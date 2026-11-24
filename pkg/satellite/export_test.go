@@ -51,6 +51,12 @@ func (r *Reconciler) RecoverFromBitmapBothDisksForTest(ctx context.Context, dr *
 	return r.recoverFromBitmapBothDisks(ctx, dr, skipDisk, adjustErr)
 }
 
+// RememberPoolForTest records the pool backing a resource, as an applied
+// replica does.
+func (r *Reconciler) RememberPoolForTest(resourceName, pool string) {
+	r.rememberPool(resourceName, pool)
+}
+
 // SetDemoteRetryForTest replaces the waits of the demote owed after an
 // auto-promote: backoff between the tries right after mkfs, and every,
 // the pacing of later applies' retries (zero retries on every apply).

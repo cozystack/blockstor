@@ -19,6 +19,8 @@ limitations under the License.
 package controllers
 
 import (
+	"time"
+
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -126,8 +128,36 @@ type Config struct {
 	// restore on this node falls back to a DRBD resync.
 	StreamTLS stream.TLSFiles
 
+	// ResourceWorkers is how many local Resources the satellite applies
+	// at once. Zero takes DefaultResourceWorkers.
+	ResourceWorkers int
+
+	// DriftCheckInterval is how often the satellite asks drbdadm which
+	// resources the kernel no longer runs as configured; zero means
+	// driftCheckInterval.
+	DriftCheckInterval time.Duration
+
 	// Workarounds turns the satellite's DRBD workarounds on and off
 	// (drbd_workarounds.go). The zero value turns them all off;
 	// cmd/satellite wires DefaultWorkaroundsConfig adjusted by its flags.
 	Workarounds WorkaroundsConfig
+}
+
+// DefaultResourceWorkers is how many local Resources the satellite applies
+// at once unless told otherwise. A pass is mostly drbdadm and drbdmeta
+// waiting on the disks and the network, and after a reboot every replica of
+// the node needs one, so one pass at a time makes the node rejoin in the sum
+// of its passes. The DRBD kernel serialises administration per resource, not
+// across resources, and the controller never hands one Resource to two
+// workers, so different resources go in parallel; the bound keeps the burst
+// of attaches and apiserver reads at a cold start to a few at a time.
+const DefaultResourceWorkers = 8
+
+// resourceWorkers is ResourceWorkers with the default applied.
+func (c *Config) resourceWorkers() int {
+	if c.ResourceWorkers > 0 {
+		return c.ResourceWorkers
+	}
+
+	return DefaultResourceWorkers
 }

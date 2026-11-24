@@ -68,9 +68,14 @@ func (s *slowReader) List(ctx context.Context, list client.ObjectList, opts ...c
 // priority as the new Resource.
 //
 // The idle replicas here cost more per pass, in total, than the
-// re-check interval, so without the fix the queue never drains. The
-// new Resource must still get its first pass (the finalizer) within
-// a couple of passes.
+// re-check interval the satellite used to have, so with that re-check
+// the queue never drains. A converged replica no longer gets a periodic
+// pass at all; the new Resource must still get its first pass (the
+// finalizer) within a couple of passes.
+// formerRecheckInterval is the periodic re-check a converged DRBD
+// replica used to get.
+const formerRecheckInterval = 10 * time.Second
+
 func TestNewResourceIsNotQueuedBehindIdleReplicas(t *testing.T) {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		t.Skip("KUBEBUILDER_ASSETS not set; run via `make test` (needs envtest apiserver)")
@@ -90,9 +95,10 @@ func TestNewResourceIsNotQueuedBehindIdleReplicas(t *testing.T) {
 	)
 
 	// Idle replicas take idle*perPass to go round, longer than the
-	// re-check interval: the queue is saturated by re-checks alone.
-	if idle*perPass <= activeDRBDRequeue {
-		t.Fatalf("test setup: %d replicas x %v does not saturate the %v re-check", idle, perPass, activeDRBDRequeue)
+	// re-check interval the satellite used to have: a periodic pass
+	// would saturate the queue on its own.
+	if idle*perPass <= formerRecheckInterval {
+		t.Fatalf("test setup: %d replicas x %v does not saturate a %v re-check", idle, perPass, formerRecheckInterval)
 	}
 
 	cli, mgr := startSatelliteEnvtest(t)
@@ -169,9 +175,9 @@ func TestNewResourceIsNotQueuedBehindIdleReplicas(t *testing.T) {
 
 	wg.Go(func() { churnPeerStatus(churnCtx, cli, peers) })
 
-	// Let the re-checks come due: from here on the idle replicas alone
-	// keep the queue full.
-	time.Sleep(activeDRBDRequeue)
+	// Wait as long as a periodic re-check took to come due, so one
+	// would be in the queue by now.
+	time.Sleep(formerRecheckInterval)
 
 	createDRBDDefinition(t, cli, "pvc-new")
 

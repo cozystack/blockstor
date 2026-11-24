@@ -28,6 +28,10 @@ import (
 	"github.com/cozystack/blockstor/pkg/satellite/stream"
 )
 
+// errNoResourceWorkers refuses a worker count that would leave every
+// resource on the node unreconciled.
+var errNoResourceWorkers = errors.New("the satellite needs at least one resource worker")
+
 // options are the satellite's command-line flags.
 type options struct {
 	nodeName            string
@@ -35,6 +39,7 @@ type options struct {
 	probeAddr           string
 	controllerNamespace string
 	streamTLS           stream.TLSFiles
+	resourceWorkers     int
 	workarounds         controllers.WorkaroundsConfig
 }
 
@@ -62,11 +67,18 @@ func parseFlags(flagSet *flag.FlagSet, args []string) (options, error) {
 		"PEM CA bundle every peer satellite's stream certificate is verified against (cert-manager ca.crt). "+
 			"With none of the three set the snapshot stream is off and cross-node clone and restore fall back to a DRBD resync.")
 
+	flagSet.IntVar(&opts.resourceWorkers, "resource-workers", controllers.DefaultResourceWorkers,
+		"How many local resources the satellite applies at once, for instance when it brings every replica of the node up after a reboot.")
+
 	registerWorkaroundFlags(flagSet, &opts.workarounds)
 
 	err := flagSet.Parse(args)
 	if err != nil {
 		return opts, errors.Wrap(err, "parse flags")
+	}
+
+	if opts.resourceWorkers < 1 {
+		return opts, errors.Wrapf(errNoResourceWorkers, "--resource-workers=%d", opts.resourceWorkers)
 	}
 
 	if opts.workarounds.Interval < 0 || opts.workarounds.StalledResyncPasses < 1 ||

@@ -67,6 +67,38 @@ func TestSatelliteStartsWithTheStreamOff(t *testing.T) {
 	}
 }
 
+// Without the flag the satellite applies several resources at once, so a
+// rebooted node does not bring its replicas up one by one.
+func TestSatelliteAppliesResourcesInParallelByDefault(t *testing.T) {
+	t.Parallel()
+
+	opts, err := parseTestFlags("--node-name=n1")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	if opts.resourceWorkers != controllers.DefaultResourceWorkers {
+		t.Errorf("resource workers = %d, want the default %d", opts.resourceWorkers, controllers.DefaultResourceWorkers)
+	}
+
+	opts, err = parseTestFlags("--node-name=n1", "--resource-workers=3")
+	if err != nil || opts.resourceWorkers != 3 {
+		t.Errorf("--resource-workers=3 = %d, %v", opts.resourceWorkers, err)
+	}
+}
+
+// No worker at all would leave every resource on the node unreconciled.
+func TestSatelliteRefusesNoResourceWorkers(t *testing.T) {
+	t.Parallel()
+
+	for _, arg := range []string{"--resource-workers=0", "--resource-workers=-1"} {
+		_, err := parseTestFlags("--node-name=n1", arg)
+		if err == nil {
+			t.Errorf("%s accepted, want refused", arg)
+		}
+	}
+}
+
 // The DRBD workarounds the LINSTOR-mode plunger runs are all on by
 // default, at the plunger's cadence.
 func TestSatelliteRunsTheDRBDWorkaroundsByDefault(t *testing.T) {

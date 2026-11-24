@@ -33,7 +33,9 @@ import (
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/storage/zfs"
 	k8sstore "github.com/cozystack/blockstor/pkg/store/k8s"
+	"github.com/cozystack/blockstor/pkg/validate"
 )
 
 // drbdSharedSecretProp is the RD property key blockstor's satellite
@@ -381,11 +383,24 @@ func (c *converter) convertControllerConfig() *crdv1alpha1.ControllerConfig {
 		}
 	}
 
-	if len(drbdProps) == 0 {
+	strategy, hasStrategy := c.props.Controller[validate.ZFSDeleteStrategyProp]
+
+	if len(drbdProps) == 0 && !hasStrategy {
 		return nil
 	}
 
 	typed, _, extra := k8sstore.SplitProps(drbdProps)
+
+	// The controller is the last scope LINSTOR reads the ZFS delete
+	// strategy from, and blockstor reads it from the same props: a
+	// cluster that set DELETE there keeps refusing the deletes it did.
+	if hasStrategy {
+		if extra == nil {
+			extra = map[string]string{}
+		}
+
+		extra[validate.ZFSDeleteStrategyProp] = strategy
+	}
 
 	return &crdv1alpha1.ControllerConfig{
 		TypeMeta:   typeMeta("ControllerConfig"),
@@ -2304,6 +2319,7 @@ func (c *converter) buildSnapshot(row *ResourceDefinitionRow, rdDsp, snapDsp, na
 
 	snap.Spec.VolumeDefinitions = c.snapshotVolumeRefsFor(row.ResourceName, row.SnapshotName)
 	snap.Spec.LUKSKeys = c.importedSnapshotKeys(row.ResourceName, row.SnapshotName)
+	c.carryRenameSuffixes(&snap, row.ResourceName, row.SnapshotName)
 
 	// blockstor's ZFS provider addresses a snapshot as
 	// `<pool>/<resource>_00000@<snap>` — volume 0 only (multi-volume
@@ -2557,7 +2573,11 @@ func (c *converter) resolveReplicaDRBDPort(row *ResourceRow, dumpPort *int32, rd
 }
 
 // snapshotVolumeRefsFor collects the snapshot's captured volume slots
-// (number + size) from the snapshot-scoped VOLUME_DEFINITIONS rows.
+// (number + size) from the snapshot-scoped VOLUME_DEFINITIONS rows, each
+// with the volume definition props LINSTOR froze into the snapshot. A
+// restore copies those, the block size among them, the way LINSTOR's
+// restore does; without them a restored volume came up at DRBD's default
+// sector size instead of its source's.
 func (c *converter) snapshotVolumeRefsFor(rdName, snapName string) []crdv1alpha1.SnapshotVolumeRef {
 	var out []crdv1alpha1.SnapshotVolumeRef
 
@@ -2567,9 +2587,19 @@ func (c *converter) snapshotVolumeRefsFor(rdName, snapName string) []crdv1alpha1
 			continue
 		}
 
+		// The dump is the record of what the snapshot held: a volume
+		// definition with no props there had none, and is recorded as
+		// {} so the store does not take it for a snapshot from before
+		// props were kept and fill in the definition's props of today.
+		props := c.props.SnapshotVDFrozen(rdName, snapName, strconv.Itoa(int(vd.VlmNr)))
+		if props == nil {
+			props = map[string]string{}
+		}
+
 		out = append(out, crdv1alpha1.SnapshotVolumeRef{
 			VolumeNumber: vd.VlmNr,
 			SizeKib:      vd.VlmSize,
+			Props:        props,
 		})
 	}
 
@@ -2629,6 +2659,30 @@ func (c *converter) snapshotNodesFor(rdName, snapName, snapDsp string) []string 
 	sort.Strings(out)
 
 	return out
+}
+
+// carryRenameSuffixes copies the ZFS rename suffix LINSTOR recorded on each
+// node's snapshot when that node's replica was deleted, so the satellite finds
+// the snapshot under the renamed zvol by name instead of by search. LINSTOR
+// keeps it per node; blockstor keys it by the node in the Snapshot's props.
+func (c *converter) carryRenameSuffixes(snap *crdv1alpha1.Snapshot, rdName, snapName string) {
+	for i := range c.dump.Resources {
+		row := &c.dump.Resources[i]
+		if row.ResourceName != rdName || row.SnapshotName != snapName || !c.convertedNode[row.NodeName] {
+			continue
+		}
+
+		suffix := c.props.Snapshot(row.NodeName, rdName, snapName)[zfs.RenameSuffixProp]
+		if suffix == "" {
+			continue
+		}
+
+		if snap.Spec.Props == nil {
+			snap.Spec.Props = map[string]string{}
+		}
+
+		snap.Spec.Props[zfs.SnapshotRenameSuffixProp(c.displayNode(row.NodeName))] = suffix
+	}
 }
 
 // parseList decodes LINSTOR's JSON-array-in-a-string columns

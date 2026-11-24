@@ -242,7 +242,8 @@ type peerVolumeObservation struct {
 // view of the other.
 //
 // PeerRole is the peer's DRBD role (the `role:` field of connection
-// frames), empty when unknown. It is not published; the resync reads it
+// frames), empty when unknown. It is not published. A change of it
+// wakes the local replica (lifecycleSignature), and the resync reads it
 // to tell whether a day0 GI can still move (giMayMove).
 type connectionObservation struct {
 	PeerNodeName     string
@@ -900,6 +901,13 @@ type ObserverRunnable struct {
 	// line before it is taken as ended; zero means
 	// observerInitialStateQuiet. For tests.
 	initialStateQuiet time.Duration
+
+	// overflow holds the replicas whose wake-up found the trigger
+	// channel full, each once, and overflowSending is set while the
+	// one goroutine that hands them over runs (sendOverflow).
+	overflowMu      sync.Mutex
+	overflow        map[string]struct{}
+	overflowSending bool
 }
 
 // appliedStatus is one entry of ObserverRunnable.applied.
@@ -938,10 +946,9 @@ const observerWriters = 8
 // whether the new observation represents a kernel-state lifecycle
 // change worth waking the reconciler on. Out-of-sync deltas and
 // other statistics-tick values are intentionally NOT part of the
-// signature — they fire too often to be a useful trigger, and the
-// observer's 5-second resync ticker + the reconciler's
-// RequeueAfter cover any wake-up that would otherwise have come
-// from a missed statistics frame.
+// signature — they fire too often to be a useful trigger, and no
+// local decision waits on one. Nothing periodic wakes the reconciler,
+// so a field a decision does wait on belongs in the signature.
 type lifecycleSignature struct {
 	// Role, DrbdState, Suspended come from resource / device kind
 	// frames. Role transitions (Secondary → Primary) and disk-state
@@ -975,10 +982,16 @@ type volumeLifecycle struct {
 }
 
 // connectionLifecycle is the per-peer slice of lifecycleSignature.
+//
+// PeerRole is in it because several local decisions refuse while a
+// peer is Primary (the latch-free mkfs retry, the recovery and late-add
+// promotes) and wait for the peer to step down; no other frame and no
+// write to the peer's Resource reports that step-down to this node.
 type connectionLifecycle struct {
 	Connected        bool
 	Message          string
 	ReplicationState string
+	PeerRole         string
 	// peerDisk keyed by VolumeNumber. The peer's view of a
 	// volume's disk-state matters for partition recovery: a peer
 	// disk flipping to Outdated is the signal that triggers our
@@ -2197,11 +2210,11 @@ func isDataBearingDiskState(s drbd.DiskState) bool {
 // channel would re-add the very Reconcile noise the predicate
 // just removed.
 //
-// Non-blocking: a full channel is treated as "reconciler is already
-// behind, drop this wake-up" rather than back-pressuring the events2
-// loop. The observer's 5-second resync ticker re-emits cached state
-// onto Status so a coalesced wake-up still arrives within the same
-// window; reconciler's RequeueAfter covers any per-resource hand-off.
+// Non-blocking: a wake-up the full channel has no room for waits in
+// the overflow set (queueOverflow) rather than back-pressuring the
+// events2 loop. Nothing periodic would make up for one dropped here:
+// the resync re-stamps Status but wakes no reconcile, and a converged
+// replica asks for no further pass.
 //
 // The emitted object carries only `Name` — the ResourceReconciler's
 // SetupWithManager registers the channel as a raw source whose
@@ -2246,23 +2259,99 @@ func (o *ObserverRunnable) sendReconcileTrigger(ctx context.Context, rdName stri
 
 	name, err := replicaCRName(ctx, o.Client, rdName, o.NodeName)
 	if err != nil {
-		// The 5-second resync re-enqueues every local Resource anyway.
+		// The definition or node read failed (a missing object is no
+		// error). The signature is already cached, so an identical
+		// next frame would be taken for one already delivered: forget
+		// it, and the next frame wakes the replica.
+		o.lifecycleMu.Lock()
+		delete(o.lifecycleCache, rdName)
+		o.lifecycleMu.Unlock()
+
+		log.FromContext(ctx).Error(err, "name the local replica to wake", "resource", rdName)
+
 		return
 	}
 
-	trigger := event.GenericEvent{
+	select {
+	case o.ReconcileTrigger <- wakeUp(name):
+	default:
+		// Channel full. No periodic pass of the replica makes up for a
+		// wake-up dropped here, so it waits for room without holding
+		// up the events2 reader.
+		o.queueOverflow(ctx, name)
+	}
+}
+
+// wakeUp is the trigger event for the local replica name.
+func wakeUp(name string) event.GenericEvent {
+	return event.GenericEvent{
 		Object: &blockstoriov1alpha1.Resource{
 			ObjectMeta: metav1.ObjectMeta{Name: name},
 		},
 	}
+}
 
-	select {
-	case o.ReconcileTrigger <- trigger:
-	default:
-		// Channel full — reconciler is already behind. Drop this
-		// wake-up; the 5-second resync ticker plus c-r's
-		// per-resource debouncer guarantee a follow-up.
+// queueOverflow keeps a wake-up the trigger channel had no room for.
+// A replica waits in the overflow set at most once, however many
+// wake-ups it gets meanwhile, besides the one wake-up being handed
+// over, and one goroutine hands the set over: in
+// a reconnect storm of hundreds of resources a goroutine per dropped
+// wake-up piled up without bound, most of them for the same replicas.
+func (o *ObserverRunnable) queueOverflow(ctx context.Context, name string) {
+	o.overflowMu.Lock()
+	defer o.overflowMu.Unlock()
+
+	if o.overflow == nil {
+		o.overflow = map[string]struct{}{}
 	}
+
+	o.overflow[name] = struct{}{}
+
+	if o.overflowSending {
+		return
+	}
+
+	o.overflowSending = true
+
+	go o.sendOverflow(ctx)
+}
+
+// sendOverflow hands the overflow set to the trigger channel, waiting
+// for room, until the set is empty or ctx ends.
+func (o *ObserverRunnable) sendOverflow(ctx context.Context) {
+	for {
+		o.overflowMu.Lock()
+
+		name, ok := anyKey(o.overflow)
+		if !ok {
+			o.overflowSending = false
+			o.overflowMu.Unlock()
+
+			return
+		}
+
+		delete(o.overflow, name)
+		o.overflowMu.Unlock()
+
+		select {
+		case o.ReconcileTrigger <- wakeUp(name):
+		case <-ctx.Done():
+			o.overflowMu.Lock()
+			o.overflowSending = false
+			o.overflowMu.Unlock()
+
+			return
+		}
+	}
+}
+
+// anyKey returns some key of set, and false when it is empty.
+func anyKey(set map[string]struct{}) (string, bool) {
+	for key := range set {
+		return key, true
+	}
+
+	return "", false
 }
 
 // lifecycleSnapshotLocked builds the current lifecycle signature for
@@ -2315,6 +2404,7 @@ func (o *ObserverRunnable) lifecycleSnapshotLocked(name string) lifecycleSignatu
 				Connected:        c.Connected,
 				Message:          c.Message,
 				ReplicationState: c.ReplicationState,
+				PeerRole:         c.PeerRole,
 				PeerDisk:         peerDisk,
 			}
 		}
@@ -2387,7 +2477,8 @@ func connectionLifecycleMapsEqual(left, right map[string]connectionLifecycle) bo
 
 		if leftConn.Connected != rightConn.Connected ||
 			leftConn.Message != rightConn.Message ||
-			leftConn.ReplicationState != rightConn.ReplicationState {
+			leftConn.ReplicationState != rightConn.ReplicationState ||
+			leftConn.PeerRole != rightConn.PeerRole {
 			return false
 		}
 

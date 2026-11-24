@@ -36,10 +36,12 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
@@ -52,6 +54,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
+	"github.com/cozystack/blockstor/pkg/finalizers"
 	"github.com/cozystack/blockstor/pkg/luks"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/satellite"
@@ -126,7 +129,7 @@ func enrichNodesWithInternalIP(nodes []blockstoriov1alpha1.Node, corev1Nodes []c
 // distinct key (`blockstor.org/resource`) so the
 // two paths coexist during the Phase 10.6 cutover without
 // stepping on each other.
-const SatelliteResourceFinalizer = "blockstor.org/satellite-resource"
+const SatelliteResourceFinalizer = finalizers.SatelliteResource
 
 // resourceKind is the apiserver Kind for the blockstor Resource
 // CRD. Defined once so SSA Patch payloads in this package share
@@ -148,6 +151,15 @@ type ResourceReconciler struct {
 
 	Config Config
 
+	// passes counts the passes by reason. SetupWithManager sets it and
+	// counts Reconcile through it; a test calling Reconcile directly goes
+	// around it.
+	passes *passCounter
+
+	// bringUp ranks the first pass of every local Resource in this
+	// process ahead of every other pass (bringUpQueue). SetupWithManager
+	// creates it.
+	bringUp *bringUpTracker
 	// conflicts retries a pass that lost an optimistic-concurrency
 	// race and counts such races per object.
 	conflicts conflict.Retrier
@@ -158,12 +170,11 @@ type ResourceReconciler struct {
 // (see conflict.Retrier), and settles the queue priority of the
 // result.
 //
-// Only a converged pass's periodic re-check keeps low priority. Every
-// other retry (a failed apply, an error, a wait on the allocator) is
-// pinned back to normal priority: controller-runtime otherwise keeps
-// the priority the item was dequeued with, so a re-check that found
-// drift would repair it at low priority, behind every other replica's
-// idle re-check.
+// Every retry (a failed apply, an error, a wait on the allocator, work
+// a pass put off) is pinned to normal priority: controller-runtime
+// otherwise keeps the priority the item was dequeued with, so a replica
+// first seen in the informer's initial list would be retried at low
+// priority, behind every other replica of the start-up.
 func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	result, err := r.conflicts.Reconcile(ctx, req, r.reconcileResource)
 	if result.Priority == nil {
@@ -191,35 +202,10 @@ const applyFailureRequeue = 5 * time.Second
 // still giving the apiserver time to commit the Status patch.
 const peerAllocationRequeue = 2 * time.Second
 
-// activeDRBDRequeue is the periodic self-evaluation requeue applied
-// after a successful Apply on a DRBD-backed resource (Phase 11.7
-// safety net). The primary-watch predicate filters out pure
-// observer Status noise and the observer-trigger channel only fires
-// on lifecycle changes, so the reconciler no longer wakes for every
-// kernel statistics tick. This RequeueAfter is the belt-and-braces
-// re-eval that catches the rare case where the events2 stream missed
-// a frame (drbdsetup restart, kernel events2 stall) — without it the
-// reconciler could go arbitrarily long without re-checking a
-// long-lived active DRBD resource against its desired state.
-//
-// 10s is chosen to be:
-//   - long enough that steady-state idle resources don't generate
-//     pointless apiserver round-trips;
-//   - short enough that any divergence between desired and observed
-//     converges within a single user-visible scenario tick (e2e
-//     tests poll at 1-2 s and budget ~30 s per assertion).
-const activeDRBDRequeue = 10 * time.Second
-
-// lowPriority is the queue priority of the periodic re-check, the one
-// controller-runtime gives events from the initial list.
-func lowPriority() *int {
-	priority := handler.LowPriority
-
-	return &priority
-}
-
 // normalPriority is the queue priority of a real event, and of every
-// retry of a pass that did not converge.
+// retry of a pass that did not converge: an item first queued from the
+// informer's initial list carries handler.LowPriority, and
+// controller-runtime keeps the priority it was dequeued with.
 func normalPriority() *int {
 	priority := 0
 
@@ -258,23 +244,46 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 // rendered a peer-less .res, and never re-rendered because
 // later peer events get filtered out by nodeNamePredicate
 // before they reach this controller.
+//
+// Every way an event reaches the queue is counted for the pass report:
+// For, the kernel trigger and the drift check through r.passes.marker,
+// every Watches map function through r.passes.mapFunc. A Watches added
+// without it still works, but its passes are counted as retries.
+//
+// A converged replica gets no periodic pass. A change of anything else
+// a pass renders from reaches it through watchRenderInputs, and the
+// drift check (see driftCheckInterval) passes the replicas drbdadm
+// lists as adjustable.
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.passes = newPassCounter()
+
+	if r.bringUp == nil {
+		r.bringUp = newBringUpTracker()
+	}
+
 	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{},
 			builder.WithPredicates(
 				predicate.And(
 					nodeNamePredicate(r.Config.NodeName),
 					primaryWatchPredicate(),
+					r.passes.marker(passResource),
 				),
 			)).
 		Watches(&blockstoriov1alpha1.Resource{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueLocalSiblings),
+			handler.EnqueueRequestsFromMapFunc(r.passes.mapFunc(passPeer, r.enqueueLocalSiblings)),
 			builder.WithPredicates(siblingWatchPredicate())).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
+			handler.EnqueueRequestsFromMapFunc(r.passes.mapFunc(passDefinition, r.enqueueResourcesForRD))).
 		Watches(&blockstoriov1alpha1.ResourceGroup{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRG)).
-		Named("satellite-resource")
+			handler.EnqueueRequestsFromMapFunc(r.passes.mapFunc(passDefinition, r.enqueueResourcesForRG))).
+		Named("satellite-resource").
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: r.Config.resourceWorkers(),
+			NewQueue:                newBringUpQueueFunc(r.bringUp, mgr.GetControllerOptions().Logger),
+		})
+
+	bldr = r.watchRenderInputs(bldr)
 
 	// Phase 11.7 second leg: the observer-trigger channel wakes
 	// this reconciler on kernel-state changes that produce no
@@ -286,16 +295,53 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// builder skips the raw-source registration entirely.
 	if r.Config.ReconcileTrigger != nil {
 		bldr = bldr.WatchesRawSource(
-			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{}),
+			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{},
+				source.WithPredicates[client.Object, reconcile.Request](r.passes.marker(passKernel))),
 		)
 	}
 
-	err := bldr.Complete(r)
+	bldr, drift := r.watchDrift(mgr, bldr)
+
+	err := bldr.Complete(r.passes.counted(r))
 	if err != nil {
 		return errors.Wrap(err, "register ResourceReconciler")
 	}
 
+	logger := mgr.GetLogger().WithName("satellite-resource")
+
+	err = mgr.Add(manager.RunnableFunc(r.passes.reportEvery(passReportInterval, logger)))
+	if err != nil {
+		return errors.Wrap(err, "register resource pass report")
+	}
+
+	if drift != nil {
+		err = mgr.Add(manager.RunnableFunc(drift.run(logger.WithName("drift-check"))))
+		if err != nil {
+			return errors.Wrap(err, "register drift check")
+		}
+	}
+
 	return nil
+}
+
+// watchDrift wires the drift check (see driftCheckInterval) into the
+// builder; it returns nil when the satellite has no exec to ask drbdadm
+// with.
+func (r *ResourceReconciler) watchDrift(mgr ctrl.Manager, bldr *builder.Builder) (*builder.Builder, *driftCheck) {
+	if r.Config.Exec == nil {
+		return bldr, nil
+	}
+
+	trigger := make(chan event.GenericEvent, reconcileTriggerBuffer)
+	drift := &driftCheck{
+		reader: mgr.GetClient(), exec: r.Config.Exec, node: r.Config.NodeName,
+		out: trigger, interval: r.Config.DriftCheckInterval,
+	}
+
+	return bldr.WatchesRawSource(
+		source.Channel(trigger, &handler.EnqueueRequestForObject{},
+			source.WithPredicates[client.Object, reconcile.Request](r.passes.marker(passDrift))),
+	), drift
 }
 
 // reconcileResource reads a Resource and drives the satellite-side
@@ -311,6 +357,8 @@ func (r *ResourceReconciler) reconcileResource(ctx context.Context, req ctrl.Req
 	err := r.Get(ctx, req.NamespacedName, &res)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			r.bringUp.forget(req.Name)
+
 			return ctrl.Result{}, nil
 		}
 
@@ -323,11 +371,20 @@ func (r *ResourceReconciler) reconcileResource(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
+	// From here a pass of the replica counts as its first one, whatever
+	// it ends with, so it gives up the bring-up rank (bringUpTracker).
+	// A pass that only stamps the finalizer does not: the pass it
+	// requeues is the one that brings the replica up.
+	hasFinalizer := slices.Contains(res.Finalizers, SatelliteResourceFinalizer)
+	if hasFinalizer || !res.DeletionTimestamp.IsZero() {
+		r.bringUp.start(res.Name)
+	}
+
 	if !res.DeletionTimestamp.IsZero() {
 		return r.handleDelete(ctx, &res)
 	}
 
-	if !slices.Contains(res.Finalizers, SatelliteResourceFinalizer) {
+	if !hasFinalizer {
 		res.Finalizers = append(res.Finalizers, SatelliteResourceFinalizer)
 
 		err := r.Update(ctx, &res)
@@ -592,15 +649,9 @@ func (r *ResourceReconciler) enqueueResourcesForRG(ctx context.Context, obj clie
 // up. Pulled out of Reconcile to keep the orchestration under the
 // cyclomatic / funlen budgets.
 func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger) (ctrl.Result, error) {
-	var rd blockstoriov1alpha1.ResourceDefinition
-
-	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(res.Spec.ResourceDefinitionName)}, &rd)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
-
-		return ctrl.Result{}, errors.Wrap(err, "get parent RD")
+	rd, found, err := r.definitionForApply(ctx, res, logger)
+	if !found || err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Read peer Resources fresh via APIReader (uncached). The c-r
@@ -633,7 +684,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// election relies on (Bug 80).
 	adoptAuthoritativeFlags(res, peers)
 
-	err = r.checkLayerStackPinned(ctx, &rd)
+	err = r.checkLayerStackPinned(ctx, rd)
 	if errors.Is(err, errLayerStackNotPinned) {
 		logger.Info("waiting for the controller to pin the layer stack", "rd", rd.Name)
 
@@ -649,13 +700,13 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// renders no .res and the kernel never sees a node-id, so waiting
 	// for the controller to stamp Status.DRBDNodeID/Port/Minor would
 	// block apply forever — they never come.
-	if rdNeedsDRBD(&rd) {
-		if waitResult, waitOK := r.prepareDRBDApply(ctx, res, &rd, peers, logger); !waitOK {
+	if rdNeedsDRBD(rd) {
+		if waitResult, waitOK := r.prepareDRBDApply(ctx, res, rd, peers, logger); !waitOK {
 			return waitResult, nil
 		}
 	}
 
-	desired, err := r.buildDesiredFromCRD(ctx, res, &rd, peers)
+	desired, err := r.buildDesiredFromCRD(ctx, res, rd, peers)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -665,44 +716,49 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
 	}
 
+	retry, retryAsked := r.Config.Apply.TakeRetry(desired.GetName())
+
 	anyFailed := r.recordPerResourceFailures(res, results, logger)
 	r.recordDroppedOptions(res, results)
 
-	r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
+	stampFailed := r.stampPostApply(ctx, res, rd, results, anyFailed, logger)
 
-	// Apply chain surfaces per-resource errors via results (e.g.
-	// drbdadm adjust failing on a stale .res rendered before the
-	// peer's Status caught up). Returning nil here would let c-r
-	// stop until an external event drove another reconcile;
-	// RequeueAfter ensures the next attempt sees the freshly-
-	// committed peer state.
-	if requeue, again := applyRequeue(results, anyFailed); again {
-		return ctrl.Result{RequeueAfter: requeue}, nil
+	return ctrl.Result{RequeueAfter: applyRequeue(results, anyFailed, stampFailed, retry, retryAsked)}, nil
+}
+
+// applyRequeue is when the pass after an apply comes, zero for none.
+//
+// Apply chain surfaces per-resource errors via results (e.g. drbdadm
+// adjust failing on a stale .res rendered before the peer's Status
+// caught up). Returning nil here would let c-r stop until an external
+// event drove another reconcile; RequeueAfter ensures the next attempt
+// sees the freshly-committed peer state. A stamp that failed is retried
+// the same way: no periodic pass comes back for a device path the CSI
+// node is waiting on, or for the volume-numbers record a later delete
+// needs. An apply whose only failures are refusals an operator must act
+// on waits failureRequeue's longer interval, unless a grow waits for its
+// device too (growPending): that is retried at applyFailureRequeue, so a
+// refusal elsewhere in the apply does not hold the grow back.
+//
+// A converged replica waits for its next event, the way LINSTOR's
+// satellite dispatches only resources with a pending change. The one
+// exception is work this pass put off for a while, a dwell window or a
+// throttle, that no event is bound to bring back.
+func applyRequeue(
+	results []*intent.ResourceApplyResult, anyFailed, stampFailed bool, retry time.Duration, retryAsked bool,
+) time.Duration {
+	grow := growPending(results)
+
+	switch {
+	case anyFailed && !stampFailed && !grow:
+		return failureRequeue(results)
+	case anyFailed || stampFailed || grow:
+		return applyFailureRequeue
+	case retryAsked:
+		return retry
+	default:
+		return 0
 	}
-
-	// Phase 11.7 safety net: schedule a periodic re-eval on
-	// active-DRBD resources. The primary-watch predicate drops
-	// pure observer Status noise and the observer-trigger channel
-	// only fires on lifecycle changes; combined, the reconciler no
-	// longer wakes on every kernel statistics tick. Without a
-	// belt-and-braces requeue, a missed events2 frame (drbdsetup
-	// restart, kernel stall) could leave the resource un-re-eval'd
-	// for arbitrarily long. Only fires on DRBD-stack RDs — pure
-	// STORAGE-only RDs have no kernel-state to drift against, so
-	// keeping them quiet preserves the predicate's no-op-on-idle
-	// property.
-	//
-	// The re-check runs at low priority. With one worker every
-	// replica's re-check otherwise competes first-come with new and
-	// changed Resources, and on a node holding a hundred replicas a
-	// new one waits minutes behind re-checks that find nothing to do.
-	// LINSTOR's satellite re-dispatches only resources with a pending
-	// change outside a full sync (DeviceManagerImpl.devMgrLoop).
-	if rdNeedsDRBD(&rd) {
-		return ctrl.Result{RequeueAfter: activeDRBDRequeue, Priority: lowPriority()}, nil
-	}
-
-	return ctrl.Result{}, nil
 }
 
 // applyLocked runs one apply pass under the resource's ApplyLocks
@@ -983,25 +1039,6 @@ func metadataRefusals() []applyRefusal {
 // or its definition still reconciles at once.
 const refusedApplyRequeue = 5 * time.Minute
 
-// applyRequeue is when a pass whose apply failed, or left a grow
-// unfinished, runs again: failureRequeue's interval for a failure, and
-// applyFailureRequeue at the latest while a grow waits for its device,
-// so a refusal elsewhere in the apply does not hold the grow back.
-func applyRequeue(results []*intent.ResourceApplyResult, anyFailed bool) (time.Duration, bool) {
-	grow := growPending(results)
-
-	switch {
-	case anyFailed && grow:
-		return min(failureRequeue(results), applyFailureRequeue), true
-	case anyFailed:
-		return failureRequeue(results), true
-	case grow:
-		return applyFailureRequeue, true
-	default:
-		return 0, false
-	}
-}
-
 // failureRequeue picks the retry interval of an apply that failed.
 func failureRequeue(results []*intent.ResourceApplyResult) time.Duration {
 	for _, result := range results {
@@ -1043,15 +1080,20 @@ func luksRefusals() []applyRefusal {
 // purge (Bug 355 followup), the Bug-107 volume-numbers annotation,
 // and the Bug-39 toggle-disk retry counter. Each helper is
 // independently fallible — we log and move on so a transient
-// apiserver hiccup on one stamp doesn't suppress the others.
-func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult, anyFailed bool, logger logr.Logger) {
+// apiserver hiccup on one stamp doesn't suppress the others. It
+// reports whether any of them failed, so the pass asks for another.
+func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult, anyFailed bool, logger logr.Logger) bool {
 	// Stamp per-volume DevicePath into Status.Volumes so
 	// linstor-csi / any consumer that reads the CRD sees the
 	// /dev path the satellite materialised. Done even when one
 	// volume's apply failed: a partial success is still useful
 	// to surface (volumes that did apply have a real device).
+	failed := false
+
 	err := r.stampVolumeStatus(ctx, res, results)
 	if err != nil {
+		failed = true
+
 		logger.Error(err, "stamp Status.Volumes")
 	}
 
@@ -1073,6 +1115,8 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	// volumes and was reverted.
 	err = r.purgeStaleVolumeStatus(ctx, res, rd)
 	if err != nil {
+		failed = true
+
 		logger.Error(err, "purge stale Status.Volumes")
 	}
 
@@ -1085,6 +1129,8 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	// the backing .img / ZVOL / LV leaks forever.
 	err = r.stampVolumeNumbersAnnotation(ctx, res, rd)
 	if err != nil {
+		failed = true
+
 		logger.Error(err, "stamp volume-numbers annotation")
 	}
 
@@ -1094,13 +1140,19 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	// unconditionally on every apply pass.
 	err = r.recordToggleDiskOutcome(ctx, res, !anyFailed)
 	if err != nil {
+		failed = true
+
 		logger.Error(err, "record toggle-disk outcome")
 	}
 
 	err = r.recordApplyFailure(ctx, res, rd, results)
 	if err != nil {
+		failed = true
+
 		logger.Error(err, "record apply failure")
 	}
+
+	return failed
 }
 
 // stampVolumeStatus SSA-patches Resource.Status.Volumes with the
@@ -1821,6 +1873,62 @@ func (r *ResourceReconciler) waitForControllerAllocation(ctx context.Context, re
 	return ctrl.Result{}, true
 }
 
+// definitionForApply reads the replica's definition, past the cache
+// while the replica has never been applied here (see
+// refreshDefinitionForFirstApply). A definition that is gone is not
+// found and no error: there is nothing to apply.
+func (r *ResourceReconciler) definitionForApply(
+	ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger,
+) (*blockstoriov1alpha1.ResourceDefinition, bool, error) {
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(res.Spec.ResourceDefinitionName)}, &rd)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, false, nil
+		}
+
+		return nil, false, errors.Wrap(err, "get parent RD")
+	}
+
+	r.refreshDefinitionForFirstApply(ctx, res, &rd, logger)
+
+	return &rd, true, nil
+}
+
+// refreshDefinitionForFirstApply replaces the cached definition with the
+// API server's copy while the replica has never been applied here. The
+// controller writes the volume block size onto the definition before it
+// gives the replica its DRBD identity, but the two objects reach this
+// satellite through separate watches, so the cached definition can still
+// predate the size when the identity arrives. The first apply attaches
+// the device, and drbdsetup never changes the block size of an attached
+// device, so a size read late is a size lost until the next detach. A
+// failed read keeps the cached copy.
+func (r *ResourceReconciler) refreshDefinitionForFirstApply(
+	ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, logger logr.Logger,
+) {
+	if _, applied := res.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers]; applied {
+		return
+	}
+
+	reader := r.peerReader()
+	if reader == nil {
+		return
+	}
+
+	var fresh blockstoriov1alpha1.ResourceDefinition
+
+	err := reader.Get(ctx, client.ObjectKey{Name: rd.Name}, &fresh)
+	if err != nil {
+		logger.V(1).Info("definition refresh before the first apply failed; using the cached copy", "err", err.Error())
+
+		return
+	}
+
+	*rd = fresh
+}
+
 // refreshTargetFromAPIReader does an uncached Get on the target
 // Resource and overwrites `res` in place when the APIReader reports
 // non-nil DRBD-IDs. Returns true iff every DRBD-ID is now populated,
@@ -1918,9 +2026,9 @@ func peersMissingNodeID(target *blockstoriov1alpha1.Resource, peers []blockstori
 //  4. Storage Provider's DeleteVolume is idempotent on missing
 //     volumes — a second handleDelete pass after a partial first
 //     pass (DeleteResource succeeded, Update failed) re-issues
-//     the storage tear-down safely. Bug 43's storage sweeper is
-//     the wider-scope backstop; this ordering fix is the
-//     per-resource source-of-truth path.
+//     the storage tear-down safely. Nothing else deletes the
+//     storage: the finalizer stays until DeleteResource reports
+//     that every volume is gone.
 //
 // Phase 10.1. Once Phase 10.6 retires the gRPC contract,
 // `internal/controller.ResourceReconciler.runDelete` and its
@@ -1944,6 +2052,19 @@ func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov
 		Name:          naming.Key(res.Spec.ResourceDefinitionName),
 		StoragePool:   resolveDeleteStoragePool(res),
 		VolumeNumbers: volumeNumbers,
+	}
+
+	if res.Annotations[finalizers.StorageAbandoned] != "" {
+		// `node lost` removed this replica because the node is gone;
+		// LINSTOR leaves the storage of a lost node in place, and so
+		// does a satellite that turns out to be running after all: it
+		// tears down DRBD and keeps the volumes.
+		req.StoragePool = ""
+	} else {
+		req.DeletedSuffix, err = r.recordRenameSuffix(ctx, res)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	resp, err := r.Config.Apply.DeleteResource(ctx, req)
@@ -2010,7 +2131,7 @@ func (r *ResourceReconciler) deleteReader() client.Reader {
 
 // lookupVolumeNumbers resolves the per-RD volume-number set the
 // satellite's DeleteResource walks to drop matching LVs / loopfiles.
-// It tries three sources in descending order of authority:
+// It joins three sources:
 //
 //  1. The parent RD's VolumeDefinitions (the source of truth while
 //     the RD CRD still exists).
@@ -2040,29 +2161,30 @@ func (r *ResourceReconciler) deleteReader() client.Reader {
 func (r *ResourceReconciler) lookupVolumeNumbers(ctx context.Context, res *blockstoriov1alpha1.Resource) ([]int32, error) {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
+	var fromRD []int32
+
 	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(res.Spec.ResourceDefinitionName)}, &rd)
-	if err == nil {
-		out := make([]int32, 0, len(rd.Spec.VolumeDefinitions))
+
+	switch {
+	case err == nil:
 		for i := range rd.Spec.VolumeDefinitions {
-			out = append(out, rd.Spec.VolumeDefinitions[i].VolumeNumber)
+			fromRD = append(fromRD, rd.Spec.VolumeDefinitions[i].VolumeNumber)
 		}
-
-		return out, nil
-	}
-
-	if !apierrors.IsNotFound(err) {
+	case !apierrors.IsNotFound(err):
 		return nil, errors.Wrap(err, "get parent RD for delete")
 	}
 
-	// Source 2: the annotation stamped on the last successful apply.
-	if nums := parseVolumeNumbers(res.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers]); len(nums) > 0 {
-		return nums, nil
-	}
+	// The three sources are joined rather than tried in turn: a volume any
+	// of them names belongs to this replica, and one the delete skips is
+	// left on disk with nothing to delete it later. Deleting a volume that
+	// is already gone is a no-op.
+	nums := slices.Concat(fromRD,
+		parseVolumeNumbers(res.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers]),
+		volumeNumbersFromStatus(res))
+	slices.Sort(nums)
+	nums = slices.Compact(nums)
 
-	// Source 3: the observer-stamped Status.Volumes. Covers the
-	// rolling-deploy race where the delete fires before the first
-	// apply stamped the annotation.
-	if nums := volumeNumbersFromStatus(res); len(nums) > 0 {
+	if len(nums) > 0 {
 		return nums, nil
 	}
 

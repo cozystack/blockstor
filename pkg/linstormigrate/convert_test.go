@@ -2037,3 +2037,35 @@ func TestBothLatchReasonsAreReported(t *testing.T) {
 		t.Errorf("the unmigrated node was not reported; warnings: %v", res.Warnings)
 	}
 }
+
+// TestSnapshotCarriesFrozenVolumeDefinitionProps: LINSTOR copies a volume
+// definition's props into the snapshot when it takes it, and its restore
+// copies them back, the block size among them. The adopted snapshot
+// keeps them, so a restore of it comes up at its source's sector size. A
+// volume with none frozen is recorded as an empty map, not as nothing:
+// the store fills a snapshot that recorded nothing with the definition's
+// current props, which may carry a block size the snapshot's data was
+// never written at.
+func TestSnapshotCarriesFrozenVolumeDefinitionProps(t *testing.T) {
+	res := convertFixture(t)
+
+	for i := range res.Snapshots {
+		snap := &res.Snapshots[i]
+		if snap.Spec.SnapshotName != "snap-good" {
+			continue
+		}
+
+		vol0 := snap.Spec.VolumeDefinitions[0].Props
+		if vol0["DrbdOptions/Disk/block-size"] != "4096" || vol0["Linstor/Drbd/freeze-block-size"] != "True" {
+			t.Errorf("volume 0 props %v, want the frozen block size", vol0)
+		}
+
+		if vol1 := snap.Spec.VolumeDefinitions[1].Props; vol1 == nil || len(vol1) != 0 {
+			t.Errorf("volume 1 props %#v, want an empty map", vol1)
+		}
+
+		return
+	}
+
+	t.Fatal("snapshot snap-good not converted")
+}
