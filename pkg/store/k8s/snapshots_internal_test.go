@@ -142,6 +142,87 @@ func TestWireToCRDSnapshotSuspendIOByGroup(t *testing.T) {
 	}
 }
 
+// TestSnapshotRecordsVolumeDefinitionProps pins that a snapshot keeps
+// its volume definitions' props as they were when it was taken, the
+// block size among them, and serves those rather than what the
+// definition carries later. A restore copies them, so the restored
+// volume comes up at the sector size its data was written at.
+func TestSnapshotRecordsVolumeDefinitionProps(t *testing.T) {
+	t.Parallel()
+
+	in := &apiv1.Snapshot{
+		Name:         "snap-1",
+		ResourceName: "pvc-1",
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{{
+			VolumeNumber: 0,
+			SizeKib:      1024,
+			VolumeDefinitionProps: map[string]string{
+				"DrbdOptions/Disk/block-size":    "4096",
+				"Linstor/Drbd/freeze-block-size": "True",
+				"LuksPassphrase":                 "never-recorded",
+			},
+		}},
+	}
+
+	spec := wireToCRDSnapshotSpec(in)
+
+	recorded := spec.VolumeDefinitions[0].Props
+	if recorded["DrbdOptions/Disk/block-size"] != "4096" || recorded["Linstor/Drbd/freeze-block-size"] != "True" {
+		t.Fatalf("recorded props %v, want the block size and its freeze", recorded)
+	}
+
+	if _, ok := recorded["LuksPassphrase"]; ok {
+		t.Fatalf("a passphrase prop was recorded on the snapshot: %v", recorded)
+	}
+
+	// The definition has changed since.
+	parent := &crdv1alpha1.ResourceDefinition{
+		Spec: crdv1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []crdv1alpha1.ResourceDefinitionVolume{{
+				VolumeNumber: 0,
+				Props:        map[string]string{"DrbdOptions/Disk/block-size": "512"},
+			}},
+		},
+	}
+
+	got := crdToWireSnapshot(&crdv1alpha1.Snapshot{Spec: spec}, parent)
+	if v := got.VolumeDefinitions[0].VolumeDefinitionProps["DrbdOptions/Disk/block-size"]; v != "4096" {
+		t.Fatalf("snapshot serves block-size %q, want the recorded 4096", v)
+	}
+}
+
+// TestSnapshotWithoutRecordFallsBackToDefinition: a snapshot recorded
+// before the props were kept, an adopted LINSTOR one among them, serves
+// its definition's current props, and one recorded with none serves none.
+func TestSnapshotWithoutRecordFallsBackToDefinition(t *testing.T) {
+	t.Parallel()
+
+	parent := &crdv1alpha1.ResourceDefinition{
+		Spec: crdv1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []crdv1alpha1.ResourceDefinitionVolume{{
+				VolumeNumber: 0,
+				Props:        map[string]string{"DrbdOptions/Disk/block-size": "4096"},
+			}},
+		},
+	}
+
+	old := &crdv1alpha1.Snapshot{Spec: crdv1alpha1.SnapshotSpec{
+		VolumeDefinitions: []crdv1alpha1.SnapshotVolumeRef{{VolumeNumber: 0, SizeKib: 1024}},
+	}}
+
+	if v := crdToWireSnapshot(old, parent).VolumeDefinitions[0].VolumeDefinitionProps["DrbdOptions/Disk/block-size"]; v != "4096" {
+		t.Fatalf("unrecorded snapshot serves block-size %q, want the definition's 4096", v)
+	}
+
+	empty := &crdv1alpha1.Snapshot{Spec: crdv1alpha1.SnapshotSpec{
+		VolumeDefinitions: []crdv1alpha1.SnapshotVolumeRef{{VolumeNumber: 0, SizeKib: 1024, Props: map[string]string{}}},
+	}}
+
+	if props := crdToWireSnapshot(empty, parent).VolumeDefinitions[0].VolumeDefinitionProps; len(props) != 0 {
+		t.Fatalf("a snapshot recorded with no props serves %v", props)
+	}
+}
+
 // TestCRDToWireSnapshotCarriesDeleteFailures: the satellite records why
 // deleting its copy failed on the CRD status; the REST delete reads the
 // snapshot through this conversion and answers with that error, so the
