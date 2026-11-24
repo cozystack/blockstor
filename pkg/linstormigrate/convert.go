@@ -1522,7 +1522,7 @@ func (c *converter) liveVolumes(rdName string) map[int32]bool {
 
 	for i := range c.dump.VolumeDefinitions {
 		vd := &c.dump.VolumeDefinitions[i]
-		if vd.ResourceName == rdName && vd.SnapshotName == "" && vd.VlmFlags&resourceFlagDelete == 0 {
+		if vd.ResourceName == rdName && vd.SnapshotName == "" && vd.VlmFlags&vlmDfnFlagDelete == 0 {
 			live[vd.VlmNr] = true
 		}
 	}
@@ -1604,7 +1604,7 @@ func (c *converter) drbdMetaPools(row *ResourceDefinitionRow, node string) []met
 		vd := &c.dump.VolumeDefinitions[i]
 		// A volume marked DELETE is not converted, so its metadata
 		// setting does not decide anything for the live ones.
-		if vd.ResourceName != rd || vd.SnapshotName != "" || vd.VlmFlags&resourceFlagDelete != 0 {
+		if vd.ResourceName != rd || vd.SnapshotName != "" || vd.VlmFlags&vlmDfnFlagDelete != 0 {
 			continue
 		}
 
@@ -1721,7 +1721,7 @@ func (c *converter) volumelessReason(rdName string) string {
 			continue
 		}
 
-		if vd.VlmFlags&resourceFlagDelete != 0 {
+		if vd.VlmFlags&vlmDfnFlagDelete != 0 {
 			sawDeleted = true
 
 			continue
@@ -2011,22 +2011,33 @@ func (c *converter) volumeDefinitionsFor(rdName, rdDsp string) []crdv1alpha1.Res
 			continue
 		}
 
-		if vd.VlmFlags&resourceFlagDelete != 0 {
-			c.warnf("volume definition %s/%d: marked DELETE in the source cluster — skipped", rdDsp, vd.VlmNr)
-
-			continue
-		}
-
-		if vd.VlmFlags != 0 {
-			c.warnf("volume definition %s/%d: unhandled flags bitmask %d dropped", rdDsp, vd.VlmNr, vd.VlmFlags)
-		}
-
-		out = append(out, crdv1alpha1.ResourceDefinitionVolume{
+		converted := crdv1alpha1.ResourceDefinitionVolume{
 			VolumeNumber: vd.VlmNr,
 			SizeKib:      vd.VlmSize,
 			Props:        c.volumeDefinitionProps(rdName, rdDsp, vd.VlmNr),
 			DRBDMinor:    c.drbdMinor[volumeKey{rd: rdName, vlmNr: vd.VlmNr}],
-		})
+		}
+
+		// A delete LINSTOR had not finished is carried as one: blockstor's
+		// satellites delete the volume on the replicas that still hold it,
+		// as LINSTOR's would once they confirmed, and the definition goes
+		// when they all have. Leaving it out instead would drop the
+		// operator's delete and the volumes it was for would stay on disk
+		// with nothing to delete them. The deleteID is the definition's
+		// LINSTOR UUID, so a re-run converts it the same.
+		if vd.VlmFlags&vlmDfnFlagDelete != 0 {
+			c.warnf("volume definition %s/%d: marked DELETE in the source cluster — carried, its replicas' volumes are deleted once their satellites run",
+				rdDsp, vd.VlmNr)
+
+			converted.Flags = []string{crdv1alpha1.VolumeDefinitionFlagDelete}
+			converted.DeleteID = "linstor-" + vd.UUID
+		}
+
+		if rest := vd.VlmFlags &^ vlmDfnFlagDelete; rest != 0 {
+			c.warnf("volume definition %s/%d: unhandled flags bitmask %d dropped", rdDsp, vd.VlmNr, rest)
+		}
+
+		out = append(out, converted)
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].VolumeNumber < out[j].VolumeNumber })
