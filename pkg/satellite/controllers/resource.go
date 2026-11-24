@@ -1579,11 +1579,22 @@ func (r *ResourceReconciler) peerReader() client.Reader {
 // target isn't found in the list (peer list built from a different
 // reader in a unit test, or the target's CRD was just deleted) — the
 // cached flags then stand, which is the pre-fix behaviour.
+//
+// The deletion timestamp is adopted the same way. A `rd d` stamps every
+// replica of the definition at once, so the uncached read that already
+// misses the peers torn down first also shows this replica's own
+// deletion; the cached copy can still lack it, and the desired state
+// built from it would call a replica in the middle of its delete a lone
+// survivor (dispatcher Deleting).
 func adoptAuthoritativeFlags(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) {
 	for i := range peers {
 		if naming.Same(peers[i].Spec.NodeName, target.Spec.NodeName) &&
 			naming.Same(peers[i].Spec.ResourceDefinitionName, target.Spec.ResourceDefinitionName) {
 			target.Spec.Flags = peers[i].Spec.Flags
+
+			if target.DeletionTimestamp == nil && peers[i].DeletionTimestamp != nil {
+				target.DeletionTimestamp = peers[i].DeletionTimestamp.DeepCopy()
+			}
 
 			return
 		}
