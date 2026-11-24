@@ -41,6 +41,18 @@ import (
 func liveMigrationFixture(t *testing.T, layers []string) (store.Store, string) {
 	t.Helper()
 
+	st := seedLiveMigration(t, layers)
+
+	base, stop := startServerWithStore(t, st)
+	t.Cleanup(stop)
+
+	return st, base
+}
+
+// seedLiveMigration is the store of liveMigrationFixture.
+func seedLiveMigration(t *testing.T, layers []string) store.Store {
+	t.Helper()
+
 	st := store.NewInMemory()
 	ctx := t.Context()
 
@@ -73,10 +85,7 @@ func liveMigrationFixture(t *testing.T, layers []string) (store.Store, string) {
 
 	setInUse(t, st, "node-a", true)
 
-	base, stop := startServerWithStore(t, st)
-	t.Cleanup(stop)
-
-	return st, base
+	return st
 }
 
 func setInUse(t *testing.T, st store.Store, node string, using bool) {
@@ -375,7 +384,7 @@ func TestOpenDualPrimaryRefusesWhenAnotherMigrationWonTheRace(t *testing.T) {
 
 	// The call for node-c picked node-a as its source before node-b's
 	// marks landed, and writes now.
-	_, err := srv.openDualPrimary(t.Context(), "vm-disk", "node-a", "node-c")
+	_, err := srv.openDualPrimary(t.Context(), "vm-disk", "node-a", "node-c", time.Time{})
 	if code := refusalCode(t, err); code != apiCallRcError|apiCallRcFailExistsLiveMigrate {
 		t.Fatalf("losing make-available: rc %d, want FAIL_EXISTS_LIVE_MIGRATE", code)
 	}
@@ -392,7 +401,7 @@ func TestOpenDualPrimaryRefusesWhenAnotherMigrationWonTheRace(t *testing.T) {
 	}
 
 	// The winner's repeat still goes through.
-	if _, err = srv.openDualPrimary(t.Context(), "vm-disk", "node-a", "node-b"); err != nil {
+	if _, err = srv.openDualPrimary(t.Context(), "vm-disk", "node-a", "node-b", time.Time{}); err != nil {
 		t.Fatalf("repeat of the prepared migration: %v", err)
 	}
 }
@@ -408,7 +417,7 @@ func TestOpenDualPrimaryAfterTheSourceLetGo(t *testing.T) {
 	createDisklessReplica(t, st, "node-b")
 	setInUse(t, st, "node-a", false)
 
-	rcs, err := srv.openDualPrimary(t.Context(), "vm-disk", "node-a", "node-b")
+	rcs, err := srv.openDualPrimary(t.Context(), "vm-disk", "node-a", "node-b", time.Time{})
 	if err != nil {
 		t.Fatalf("openDualPrimary: %v", err)
 	}
@@ -559,6 +568,44 @@ func TestMakeAvailableWarnsWhenAnEndDoesNotApply(t *testing.T) {
 	last := rcs[len(rcs)-1]
 	if last.RetCode != maskWarn || !strings.Contains(last.Message, "node-a, node-b") {
 		t.Fatalf("last answer %+v, want a warning naming node-a and node-b", last)
+	}
+}
+
+// When make-available created the target replica, its build and ready
+// waits already take the part of csi-attacher's minute they are sized
+// for (DefaultResourceDeployWait). The dual-Primary wait ends with them
+// rather than adding its own 10 s on top: here neither the replica is
+// built nor do the ends report, and the call answers once those waits
+// are spent, not dualPrimaryApplyTimeout later.
+func TestMakeAvailableDualPrimaryWaitSharesTheReplicaWaitBound(t *testing.T) {
+	st := seedLiveMigration(t, nil)
+	markOnline(t, st, "node-a", "node-b")
+
+	if err := st.VolumeDefinitions().Create(t.Context(), "vm-disk",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1 << 20}); err != nil {
+		t.Fatalf("seed volume definition: %v", err)
+	}
+
+	const deploy, ready = 300 * time.Millisecond, 300 * time.Millisecond
+
+	base := startDeployWaitServer(t, st, deploy, ready)
+
+	start := time.Now()
+
+	status, rcs := postRcs(t, base+"/v1/resource-definitions/vm-disk/resources/node-b/make-available",
+		`{"diskful":false,"auto_manage_dual_primary":true}`)
+	if status != http.StatusOK {
+		t.Fatalf("make-available: %d %+v", status, rcs)
+	}
+
+	if took := time.Since(start); took >= dualPrimaryApplyTimeout {
+		t.Errorf("make-available took %s; the dual-primary wait should end with the %s of replica waits, "+
+			"not run its own %s after them", took, deploy+ready, dualPrimaryApplyTimeout)
+	}
+
+	last := rcs[len(rcs)-1]
+	if last.RetCode != maskWarn || !strings.Contains(last.Message, "node-a, node-b") {
+		t.Fatalf("last answer %+v, want the warning naming node-a and node-b", last)
 	}
 }
 

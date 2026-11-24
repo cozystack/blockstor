@@ -86,12 +86,15 @@ func (s *Server) makeAvailableAndPrepareMigration(w http.ResponseWriter, r *http
 	// the satellite built it. linstor-csi's ControllerPublishVolume
 	// reads the replica's device path right after this call, and a
 	// replica the call only changed was built before.
+	var waitsEnd time.Time
+
 	if created {
+		waitsEnd = s.madeAvailableWaitsEnd()
 		msgs = append(msgs, s.waitMadeAvailableReplicaReady(r.Context(), rdName, node)...)
 	}
 
 	if req.AutoManageDualPrimary {
-		opened, err := s.openDualPrimary(r.Context(), rdName, source, node)
+		opened, err := s.openDualPrimary(r.Context(), rdName, source, node, waitsEnd)
 		if err != nil {
 			writeDualPrimaryError(w, err)
 
@@ -102,6 +105,20 @@ func (s *Server) makeAvailableAndPrepareMigration(w http.ResponseWriter, r *http
 	}
 
 	writeJSON(w, http.StatusOK, msgs)
+}
+
+// madeAvailableWaitsEnd is the latest the waits of a make-available that
+// created its replica may run to: the replica's build and ready waits,
+// counted from now. The dual-Primary wait ends there too, so the whole
+// call stays within the bound those waits are sized for (see
+// DefaultResourceDeployWait) instead of adding its own on top. Zero when
+// no ready wait is configured, and then nothing caps it.
+func (s *Server) madeAvailableWaitsEnd() time.Time {
+	if s.ResourceReadyWait <= 0 {
+		return time.Time{}
+	}
+
+	return time.Now().Add(max(s.ResourceDeployWait, 0) + s.ResourceReadyWait)
 }
 
 // liveMigrationSource checks that a make-available with
@@ -157,8 +174,9 @@ func (s *Server) liveMigrationSource(ctx context.Context, rd *apiv1.ResourceDefi
 //
 // The props reach the satellites through the definition watch, not
 // through the call; waitDualPrimaryApplied holds the answer until both
-// ends report they applied them, as LINSTOR's call does.
-func (s *Server) openDualPrimary(ctx context.Context, rdName, source, target string) ([]apiv1.APICallRc, error) {
+// ends report they applied them, as LINSTOR's call does, and not past
+// notAfter when that is set.
+func (s *Server) openDualPrimary(ctx context.Context, rdName, source, target string, notAfter time.Time) ([]apiv1.APICallRc, error) {
 	if source == "" {
 		return notMigrating(rdName), nil
 	}
@@ -214,15 +232,17 @@ func (s *Server) openDualPrimary(ctx context.Context, rdName, source, target str
 		return notMigrating(rdName), nil
 	}
 
-	return append(msgs, s.waitDualPrimaryApplied(ctx, rdName, token, source, target)...), nil
+	return append(msgs, s.waitDualPrimaryApplied(ctx, rdName, token, source, target, notAfter)...), nil
 }
 
 // dualPrimaryApplyTimeout bounds how long make-available waits for the
 // satellites of both ends to apply the dual-Primary props, and
-// dualPrimaryApplyPoll how often it looks. CSI's external-attacher gives
-// up on a ControllerPublish after 15s by default and retries it, and the
-// retry repeats the prepared migration and waits again, so the bound
-// stays below that.
+// dualPrimaryApplyPoll how often it looks. When the call created the
+// target replica, the wait also ends with that replica's build and ready
+// waits (madeAvailableWaitsEnd): those are sized to leave the writes 15s
+// of the minute piraeus-operator gives csi-attacher, and 10s more on top
+// would leave them 5s. A retry repeats the prepared migration and waits
+// again.
 //
 //nolint:gochecknoglobals // tests shorten them
 var (
@@ -247,8 +267,11 @@ func newApplyToken() string {
 // ONLINE is not waited for, it applies nothing. When the bound runs out
 // the call still succeeds, with a warning naming the nodes that have not
 // reported: the props are written and will be applied, and refusing would
-// make a satellite that predates the report fail every migration.
-func (s *Server) waitDualPrimaryApplied(ctx context.Context, rdName, token, source, target string) []apiv1.APICallRc {
+// make a satellite that predates the report fail every migration. A set
+// notAfter ends the wait earlier than dualPrimaryApplyTimeout would.
+func (s *Server) waitDualPrimaryApplied(
+	ctx context.Context, rdName, token, source, target string, notAfter time.Time,
+) []apiv1.APICallRc {
 	pending := make([]string, 0, 2)
 
 	for _, node := range []string{source, target} {
@@ -259,6 +282,9 @@ func (s *Server) waitDualPrimaryApplied(ctx context.Context, rdName, token, sour
 	}
 
 	deadline := time.Now().Add(dualPrimaryApplyTimeout)
+	if !notAfter.IsZero() && notAfter.Before(deadline) {
+		deadline = notAfter
+	}
 
 	for {
 		pending = slices.DeleteFunc(pending, func(node string) bool {
