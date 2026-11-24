@@ -548,6 +548,16 @@ type ResourceApplyResult struct {
 	Ok       bool
 	Message  string
 
+	// WaitingForController is set on a result that is not Ok only
+	// because the apply waits for the controller to stamp the replica
+	// (satellite.ErrWaitingForController): a wait, not a failed apply.
+	WaitingForController bool
+
+	// ReconnectedPeers names the peers whose StandAlone connection this
+	// apply set up again because the kernel held it with a peer
+	// configuration the resource no longer has.
+	ReconnectedPeers []string
+
 	// Volumes carries per-volume DevicePath the satellite materialised
 	// during this apply. Empty when the resource is DISKLESS or the
 	// apply chain failed before assigning a device. The c-r reconciler
@@ -599,6 +609,26 @@ func (v *ResourceApplyVolumeResult) GetAppliedSizeKib() int64 {
 	}
 
 	return v.AppliedSizeKib
+}
+
+// GetWaitingForController reports whether the result is only a wait
+// for the controller's stamp — nil-safe.
+func (x *ResourceApplyResult) GetWaitingForController() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.WaitingForController
+}
+
+// GetReconnectedPeers returns the peers this apply reconnected after
+// the kernel dropped them — nil-safe.
+func (x *ResourceApplyResult) GetReconnectedPeers() []string {
+	if x == nil {
+		return nil
+	}
+
+	return x.ReconnectedPeers
 }
 
 // GetVolumes returns the per-volume slice — nil-safe.
@@ -672,6 +702,19 @@ type DeleteResourceRequest struct {
 	Name          string
 	StoragePool   string
 	VolumeNumbers []int32
+
+	// DeletedSuffix is the rename suffix recorded for this replica's
+	// zvols; see storage.SuffixedDeleter.
+	DeletedSuffix string
+}
+
+// GetDeletedSuffix returns the recorded rename suffix.
+func (x *DeleteResourceRequest) GetDeletedSuffix() string {
+	if x == nil {
+		return ""
+	}
+
+	return x.DeletedSuffix
 }
 
 // GetName returns the RD name.
@@ -830,6 +873,34 @@ func (x *CreateSnapshotResponse) GetMessage() string {
 type DeleteSnapshotRequest struct {
 	ResourceName string
 	SnapshotName string
+
+	// StoragePools are the satellite's diskful pools, asked when the
+	// satellite does not know the resource's pool: after the replica was
+	// deleted, or after a restart before the replica was applied again.
+	StoragePools []string
+
+	// DeletedSuffix is the rename suffix recorded on the Snapshot for
+	// this node; see storage.Snapshot.DeletedSuffix.
+	DeletedSuffix string
+}
+
+// GetDeletedSuffix returns the recorded rename suffix.
+func (x *DeleteSnapshotRequest) GetDeletedSuffix() string {
+	if x == nil {
+		return ""
+	}
+
+	return x.DeletedSuffix
+}
+
+// GetStoragePools returns the pools to search when the resource's own
+// pool is not known.
+func (x *DeleteSnapshotRequest) GetStoragePools() []string {
+	if x == nil {
+		return nil
+	}
+
+	return x.StoragePools
 }
 
 // GetResourceName returns the source RD name.

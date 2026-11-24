@@ -436,10 +436,11 @@ func crdToWireNode(crd *crdv1alpha1.Node) apiv1.Node {
 	}
 
 	out := apiv1.Node{
-		Name:             OriginalName(&crd.ObjectMeta),
-		Type:             crd.Spec.Type,
-		Props:            props,
-		ConnectionStatus: crd.Status.ConnectionStatus,
+		Name:                 OriginalName(&crd.ObjectMeta),
+		Type:                 crd.Spec.Type,
+		Props:                props,
+		ConnectionStatus:     crd.Status.ConnectionStatus,
+		SatelliteIncarnation: crd.Status.SatelliteIncarnation,
 	}
 
 	flags := make([]string, 0, len(crd.Spec.Flags)+len(crd.Status.Flags))

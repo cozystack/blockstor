@@ -72,6 +72,7 @@ func TestRecvSnapshotThickSetsRefreservation(t *testing.T) {
 			VolumeNumber: 0,
 			SizeKib:      1024 * 1024, // 1 GiB
 		},
+		storage.Snapshot{ResourceName: "pvc-1", SnapshotName: "s1"},
 		src,
 	)
 	if err != nil {
@@ -130,6 +131,7 @@ func TestRecvSnapshotThinNoRefreservation(t *testing.T) {
 			VolumeNumber: 0,
 			SizeKib:      1024 * 1024,
 		},
+		storage.Snapshot{ResourceName: "pvc-1", SnapshotName: "s1"},
 		src,
 	)
 	if err != nil {
@@ -155,12 +157,15 @@ func TestRecvSnapshotThinNoRefreservation(t *testing.T) {
 // the argv that SendSnapshot would have constructed for a given
 // snapshot; the test asserts the shape of that argv.
 func TestSendSnapshotArgvIncludesDashP(t *testing.T) {
-	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, storage.NewFakeExec())
+	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, newPool(t, "tank/pvc-1_00000", "tank/pvc-1_00000@snap-1"))
 
-	argv := p.SendSnapshotArgs(storage.Snapshot{
+	argv, err := p.SendSnapshotArgs(t.Context(), storage.Snapshot{
 		ResourceName: "pvc-1",
 		SnapshotName: "snap-1",
 	})
+	if err != nil {
+		t.Fatalf("SendSnapshotArgs: %v", err)
+	}
 
 	want := []string{"send", "-p", "tank/pvc-1_00000@snap-1"}
 	if !slices.Equal(argv, want) {

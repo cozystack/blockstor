@@ -89,11 +89,19 @@ const ConditionFilesystemFormatted = "FilesystemFormatted"
 // yet destroyed. Cached from the observer's events2 stream so the
 // reconciler's hot path can skip the `drbdsetup status` round-trip.
 //
-// SAFETY: like other Phase 11.3 Conditions, this is a hot-path
-// optimisation. A stale True value can only cause an extra adjust
-// (idempotent); a stale False causes the legacy probe path which
-// is correct but slow. The authoritative source remains the
-// kernel-direct probe (drbdsetup status / drbdmeta dump-md).
+// SAFETY: for the reconciler, like other Phase 11.3 Conditions, this
+// is a hot-path optimisation. A stale True value can only cause an
+// extra adjust (idempotent); a stale False causes the legacy probe
+// path which is correct but slow. The authoritative source remains
+// the kernel-direct probe (drbdsetup status / drbdmeta dump-md).
+//
+// The reads also answer a replica with no satellite state when this
+// is False, as LINSTOR does a replica whose kernel resource is gone,
+// but only while the stored status carries no disk state and no peer
+// link either. Nothing rewrites the Condition between events2
+// resource frames, so a False that outlived its replica's return
+// stays; every status write the observer makes carries the replica's
+// disk states, which keeps a stale False from hiding a running replica.
 const ConditionKernelLoaded = "KernelLoaded"
 
 // ConditionEncryptionKeyIgnored is stamped True when the parent
@@ -411,6 +419,12 @@ type ResourceStatus struct {
 	// +listMapKey=peerNodeName
 	// +optional
 	Connections []ResourceConnectionStatus `json:"connections,omitempty"`
+
+	// satelliteIncarnation is the node's status.satelliteIncarnation of
+	// the satellite process that wrote the runtime state above. Written
+	// by the satellite observer with that state; do not hand-set.
+	// +optional
+	SatelliteIncarnation string `json:"satelliteIncarnation,omitempty"`
 
 	// conditions represent the current state of the Resource.
 	// +listType=map

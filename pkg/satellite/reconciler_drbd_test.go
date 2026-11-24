@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/luks"
@@ -1344,11 +1345,63 @@ func TestApplyUnknownStoragePool(t *testing.T) {
 			results[0].GetMessage())
 	}
 
+	if results[0].GetWaitingForController() {
+		t.Errorf("a named pool this node has no provider for read as a wait; want a failed apply")
+	}
+
 	// No DRBD commands should fire — we bail before applyDRBD.
 	for _, line := range fx.CommandLines() {
 		if strings.HasPrefix(line, "drbdadm ") {
 			t.Errorf("drbdadm should not run when storage step fails: %s", line)
 		}
+	}
+}
+
+// A diskful replica whose volumes name no pool yet waits for it, like
+// the other stamps a fresh replica can be seen without: no storage is
+// touched and the result is a wait, not a failed apply. Reported as a
+// failure, it put an ApplyFailed Warning on a replica that came up a
+// second later.
+func TestApplyWithoutAPoolYetWaits(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-no-pool-yet",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply outer error: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("results: got %d, want 1", len(results))
+	}
+
+	if results[0].GetOk() || !results[0].GetWaitingForController() {
+		t.Fatalf("result Ok=%v WaitingForController=%v (%q); want a wait",
+			results[0].GetOk(), results[0].GetWaitingForController(), results[0].GetMessage())
+	}
+
+	if lines := fx.CommandLines(); len(lines) != 0 {
+		t.Errorf("a replica without a pool ran %v; want nothing run", lines)
 	}
 }
 
@@ -8264,4 +8317,125 @@ func indexOfSetGI(calls []string, rd string) int {
 	}
 
 	return -1
+}
+
+// poolWaitFixture is a reconciler with one thin pool, for the tests of
+// a diskful replica whose volumes name no pool.
+func poolWaitFixture(t *testing.T, dwell time.Duration) (*satellite.Reconciler, *storage.FakeExec) {
+	t.Helper()
+
+	fx := storage.NewFakeExec()
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+
+	return satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:           map[string]storage.Provider{"thin1": thin},
+		Adm:                 drbd.NewAdm(fx),
+		StateDir:            t.TempDir(),
+		NodeName:            "n1",
+		UnresolvedPoolDwell: dwell,
+	}), fx
+}
+
+func poolWaitReplica(pools ...string) *intent.DesiredResource {
+	dr := &intent.DesiredResource{
+		Name:            "pvc-pool-wait",
+		NodeName:        "n1",
+		SkipInitialSync: skipInitTrue(),
+		DrbdOptions: map[string]string{
+			"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+		},
+	}
+
+	for i, pool := range pools {
+		dr.Volumes = append(dr.Volumes, &intent.DesiredVolume{
+			VolumeNumber: int32(i), SizeKib: 1024 * 1024, StoragePool: pool,
+		})
+	}
+
+	return dr
+}
+
+func applyOneResult(t *testing.T, rec *satellite.Reconciler, dr *intent.DesiredResource) *intent.ResourceApplyResult {
+	t.Helper()
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{dr})
+	if err != nil {
+		t.Fatalf("Apply outer error: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("results: got %d, want 1", len(results))
+	}
+
+	return results[0]
+}
+
+// A diskful replica created or promoted without a pool keeps none:
+// nothing on the controller side fills one in later. Its wait for the
+// pool is bounded, and past it the apply fails and says how to name
+// the pool, so the operator gets the ApplyFailed Warning and the
+// back-off instead of a wait that never ends.
+func TestApplyWithoutAPoolFailsOnceTheWaitIsOver(t *testing.T) {
+	const dwell = 20 * time.Millisecond
+
+	rec, fx := poolWaitFixture(t, dwell)
+
+	first := applyOneResult(t, rec, poolWaitReplica(""))
+	if first.GetOk() || !first.GetWaitingForController() {
+		t.Fatalf("first pass Ok=%v WaitingForController=%v (%q); want a wait",
+			first.GetOk(), first.GetWaitingForController(), first.GetMessage())
+	}
+
+	time.Sleep(2 * dwell)
+
+	late := applyOneResult(t, rec, poolWaitReplica(""))
+	if late.GetOk() || late.GetWaitingForController() {
+		t.Fatalf("pass past the wait Ok=%v WaitingForController=%v (%q); want a failed apply",
+			late.GetOk(), late.GetWaitingForController(), late.GetMessage())
+	}
+
+	if !strings.Contains(late.GetMessage(), "--storage-pool") {
+		t.Errorf("failure %q does not say how to name the pool", late.GetMessage())
+	}
+
+	if lines := fx.CommandLines(); len(lines) != 0 {
+		t.Errorf("a replica without a pool ran %v; want nothing run", lines)
+	}
+}
+
+// The wait is per spell without a pool: once a pass sees the pool, a
+// later pass without one waits afresh rather than failing on the time
+// the earlier wait had run up.
+func TestAPoolThatArrivedEndsTheWait(t *testing.T) {
+	const dwell = 50 * time.Millisecond
+
+	rec, _ := poolWaitFixture(t, dwell)
+
+	applyOneResult(t, rec, poolWaitReplica(""))
+	time.Sleep(2 * dwell)
+	applyOneResult(t, rec, poolWaitReplica("thin1"))
+
+	again := applyOneResult(t, rec, poolWaitReplica(""))
+	if again.GetOk() || !again.GetWaitingForController() {
+		t.Fatalf("pass after the pool was seen Ok=%v WaitingForController=%v (%q); want a fresh wait",
+			again.GetOk(), again.GetWaitingForController(), again.GetMessage())
+	}
+}
+
+// A replica one of whose volumes has its pool and another not yet
+// touches no storage while it waits: materialising volume 0 alone
+// would leave a half-built replica behind a wait that may end in a
+// failure.
+func TestAReplicaWithAVolumeWithoutAPoolTouchesNoStorage(t *testing.T) {
+	rec, fx := poolWaitFixture(t, 0)
+
+	result := applyOneResult(t, rec, poolWaitReplica("thin1", ""))
+	if result.GetOk() || !result.GetWaitingForController() {
+		t.Fatalf("result Ok=%v WaitingForController=%v (%q); want a wait",
+			result.GetOk(), result.GetWaitingForController(), result.GetMessage())
+	}
+
+	if lines := fx.CommandLines(); len(lines) != 0 {
+		t.Errorf("a replica with a volume without a pool ran %v; want nothing run", lines)
+	}
 }

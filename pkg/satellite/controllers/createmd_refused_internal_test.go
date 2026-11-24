@@ -34,7 +34,7 @@ func TestARefusedCreateMDIsAWarningEventOnTheResource(t *testing.T) {
 	r := &ResourceReconciler{Config: Config{Recorder: recorder}}
 
 	message := refusedMessage + drbd.ErrCreateMDRefused.Error()
-	if !r.recordPerResourceFailures(res, []*intent.ResourceApplyResult{{Name: "pvc-1", Message: message}}, logr.Discard()) {
+	if failed, _ := r.recordPerResourceFailures(res, []*intent.ResourceApplyResult{{Name: "pvc-1", Message: message}}, logr.Discard()); !failed {
 		t.Fatal("a failed result was not reported as a failure")
 	}
 
@@ -73,6 +73,26 @@ func TestARefusedCreateMDIsNotRetriedOnTheFailureTimer(t *testing.T) {
 				t.Errorf("failureRequeue = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// The back-off of a failing apply never brings a refusal-only failure
+// back sooner than refusedApplyRequeue, and a failure that is not only
+// refusals starts on the back-off's first step.
+func TestRetryAfterApplyKeepsTheRefusalInterval(t *testing.T) {
+	t.Parallel()
+
+	refused := &intent.ResourceApplyResult{Name: "pvc-1", Message: refusedMessage + drbd.ErrCreateMDRefused.Error()}
+	other := &intent.ResourceApplyResult{Name: "pvc-2", Message: "drbdadm adjust pvc-2: exit status 10"}
+
+	r := &ResourceReconciler{}
+
+	if got := r.retryAfterApply("pvc-1", []*intent.ResourceApplyResult{refused}, true, false); got != refusedApplyRequeue {
+		t.Errorf("refusal only: retry after %v, want %v", got, refusedApplyRequeue)
+	}
+
+	if got := r.retryAfterApply("pvc-2", []*intent.ResourceApplyResult{other}, true, false); got != applyFailureRequeue {
+		t.Errorf("other failure: retry after %v, want %v", got, applyFailureRequeue)
 	}
 }
 

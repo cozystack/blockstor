@@ -195,6 +195,20 @@
 {
 "apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
+"prop_key": "DrbdOptions/Disk/block-size",
+"prop_value": "4096",
+"props_instance": "/SNAP_VLM_DFNS_VLM_DFN/PVC-VOL1/SNAP-GOOD/0"
+}
+},
+{
+"spec": {
+"prop_key": "Linstor/Drbd/freeze-block-size",
+"prop_value": "True",
+"props_instance": "/SNAP_VLM_DFNS_VLM_DFN/PVC-VOL1/SNAP-GOOD/0"
+}
+},
+{
+"spec": {
 "prop_key": "DrbdOptions/auto-add-quorum-tiebreaker",
 "prop_value": "True",
 "props_instance": "/CTRL"
