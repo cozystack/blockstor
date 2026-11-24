@@ -427,9 +427,21 @@ func isBareTokenByte(c byte) bool {
 // quoted string.
 const sharedSecretOption = "shared-secret"
 
+// DefaultCramHMACAlg is the digest LINSTOR writes next to the shared
+// secret of every resource it authenticates. The renderer never adds it
+// on its own: DRBD authenticates peers only once cram-hmac-alg is set,
+// and a satellite that started doing so for a resource whose peers have
+// not been rolled yet fails every handshake with them. It is written as
+// DrbdOptions/Net/cram-hmac-alg, by the LINSTOR converter for a
+// definition LINSTOR authenticated and by an operator for any other.
+const DefaultCramHMACAlg = "sha1"
+
 // writeNet emits the `net { … }` block when there is anything to emit
 // (a shared secret or any free-form option). drbd treats an empty `net
 // {}` as legal but noisy, so we skip it entirely when unused.
+//
+// cram-hmac-alg is rendered only as an option like any other, never
+// inferred from a shared secret; see DefaultCramHMACAlg.
 func writeNet(b *strings.Builder, n Net) {
 	if n.SharedSecret == "" && len(n.Options) == 0 {
 		return

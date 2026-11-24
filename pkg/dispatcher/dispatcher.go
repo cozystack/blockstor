@@ -791,6 +791,15 @@ func DiskfulPeersAllocated(target *blockstoriov1alpha1.Resource, peers []blockst
 	return diskfulPeersAllocated(target, peers)
 }
 
+// AllocatedNodeID is the exported façade over `nodeIDOf`: the replica's
+// DRBD node-id, Spec first, and false when neither Spec nor Status
+// carries one yet.
+func AllocatedNodeID(r *blockstoriov1alpha1.Resource) (int32, bool) {
+	id := nodeIDOf(r)
+
+	return id, id >= 0
+}
+
 // buildVolumes turns the parent ResourceDefinition's VolumeDefinitions
 // into DesiredVolumes for the satellite. DISKLESS replicas still get
 // volume entries — DRBD-9 needs a `volume { ... }` block per peer in
@@ -902,6 +911,7 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 			StoragePool:    pool,
 			SeedFromGI:     seedFromGI(target, vd.VolumeNumber),
 			ObservedGI:     observedGI(target, vd.VolumeNumber),
+			AppliedSizeKib: appliedSizeKib(target, vd.VolumeNumber),
 			SourceSnapshot: srcSnapshot,
 			MetaPool:       metaPool,
 			Minor:          minor,
@@ -986,6 +996,18 @@ func observedGI(target *blockstoriov1alpha1.Resource, volumeNumber int32) string
 	}
 
 	return ""
+}
+
+// appliedSizeKib returns the size the satellite last finished applying
+// for this volume on the target replica, or 0 when it never reported one.
+func appliedSizeKib(target *blockstoriov1alpha1.Resource, volumeNumber int32) int64 {
+	for i := range target.Status.Volumes {
+		if target.Status.Volumes[i].VolumeNumber == volumeNumber {
+			return target.Status.Volumes[i].AppliedSizeKib
+		}
+	}
+
+	return 0
 }
 
 // kubeInternalNICName is the well-known NetInterface name carrying the

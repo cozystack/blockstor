@@ -152,10 +152,10 @@ func TestPinLayerStackGivesAFreshRDItsGroupsStack(t *testing.T) {
 	}
 }
 
-// Nothing watches a group's stack on an RD's behalf: an RD whose group
-// has no stack yet picks one up only on its next reconcile, which the
-// controller schedules every time.
-func TestPinLayerStackComesBackForAGroupWithoutAStack(t *testing.T) {
+// An RD whose group has no stack yet is left unpinned and waits for the
+// group's change (groupLayerStackChanged) rather than coming back on a
+// timer.
+func TestPinLayerStackWaitsForAGroupWithoutAStack(t *testing.T) {
 	t.Parallel()
 
 	got := reconcilePin(t, pinClient(t, pinGroup(), pinRD("rg-pin")))
@@ -163,8 +163,12 @@ func TestPinLayerStackComesBackForAGroupWithoutAStack(t *testing.T) {
 		t.Fatalf("reconcile: %v", got.err)
 	}
 
-	if got.result.RequeueAfter != controllerpkg.RDReconcileRequeue {
-		t.Errorf("requeue after %v, want %v", got.result.RequeueAfter, controllerpkg.RDReconcileRequeue)
+	if len(got.rd.Spec.LayerStack) != 0 {
+		t.Errorf("pinned %v from a group with no stack", got.rd.Spec.LayerStack)
+	}
+
+	if got.result.RequeueAfter != 0 {
+		t.Errorf("requeue after %v, want none", got.result.RequeueAfter)
 	}
 }
 

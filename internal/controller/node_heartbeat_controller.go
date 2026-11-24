@@ -46,8 +46,14 @@ const (
 
 	// NodeMonitorGracePeriod is the staleness window past which a
 	// Node's Ready Condition flips to Unknown. Matches
-	// `--node-monitor-grace-period=40s`.
-	NodeMonitorGracePeriod = 40 * time.Second
+	// `--node-monitor-grace-period=50s`, the default since
+	// Kubernetes 1.32. It was 40s before, which is shorter than the
+	// 45s an API client takes to drop a connection to an API server
+	// that died silently: a satellite whose connection sat on the
+	// failed node's API server went OFFLINE although its own node
+	// never stopped. The window has to outlast one API endpoint
+	// failover, not just one missed stamp.
+	NodeMonitorGracePeriod = 50 * time.Second
 
 	// HeartbeatWatchdogFieldOwner is the SSA manager the watchdog
 	// uses when it owns the Ready Condition + ConnectionStatus.

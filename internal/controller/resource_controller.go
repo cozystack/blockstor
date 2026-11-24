@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -122,17 +123,49 @@ type ResourceReconciler struct {
 	// not cross-object). This is Bug 306: batch autoplace
 	// (parallel `rd create`+autoplace) produces RDs with colliding
 	// DRBD ports → satellite-side .res collision. Holding this mutex
-	// across {list taken → pick free → Status patch} on the parent
-	// RD makes the cross-RD allocation atomic in-process. Combined
-	// with APIReader-direct reads, this guarantees collision-free
-	// allocation under batch creation. Single-controller process
-	// (Deployment replicas=1 + leader election in HA) is the
-	// supported topology, so an in-process mutex is sufficient.
+	// across {list taken → pick free → reserve in the ledger} makes
+	// the cross-RD allocation atomic in-process: the ledger holds a
+	// value from the moment it is chosen until the cache shows it
+	// written, so the writes themselves run outside the mutex (see
+	// reserveIdentities).
+	// Single-controller process (Deployment replicas=1 + leader
+	// election in HA) is the supported topology, so an in-process
+	// mutex is sufficient.
 	clusterAllocMu sync.Mutex
+
+	// ledger holds the identities chosen under clusterAllocMu that
+	// the cache may not show yet; see allocLedger.
+	ledger allocLedger
+
+	// Workers is how many Resources reconcile at once; zero means
+	// DefaultResourceWorkers.
+	Workers int
 
 	// conflicts retries a pass that lost an optimistic-concurrency
 	// race and counts such races per object.
 	conflicts conflict.Retrier
+}
+
+// DefaultResourceWorkers is how many Resources the controller
+// reconciles at once.
+//
+// Every status report a satellite writes reconciles the replica and
+// its siblings. With one worker a new replica waited for its DRBD
+// identities behind all of them, and the satellites build nothing
+// before those exist: a burst of 16 new volumes on a cluster with
+// about 400 replicas left replicas waiting more than a minute, past
+// the CSI provisioner's deadline. Allocation itself stays serialised
+// by clusterAllocMu; the other workers keep the rest of the queue
+// moving meanwhile.
+const DefaultResourceWorkers = 8
+
+// workers returns the configured worker count, or the default.
+func (r *ResourceReconciler) workers() int {
+	if r.Workers > 0 {
+		return r.Workers
+	}
+
+	return DefaultResourceWorkers
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;create;update;patch;delete
@@ -222,9 +255,13 @@ func (r *ResourceReconciler) ReconcilePass(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
-	// Bug 302: allocate DRBD-IDs unconditionally on every live
-	// Resource Reconcile. The satellite's `waitForControllerAllocation`
-	// gate stalls until Status.DRBD{NodeID,Port,Minor} are non-nil,
+	// Bug 302: allocate DRBD-IDs on every live Resource Reconcile
+	// whose definition has a DRBD layer. A definition without one
+	// gets none, as in LINSTOR, where they are DRBD layer data, and
+	// one whose group stack is not pinned onto it yet waits for the
+	// pin instead of guessing (see replicaUsesDRBD). The satellite's
+	// `waitForControllerAllocation` gate stalls until
+	// Status.DRBD{NodeID,Port,Minor} are non-nil on a DRBD replica,
 	// and gating allocation behind `runApply`'s long-tail housekeeping
 	// (seed-from-Gi, auto-diskful) left a window where transient
 	// errors deeper in the apply chain prevented allocation from
@@ -248,15 +285,9 @@ func (r *ResourceReconciler) ReconcilePass(ctx context.Context, req ctrl.Request
 	// resourceVersion stays valid for the downstream Spec writers;
 	// requeue when allocation actually mutated state so the next
 	// pass observes the fresh revision uniformly.
-	allocCopy := target.DeepCopy()
-
-	allocated, err := r.ensureDRBDIDs(ctx, allocCopy, nil)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if allocated {
-		return ctrl.Result{Requeue: true}, nil
+	result, done, err := r.allocateDRBDIDsIfUsed(ctx, &target)
+	if err != nil || done {
+		return result, err
 	}
 
 	return r.runApply(ctx, &target)
@@ -367,8 +398,10 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 	}
 
 	// Bug 302: DRBD-ID allocation moved to top-of-Reconcile (above the
-	// orphan gate) so it runs unconditionally on every Reconcile pass —
-	// the satellite's `waitForControllerAllocation` gate stalls until
+	// orphan gate) so it runs on every Reconcile pass of a replica whose
+	// definition has a DRBD layer, skipped for one without and held back
+	// until the layer stack is pinned (replicaUsesDRBD) — the
+	// satellite's `waitForControllerAllocation` gate stalls until
 	// Status.DRBD{NodeID,Port,Minor} are non-nil, and gating allocation
 	// behind `runApply` left a window where a Resource that hit the
 	// orphan branch or short-circuited before `runApply` could never
@@ -407,13 +440,14 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 	}
 
 	// Auto-diskful: when a DISKLESS replica is actively used by a
-	// consumer (InUse=true on this node) AND the hosting node has
-	// a viable storage pool, promote it to diskful so reads stay
-	// local. Cleanup (demote on idle) is intentionally not
-	// automated yet — needs hysteresis to avoid flapping on
-	// transient opens; operators demote via `linstor r d` until
-	// then.
-	promoted, err := r.maybeAutoDiskful(ctx, target)
+	// consumer (InUse=true on this node), the hosting node has a
+	// viable storage pool AND the volume has fewer diskful replicas
+	// than its resource group's place count, promote it to diskful
+	// so the lost copy is refilled where the volume is used. Cleanup
+	// (demote on idle) is intentionally not automated yet — needs
+	// hysteresis to avoid flapping on transient opens; operators
+	// demote via `linstor r d` until then.
+	promoted, err := r.maybeAutoDiskful(ctx, target, peers, rdPtr)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -437,7 +471,20 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 // satellite reconciler picks up the spec change on the next pass
 // and creates the LV/zvol + attach. Returns true when Spec was
 // mutated so the caller can requeue.
-func (r *ResourceReconciler) maybeAutoDiskful(ctx context.Context, target *blockstoriov1alpha1.Resource) (bool, error) {
+//
+// A volume that already has its resource group's place count of
+// diskful replicas keeps the diskless attach diskless: a pod or a VM
+// moving to a node without a replica would otherwise copy the whole
+// volume there and leave it with more diskful replicas than the
+// storage class asks for. Only a deficit (a copy was lost) is refilled
+// through the node that uses the volume. When the place count can't
+// be read nothing is promoted.
+func (r *ResourceReconciler) maybeAutoDiskful(
+	ctx context.Context,
+	target *blockstoriov1alpha1.Resource,
+	peers []blockstoriov1alpha1.Resource,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+) (bool, error) {
 	if !slices.Contains(target.Spec.Flags, apiv1.ResourceFlagDiskless) {
 		return false, nil
 	}
@@ -450,6 +497,15 @@ func (r *ResourceReconciler) maybeAutoDiskful(ctx context.Context, target *block
 		// Tiebreaker witnesses must stay diskless — they're chosen
 		// for the network presence, not local storage. Promoting a
 		// tiebreaker would defeat the quorum semantic.
+		return false, nil
+	}
+
+	hasDeficit, err := r.hasDiskfulDeficit(ctx, peers, rd)
+	if err != nil {
+		return false, err
+	}
+
+	if !hasDeficit {
 		return false, nil
 	}
 
@@ -483,6 +539,75 @@ func (r *ResourceReconciler) maybeAutoDiskful(ctx context.Context, target *block
 	}
 
 	return true, nil
+}
+
+// hasDiskfulDeficit reports whether the volume has fewer live diskful
+// replicas than its resource group's place count. Diskless replicas,
+// replicas flagged DELETE (or INACTIVE), replicas being deleted and
+// replicas on EVICTED or LOST nodes don't count, the same way the
+// auto-diskful timer drops them. A definition without a resource group, a resource group
+// that can't be read, or a missing definition yields false so nothing
+// is promoted on a guess. A place count of 0 (the default group ships
+// with it) reads as 1, the way the placer treats it.
+func (r *ResourceReconciler) hasDiskfulDeficit(
+	ctx context.Context,
+	peers []blockstoriov1alpha1.Resource,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+) (bool, error) {
+	if rd == nil || rd.Spec.ResourceGroupName == "" {
+		return false, nil
+	}
+
+	rg, err := r.Store.ResourceGroups().Get(ctx, rd.Spec.ResourceGroupName)
+	if err != nil {
+		if cerrors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	placeCount := int(rg.SelectFilter.PlaceCount)
+	if placeCount == 0 {
+		placeCount = 1
+	}
+
+	nodes, err := r.Store.Nodes().List(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	disabled := make(map[string]struct{}, len(nodes))
+
+	for i := range nodes {
+		if isDisabledNode(&nodes[i]) {
+			disabled[naming.Key(nodes[i].Name)] = struct{}{}
+		}
+	}
+
+	diskful := 0
+
+	for i := range peers {
+		if peers[i].DeletionTimestamp != nil {
+			continue
+		}
+
+		if _, gone := disabled[naming.Key(peers[i].Spec.NodeName)]; gone {
+			continue
+		}
+
+		if slices.ContainsFunc(peers[i].Spec.Flags, func(f string) bool {
+			return f == apiv1.ResourceFlagDiskless ||
+				f == apiv1.ResourceFlagDelete ||
+				f == apiv1.ResourceFlagInactive
+		}) {
+			continue
+		}
+
+		diskful++
+	}
+
+	return diskful < placeCount, nil
 }
 
 // firstAvailablePool returns any non-diskless storage pool present on
@@ -646,31 +771,22 @@ func (r *ResourceReconciler) allocateAndApplyDRBDIDs(ctx context.Context, reader
 		return false, err
 	}
 
-	// Hold the process-wide cross-RD/cross-node allocation mutex
-	// across the whole {read taken-set → pick free → patch Spec}
-	// sequence. Port allocation is now PER-NODE, so two DIFFERENT RDs
-	// whose replicas land on the SAME node must not both observe the
-	// same taken-set and pick the same port (Bug 306, same-node
-	// variant); minor allocation is cluster-wide and races the same
-	// way. The mutex makes both strictly serial in-process; the
-	// APIReader-direct reads then observe the prior allocator's
-	// committed Spec. (The per-RD allocMu held by ensureDRBDIDs only
-	// serialises replicas of ONE RD — it does not cover cross-RD
-	// same-node port collisions.)
-	r.clusterAllocMu.Lock()
-	defer r.clusterAllocMu.Unlock()
+	// One uncached read of the definition serves every decision below
+	// that depends on it: the preferred port, the skip-initial-sync
+	// latch and the volume minors. The copy may go stale before the
+	// minors are written (a restore, a migration or `vd c` can write
+	// the definition meanwhile); the minor write carries its
+	// resourceVersion, so a stale copy ends in a conflict and a fresh
+	// pass, never in a lost volume.
+	rd, err := r.definitionForAllocation(ctx, reader, target.Spec.ResourceDefinitionName)
+	if err != nil {
+		return false, err
+	}
 
 	originalSpec := target.Spec.DeepCopy()
 	originalStatus := target.Status.DeepCopy()
 
-	// (1) one-time status→spec backfill for objects created before
-	// this refactor: copy the legacy Status identities into Spec when
-	// Spec is still nil. Runs BEFORE the allocate-if-nil pass and is
-	// idempotent (guarded on Spec==nil && Status!=nil).
-	backfillResourceSpecFromStatus(target)
-
-	// (2) allocate any still-missing per-replica identities INTO Spec.
-	err = r.allocateResourceSpecFields(ctx, target)
+	picked, err := r.reserveIdentities(ctx, target, rd, originalSpec)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return false, nil
@@ -679,10 +795,10 @@ func (r *ResourceReconciler) allocateAndApplyDRBDIDs(ctx context.Context, reader
 		return false, err
 	}
 
-	// (3) ensure the parent RD's per-volume minors (separate object /
+	// (3) persist the parent RD's per-volume minors (separate object /
 	// separate patch). Returns whether the RD Spec was mutated and the
 	// volume-0 minor (mirrored onto Status below).
-	minorMutated, vol0Minor, err := r.ensureRDVolumeMinors(ctx, target)
+	minorMutated, vol0Minor, err := r.persistRDVolumeMinors(ctx, reader, rd, picked)
 	if err != nil {
 		return false, err
 	}
@@ -716,6 +832,94 @@ func (r *ResourceReconciler) allocateAndApplyDRBDIDs(ctx context.Context, reader
 	}
 
 	return specMutated || statusMutated || minorMutated, nil
+}
+
+// reserveIdentities picks every identity target and its definition
+// still lack and reserves them in the ledger, under clusterAllocMu.
+// It returns a copy of rd carrying the minors it picked, or nil when
+// the definition needs none.
+//
+// The lock covers the choice, not the writes that persist it, the way
+// LINSTOR hands out a node id, port and minor from its in-memory pools
+// and commits them afterwards. The taken sets come from the cache plus
+// the ledger, and a value is in the ledger from the moment it is
+// chosen, so the next allocation already sees it as taken while this
+// one is still writing. Holding the lock across the writes made every
+// new replica of a burst wait for the API round trips of all the ones
+// before it, and the satellites build nothing before a replica and its
+// peers have their identities.
+func (r *ResourceReconciler) reserveIdentities(
+	ctx context.Context,
+	target *blockstoriov1alpha1.Resource,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+	originalSpec *blockstoriov1alpha1.ResourceSpec,
+) (*blockstoriov1alpha1.ResourceDefinition, error) {
+	// Port allocation is PER-NODE, so two DIFFERENT RDs whose replicas
+	// land on the SAME node must not both observe the same taken-set
+	// and pick the same port (Bug 306, same-node variant); minor
+	// allocation is cluster-wide and races the same way. (The per-RD
+	// allocMu held by ensureDRBDIDs only serialises replicas of ONE
+	// RD.)
+	r.clusterAllocMu.Lock()
+	defer r.clusterAllocMu.Unlock()
+
+	// (1) one-time status→spec backfill for objects created before
+	// this refactor: copy the legacy Status identities into Spec when
+	// Spec is still nil. Runs BEFORE the allocate-if-nil pass and is
+	// idempotent (guarded on Spec==nil && Status!=nil).
+	backfillResourceSpecFromStatus(target)
+
+	// (2) allocate any still-missing per-replica identities INTO Spec.
+	err := r.allocateResourceSpecFields(ctx, target, rd)
+	if err != nil {
+		return nil, err
+	}
+
+	var picked *blockstoriov1alpha1.ResourceDefinition
+
+	if rd != nil && len(rd.Spec.VolumeDefinitions) > 0 && !rdVolumeMinorsComplete(rd) {
+		draft := rd.DeepCopy()
+
+		mutated, err := r.allocateRDVolumeMinors(ctx, draft)
+		if err != nil {
+			return nil, err
+		}
+
+		if mutated {
+			r.ledger.recordMinors(draft)
+			picked = draft
+		}
+	}
+
+	// Reserve before writing: a patch whose answer is lost may still
+	// have landed, and the retry then finds nothing to allocate and
+	// nothing to record.
+	if !equalResourceIdentitySpec(originalSpec, &target.Spec) {
+		r.ledger.recordReplica(target)
+	}
+
+	return picked, nil
+}
+
+// definitionForAllocation reads the parent definition past the cache,
+// or returns nil when it is absent (unit-test fast path / rd-delete in
+// flight): the allocator then leaves the decisions that need it for a
+// later pass.
+func (r *ResourceReconciler) definitionForAllocation(
+	ctx context.Context, reader client.Reader, rdName string,
+) (*blockstoriov1alpha1.ResourceDefinition, error) {
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := reader.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &rd)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil, nil //nolint:nilnil // absent definition: nothing to decide from yet
+		}
+
+		return nil, err
+	}
+
+	return &rd, nil
 }
 
 // backfillResourceSpecFromStatus copies the legacy per-replica Status
@@ -753,7 +957,9 @@ func backfillResourceSpecFromStatus(target *blockstoriov1alpha1.Resource) {
 // instead of the whole cluster sharing it. The optional RD.Spec.
 // DRBDPort preferred seed is tried first on the node; on collision the
 // allocator falls back to the lowest per-node-free port.
-func (r *ResourceReconciler) allocateResourceSpecFields(ctx context.Context, target *blockstoriov1alpha1.Resource) error {
+func (r *ResourceReconciler) allocateResourceSpecFields(
+	ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition,
+) error {
 	if target.Spec.DRBDNodeID == nil {
 		id, err := r.allocateNodeIDLocked(ctx, target)
 		if err != nil {
@@ -764,7 +970,7 @@ func (r *ResourceReconciler) allocateResourceSpecFields(ctx context.Context, tar
 	}
 
 	if target.Spec.DRBDPort == nil {
-		port, err := r.allocatePortForNode(ctx, target)
+		port, err := r.allocatePortForNode(ctx, target, preferredPort(rd))
 		if err != nil {
 			return err
 		}
@@ -783,40 +989,12 @@ func (r *ResourceReconciler) allocateResourceSpecFields(ctx context.Context, tar
 	// absent (unit-test fast path / rd-delete in flight) we leave it nil
 	// and the runApply-side ensureSkipInitSyncDecision fallback stamps it
 	// once the RD is observable.
-	if target.Spec.SkipInitialSync == nil {
-		skip, ok, err := r.rdInitializedForResource(ctx, target.Spec.ResourceDefinitionName)
-		if err != nil {
-			return err
-		}
-
-		if ok {
-			v := !skip
-			target.Spec.SkipInitialSync = &v
-		}
+	if target.Spec.SkipInitialSync == nil && rd != nil {
+		v := !rdInitialized(rd)
+		target.Spec.SkipInitialSync = &v
 	}
 
 	return nil
-}
-
-// rdInitializedForResource reads the parent RD's append-only
-// initialized latch. Returns (initialized, rdFound, err). rdFound=false
-// (RD absent — unit-test fast path or rd-delete in flight) tells the
-// caller to defer the SkipInitialSync stamp to a later pass rather than
-// guess. Uses the direct APIReader for the same cache-trail reason the
-// allocator's other reads do.
-func (r *ResourceReconciler) rdInitializedForResource(ctx context.Context, rdName string) (bool, bool, error) {
-	var rd blockstoriov1alpha1.ResourceDefinition
-
-	err := r.apiReader().Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &rd)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			return false, false, nil
-		}
-
-		return false, false, err
-	}
-
-	return rdInitialized(&rd), true, nil
 }
 
 // mirrorIdentitiesToStatus copies the authoritative Spec identities
@@ -1342,7 +1520,7 @@ func (r *ResourceReconciler) ensureSkipInitSyncDecision(ctx context.Context, tar
 	// permanently poison the RD (every later re-created replica then
 	// full-syncs a never-written volume — the r-full Phase-2 flake).
 	// See anyProvenDataBearingDiskfulPeer.
-	if !rdInitialized(rd) && anyProvenDataBearingDiskfulPeer(peers, "") {
+	if !rdInitialized(rd) && (anyProvenDataBearingDiskfulPeer(peers, "") || restoredDefinitionInUse(rd, peers)) {
 		if err := r.patchRDInitialized(ctx, rd.Name); err != nil {
 			if errors.IsNotFound(err) {
 				return false, nil
@@ -1376,6 +1554,31 @@ func (r *ResourceReconciler) ensureSkipInitSyncDecision(ctx context.Context, tar
 	}
 
 	return true, nil
+}
+
+// restoredDefinitionInUse reports whether rd was restored or cloned from a
+// snapshot and one of its replicas has been Primary, which ends its
+// restore set. The satellite seeds a replica cloned from the snapshot
+// UpToDate on its own only while the RD is not Initialized; once the
+// volume is in use a new clone of the old snapshot is stale, so the RD is
+// latched and every later replica syncs from a peer, as one LINSTOR
+// places next to a restored resource does.
+//
+// The GI scan cannot stand in for this: a Primary connected to all its
+// peers keeps the day0 current UUID it was restored with however much it
+// writes, so the restored RD would never read as data-bearing.
+func restoredDefinitionInUse(rd *blockstoriov1alpha1.ResourceDefinition, peers []blockstoriov1alpha1.Resource) bool {
+	if rd.Spec.Props[store.RestoreFromSnapshotProp] == "" {
+		return false
+	}
+
+	for i := range peers {
+		if peers[i].Status.InUse || drbd.Role(peers[i].Status.Role).IsPrimary() {
+			return true
+		}
+	}
+
+	return false
 }
 
 // rdInitialized reports whether the RD's append-only initialized latch
@@ -1445,87 +1648,56 @@ func ptrEqI32(a, b *int32) bool {
 	}
 }
 
-// ensureRDVolumeMinors allocates a per-volume DRBD minor on the parent
-// RD's Spec.VolumeDefinitions for every volume that still lacks one,
-// following the clusterIP model: a non-nil minor is authoritative and
-// NEVER overwritten (restore-safe / settable-once), a nil minor gets
-// allocated from the cluster-wide free set and written back to the RD
-// Spec under optimistic concurrency.
+// persistRDVolumeMinors writes the per-volume DRBD minors
+// reserveIdentities picked for the parent RD's
+// Spec.VolumeDefinitions. It chooses nothing itself: the choice, the
+// legacy base+k backfill included, is allocateRDVolumeMinors', made
+// under clusterAllocMu. The write runs after that lock is released and
+// carries the resourceVersion of the copy the choice was made on, so a
+// definition written meanwhile ends in a conflict, never in a clobbered
+// volume list.
 //
-// Per-volume (not per-RD base+k): each VolumeDefinition carries its own
-// minor, so adoption can preserve arbitrary, possibly non-contiguous
-// LINSTOR minors verbatim. Native allocation stays contiguous-ish (it
-// hands out the lowest free value per volume) but never assumes
-// contiguity — the satellite renders each volume's own minor.
-//
-// One-time backfill: when every VolumeDefinition minor is nil but the
-// legacy RD.Status.DRBDMinor base is set, the volumes are seeded with
-// base+volumeIndex (preserving the pre-refactor base+k behaviour) so an
-// upgraded cluster keeps its existing /dev/drbd<N> device paths.
-//
-// Returns (mutated, vol0Minor, err): mutated is true when the RD Spec
-// was patched; vol0Minor is the minor of volume 0 (mirrored onto the
+// rd is the definition as read before the choice, picked the copy
+// carrying the chosen minors, nil when nothing was chosen. Returns
+// (mutated, vol0Minor, err): mutated is true when the RD Spec was
+// patched; vol0Minor is the minor of volume 0 (mirrored onto the
 // Resource Status for backward-compat readers), nil when the RD is
 // absent or has no volume 0.
-//
-// Cross-RD allocation is serialised by clusterAllocMu: two RDs
-// reconciling at once would otherwise both observe the same free set
-// and both pick the same minor (Kube optimistic concurrency is
-// per-object, so writing to different RDs' Specs never conflicts).
-func (r *ResourceReconciler) ensureRDVolumeMinors(ctx context.Context, target *blockstoriov1alpha1.Resource) (bool, *int32, error) {
-	rdName := target.Spec.ResourceDefinitionName
-	reader := r.apiReader()
-
-	var rd blockstoriov1alpha1.ResourceDefinition
-
-	err := reader.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &rd)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			// RD absent (unit-test fast path / rd-delete in flight).
-			// No RD Spec to allocate on; the .res renderer falls back
-			// to the deterministic deriveMinor() until the RD exists.
+func (r *ResourceReconciler) persistRDVolumeMinors(
+	ctx context.Context, reader client.Reader, rd, picked *blockstoriov1alpha1.ResourceDefinition,
+) (bool, *int32, error) {
+	if picked == nil {
+		if rd == nil {
 			return false, nil, nil
 		}
 
-		return false, nil, err
+		return false, vol0MinorOf(rd), nil
 	}
 
-	if len(rd.Spec.VolumeDefinitions) == 0 {
-		return false, nil, nil
+	err := r.patchRDVolumeMinors(ctx, picked)
+	if err == nil {
+		return true, vol0MinorOf(picked), nil
 	}
 
-	if rdVolumeMinorsComplete(&rd) {
-		return false, vol0MinorOf(&rd), nil
-	}
+	if errors.IsConflict(err) {
+		// The definition moved on since it was read. When another
+		// writer set the minors meanwhile, take theirs. Any other
+		// write (status, metadata, a new volume) leaves them unset:
+		// hand the conflict back so the whole pass runs again on a
+		// fresh read, rather than writing the replica without a minor
+		// on its definition and waiting for some later event.
+		var fresh blockstoriov1alpha1.ResourceDefinition
+		if gerr := reader.Get(ctx, client.ObjectKey{Name: naming.Key(picked.Name)}, &fresh); gerr == nil &&
+			rdVolumeMinorsComplete(&fresh) {
+			r.clusterAllocMu.Lock()
+			r.ledger.recordMinors(&fresh)
+			r.clusterAllocMu.Unlock()
 
-	// Caller (allocateAndApplyDRBDIDs) holds clusterAllocMu across the
-	// whole allocation sequence, so cross-RD minor allocation is
-	// already serialised and the APIReader read above observed any
-	// prior allocator's committed minors.
-	mutated, err := r.allocateRDVolumeMinors(ctx, &rd)
-	if err != nil {
-		return false, nil, err
-	}
-
-	if !mutated {
-		return false, vol0MinorOf(&rd), nil
-	}
-
-	if err = r.patchRDVolumeMinors(ctx, &rd); err != nil {
-		if errors.IsConflict(err) {
-			// Sibling reconcile committed minors first. Re-read and
-			// return whatever it stamped — the next reconcile observes
-			// the committed values uniformly.
-			var fresh blockstoriov1alpha1.ResourceDefinition
-			if gerr := reader.Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &fresh); gerr == nil {
-				return false, vol0MinorOf(&fresh), nil
-			}
+			return false, vol0MinorOf(&fresh), nil
 		}
-
-		return false, nil, err
 	}
 
-	return true, vol0MinorOf(&rd), nil
+	return false, nil, err
 }
 
 // rdVolumeMinorsComplete reports whether every VolumeDefinition on the
@@ -1641,7 +1813,7 @@ func backfillRDMinorsFromStatus(rd *blockstoriov1alpha1.ResourceDefinition) bool
 // BUG-048 (P1, the silent VD drop): because a JSON merge-patch REPLACES
 // the volumeDefinitions array (RFC 7386 has no array-merge), this write
 // stamps the WHOLE list from the in-memory snapshot the reconciler read
-// at the top of ensureRDVolumeMinors. If a concurrent number-less
+// before reserveIdentities chose the minors. If a concurrent number-less
 // `linstor vd c` appended a new volume AFTER that read but before this
 // patch, the wholesale replace silently drops it — and both `vd c`
 // return success because the clobber is an async reconciler write, not
@@ -1714,7 +1886,7 @@ func (r *ResourceReconciler) patchRDVolumeMinors(ctx context.Context, rd *blocks
 // RD.Spec.DRBDPort preferred seed first; on a per-node collision (or
 // no seed) falls back to the lowest per-node-free port in the node's
 // range.
-func (r *ResourceReconciler) allocatePortForNode(ctx context.Context, target *blockstoriov1alpha1.Resource) (int32, error) {
+func (r *ResourceReconciler) allocatePortForNode(ctx context.Context, target *blockstoriov1alpha1.Resource, seed *int32) (int32, error) {
 	low, high, err := r.portRangeForNode(ctx, target.Spec.NodeName)
 	if err != nil {
 		return 0, err
@@ -1727,7 +1899,7 @@ func (r *ResourceReconciler) allocatePortForNode(ctx context.Context, target *bl
 
 	// Try the RD's preferred-port seed first when it is free on this
 	// node and inside the node's range.
-	if seed := r.rdPreferredPort(ctx, target.Spec.ResourceDefinitionName); seed != nil {
+	if seed != nil {
 		if *seed >= low && *seed <= high && !slices.Contains(taken, *seed) {
 			return *seed, nil
 		}
@@ -1736,11 +1908,10 @@ func (r *ResourceReconciler) allocatePortForNode(ctx context.Context, target *bl
 	return drbd.LowestFreePort(taken, low, high)
 }
 
-// rdPreferredPort reads the optional RD.Spec.DRBDPort preferred-port
-// seed. Returns nil when the RD is absent or sets no preference.
-func (r *ResourceReconciler) rdPreferredPort(ctx context.Context, rdName string) *int32 {
-	var rd blockstoriov1alpha1.ResourceDefinition
-	if err := r.apiReader().Get(ctx, client.ObjectKey{Name: naming.Key(rdName)}, &rd); err != nil {
+// preferredPort is the optional RD.Spec.DRBDPort preferred-port seed,
+// nil when the RD is absent or sets no preference.
+func preferredPort(rd *blockstoriov1alpha1.ResourceDefinition) *int32 {
+	if rd == nil {
 		return nil
 	}
 
@@ -1765,20 +1936,20 @@ func (r *ResourceReconciler) apiReader() client.Reader {
 // the named RD. Used by the per-RD allocator to intersect each
 // node's port/minor range.
 func (r *ResourceReconciler) hostingNodesForRD(ctx context.Context, rdName string) ([]string, error) {
-	list := &blockstoriov1alpha1.ResourceList{}
-	if err := r.List(ctx, list); err != nil {
+	replicas, err := r.cachedResources(ctx)
+	if err != nil {
 		return nil, err
 	}
 
 	seen := map[string]bool{}
-	out := make([]string, 0, len(list.Items))
+	out := make([]string, 0, len(replicas))
 
-	for i := range list.Items {
-		if !isReplicaOf(&list.Items[i], rdName) {
+	for i := range replicas {
+		if !isReplicaOf(&replicas[i], rdName) {
 			continue
 		}
 
-		node := list.Items[i].Spec.NodeName
+		node := replicas[i].Spec.NodeName
 		if seen[naming.Key(node)] {
 			continue
 		}
@@ -1853,28 +2024,37 @@ func (r *ResourceReconciler) intersectRange(
 // resources inside the 20000-20999 window instead of the whole cluster
 // sharing it.
 //
-// Reads the authoritative Spec.DRBDPort. Uses APIReader (uncached) so
-// concurrent allocations on the same node observe each other's
-// freshly-committed Spec instead of a stale informer snapshot;
-// combined with the per-RD/cluster mutexes this keeps same-node
+// Reads the authoritative Spec.DRBDPort from the cache, plus the ports
+// this controller reserved that the cache does not show yet (allocLedger);
+// with clusterAllocMu held by the caller this keeps same-node
 // allocation collision-free.
 func (r *ResourceReconciler) takenPortsOnNode(ctx context.Context, nodeName, selfName string) ([]int32, error) {
 	out := make([]int32, 0, takenAllocsInitialCap)
-	reader := r.apiReader()
 
-	var resList blockstoriov1alpha1.ResourceList
-	if err := reader.List(ctx, &resList); err != nil {
+	replicas, err := r.cachedResources(ctx)
+	if err != nil {
 		return nil, err
 	}
 
-	for i := range resList.Items {
-		res := &resList.Items[i]
+	for i := range replicas {
+		res := &replicas[i]
 		if !naming.Same(res.Spec.NodeName, nodeName) || res.Name == selfName {
 			continue
 		}
 
 		if p := res.Spec.DRBDPort; p != nil {
 			out = append(out, *p)
+		}
+	}
+
+	pending, err := r.ledger.pendingReplicas(ctx, r.apiReader(), replicas)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, grant := range pending {
+		if grant.port != nil && naming.Same(grant.node, nodeName) && grant.name != selfName {
+			out = append(out, *grant.port)
 		}
 	}
 
@@ -1890,19 +2070,34 @@ func (r *ResourceReconciler) takenPortsOnNode(ctx context.Context, nodeName, sel
 // minors. Excludes `selfRD` so an RD mid-allocation doesn't trip on its
 // own draft.
 //
-// Uses APIReader (uncached) so cross-RD batch allocation observes
-// freshly-committed sibling minors rather than a stale cache.
+// Reads the cache, plus the minors this controller reserved that the
+// cache does not show yet (allocLedger), so cross-RD batch allocation
+// under clusterAllocMu observes every minor already handed out.
 func (r *ResourceReconciler) takenMinorsCluster(ctx context.Context, selfRD string) ([]int32, error) {
 	out := make([]int32, 0, takenAllocsInitialCap)
-	reader := r.apiReader()
 
-	var rdList blockstoriov1alpha1.ResourceDefinitionList
-	if err := reader.List(ctx, &rdList); err != nil {
+	definitions, err := r.cachedDefinitions(ctx)
+	if err != nil {
 		return nil, err
 	}
 
-	for i := range rdList.Items {
-		rd := &rdList.Items[i]
+	pending, err := r.ledger.pendingMinors(ctx, r.apiReader(), definitions)
+	if err != nil {
+		return nil, err
+	}
+
+	for key, grant := range pending {
+		if key == naming.Key(selfRD) {
+			continue
+		}
+
+		for _, minor := range grant.minors {
+			out = append(out, minor)
+		}
+	}
+
+	for i := range definitions {
+		rd := &definitions[i]
 		if naming.Same(rd.Name, selfRD) {
 			continue
 		}
@@ -2127,6 +2322,7 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&blockstoriov1alpha1.Resource{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueSiblings)).
 		Named("resource").
+		WithOptions(controller.Options{MaxConcurrentReconciles: r.workers()}).
 		Complete(r)
 }
 
@@ -2199,19 +2395,10 @@ func (r *ResourceReconciler) allocateNodeIDLocked(ctx context.Context, target *b
 // is conservative and self-healing; strictly better than the
 // permanent wedge a premature reuse causes.
 func (r *ResourceReconciler) collectTakenNodeIDs(ctx context.Context, target *blockstoriov1alpha1.Resource) ([]int32, error) {
-	// Fall back to the cached client when APIReader hasn't been
-	// wired — tests construct `ResourceReconciler{}` directly with
-	// a fake client and skip SetupWithManager; the race we're
-	// guarding against only matters under real-cluster
-	// informer-cache load, which the fake client doesn't simulate.
-	reader := r.APIReader
-	if reader == nil {
-		reader = r.Client
-	}
-
-	var resList blockstoriov1alpha1.ResourceList
-
-	err := reader.List(ctx, &resList)
+	// The cache plus the node ids this controller reserved that the
+	// cache does not show yet (allocLedger); the caller holds
+	// clusterAllocMu, under which every such reservation is made.
+	replicas, err := r.cachedResources(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -2219,10 +2406,22 @@ func (r *ResourceReconciler) collectTakenNodeIDs(ctx context.Context, target *bl
 	// Dedup so the union of own-ids and observed-peer-ids doesn't
 	// hand LowestFreeNodeID a slice with repeats (functionally
 	// harmless, but keeps the taken set minimal and inspectable).
-	occupied := make(map[int32]struct{}, len(resList.Items))
+	occupied := make(map[int32]struct{}, len(replicas))
 
-	for i := range resList.Items {
-		res := &resList.Items[i]
+	pending, err := r.ledger.pendingReplicas(ctx, r.apiReader(), replicas)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, grant := range pending {
+		if grant.nodeID != nil && grant.name != target.Name &&
+			naming.Same(grant.rd, target.Spec.ResourceDefinitionName) {
+			occupied[*grant.nodeID] = struct{}{}
+		}
+	}
+
+	for i := range replicas {
+		res := &replicas[i]
 
 		if res.Name == target.Name {
 			continue

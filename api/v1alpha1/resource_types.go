@@ -43,6 +43,23 @@ import (
 // Condition is absent.
 const ConditionMetadataCreated = "MetadataCreated"
 
+// Reasons of a true ConditionMetadataCreated. They tell a replica whose
+// metadata this satellite created apart from one whose metadata was
+// already on the volume, such as a replica adopted from LINSTOR, where
+// create-md never ran.
+const (
+	// MetadataCreatedReasonCreateMd: `drbdadm create-md` ran on at
+	// least one volume of the replica.
+	MetadataCreatedReasonCreateMd = "CreateMdSucceeded"
+
+	// MetadataCreatedReasonFound: `drbdadm dump-md` found metadata on
+	// every volume, so create-md was not run on that pass. The startup
+	// backfill also stamps it on a replica whose create-md stamp failed,
+	// since all it can see is that metadata is there; the satellite log
+	// of the create-md pass records which it was.
+	MetadataCreatedReasonFound = "MetadataFound"
+)
+
 // ConditionFilesystemFormatted is a Status Condition stamped by the
 // satellite after the RG-driven auto-mkfs path (scenario 9.W14)
 // reports every diskful volume of this Resource as carrying a
@@ -424,6 +441,36 @@ type ResourceStatus struct {
 	// surfaced via a `ToggleDiskFailed` condition once exceeded.
 	// +optional
 	ToggleDiskRetries int32 `json:"toggleDiskRetries,omitempty"`
+
+	// applyFailure is the error of the satellite's last apply pass on
+	// this replica, with the volume sizes that pass was applying. The
+	// satellite sets it when a pass fails and removes it when one
+	// succeeds. A resize that waits for this replica to grow ends with
+	// this error instead of waiting for a pass that keeps failing, as
+	// LINSTOR returns its satellite's error.
+	// +optional
+	ApplyFailure *ResourceApplyFailure `json:"applyFailure,omitempty"`
+}
+
+// ResourceApplyFailure is the error of a failed satellite apply pass.
+// +structType=atomic
+type ResourceApplyFailure struct {
+	// message is the error the pass failed with.
+	Message string `json:"message"`
+
+	// volumes lists the definition size of each volume the failed pass
+	// was applying.
+	// +optional
+	Volumes []ResourceApplyFailureVolume `json:"volumes,omitempty"`
+}
+
+// ResourceApplyFailureVolume is the size one volume had in a failed pass.
+type ResourceApplyFailureVolume struct {
+	// volumeNumber is the volume's number in the definition.
+	VolumeNumber int32 `json:"volumeNumber"`
+
+	// sizeKib is the volume definition size the pass was applying.
+	SizeKib int64 `json:"sizeKib"`
 }
 
 // ResourceConnectionStatus is the state of one DRBD peer connection
@@ -506,6 +553,27 @@ type PeerVolumeStatus struct {
 	// --statistics` peer-device frames.
 	// +optional
 	PeerDiskState string `json:"peerDiskState,omitempty"`
+
+	// done is the progress of the resync running with this peer, as
+	// the `done:<percent>` token of the peer-device frame carries it
+	// ("50.31"). DRBD measures it against that resync's own total,
+	// not the volume size, and prints it only while a resync with
+	// this peer runs; empty otherwise. It is what LINSTOR reports as
+	// the peer's `done_percentage` and renders in `SyncTarget(NN%)`.
+	// A string because a CRD has no portable float type.
+	// +optional
+	Done string `json:"done,omitempty"`
+
+	// replicationState is this volume's DRBD-9 replication state with
+	// this peer, the `replication:<state>` token of the volume's own
+	// peer-device frame. DRBD keeps it per peer and per volume, and
+	// so does LINSTOR (DrbdVolume.volReplState); the connection-level
+	// `replicationState` is whichever volume's frame came last. It is
+	// what `done` belongs to: a two-volume resource can have one
+	// volume in SyncTarget and the other Established or PausedSyncT
+	// on the same connection.
+	// +optional
+	ReplicationState string `json:"replicationState,omitempty"`
 }
 
 // ResourceVolumeStatus is the runtime state of one volume of a Resource.
@@ -521,6 +589,22 @@ type ResourceVolumeStatus struct {
 	UsableKib int64 `json:"usableKib,omitempty"`
 	// +optional
 	DiskState string `json:"diskState,omitempty"`
+
+	// appliedSizeKib is the volume definition size this replica has
+	// finished applying: the satellite writes it after a pass in which
+	// every layer, the backing volume, LUKS and `drbdadm resize`,
+	// succeeded at that size and the device the consumer sees reads at
+	// least that size. A grow is complete once every diskful replica
+	// reports the new size here. The last replica to grow its
+	// backing runs its `drbdadm resize` after all the others have
+	// grown theirs, and DRBD commits a resize on every connected peer
+	// before the command returns, so at that point the device has the
+	// new size wherever it is attached. The REST API answers a resize
+	// only then, as LINSTOR does, and the satellite reruns
+	// `drbdadm resize` while this lags the definition. Unset until
+	// the first such pass.
+	// +optional
+	AppliedSizeKib int64 `json:"appliedSizeKib,omitempty"`
 
 	// currentGi is the DRBD-9 current generation identifier reported
 	// by `drbdsetup events2` for this replica's local volume. The
@@ -539,16 +623,13 @@ type ResourceVolumeStatus struct {
 	// +optional
 	HistoryGI []string `json:"historyGI,omitempty"`
 
-	// outOfSyncKib is the worst-case "how many KiB this volume is
-	// behind any peer" reported by `drbdsetup events2 --statistics`
-	// peer-device frames. Combined with RD.Spec.VolumeDefinitions
-	// SizeKib, callers compute a sync-progress percentage:
-	//   progress = (1 - outOfSyncKib / sizeKib) * 100
-	//
-	// 0 means fully in sync; sizeKib (or close to it) means fresh
-	// resync hasn't started yet. Surfaced via the REST view layer
-	// so `linstor r l` / piraeus dashboards can render a CDI-style
-	// progress bar without polling drbdsetup themselves.
+	// outOfSyncKib is the out-of-sync count of the last
+	// `drbdsetup events2 --statistics` peer-device frame for this
+	// volume, whichever peer it was about. 0 means in sync with that
+	// peer. It is not a resync progress once the replica has more
+	// than one peer: a finished resync with one peer can be the last
+	// frame while a full one with another runs. The progress is
+	// connections[].peerVolumes[].done.
 	// +optional
 	OutOfSyncKib int64 `json:"outOfSyncKib,omitempty"`
 
