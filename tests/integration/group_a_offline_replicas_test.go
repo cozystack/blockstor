@@ -360,7 +360,7 @@ func TestGroupARecreatedWithoutDiskReadsFaulty(t *testing.T) {
 		reportHealthySecondary(t, stack, rdName+"."+node, peer)
 	}
 
-	reportRecreatedWithoutDisk(t, stack, rdName+"."+harness.NodeWorker1, harness.NodeWorker2)
+	reportRecreatedWithoutDisk(t, stack, rdName, harness.NodeWorker1, harness.NodeWorker2)
 
 	table := faultyTable(t, stack, rdName)
 
@@ -373,8 +373,14 @@ func TestGroupARecreatedWithoutDiskReadsFaulty(t *testing.T) {
 // reportRecreatedWithoutDisk writes what the satellite reports for a
 // kernel resource brought back without its disk whose peer link stays
 // StandAlone: a Diskless volume, the link down, KernelLoaded=True.
-func reportRecreatedWithoutDisk(t *testing.T, stack *harness.Stack, name, peer string) {
+// The mock satellite projects its DRBD state onto every volume and
+// rewrites a disk state that differs, so it is told the same state.
+func reportRecreatedWithoutDisk(t *testing.T, stack *harness.Stack, rdName, node, peer string) {
 	t.Helper()
+
+	stack.Satellite.SimulateDRBDState(rdName, node, "Diskless")
+
+	name := rdName + "." + node
 
 	harness.Eventually(t, 10*time.Second, func() bool {
 		var res blockstoriov1alpha1.Resource
@@ -385,6 +391,7 @@ func reportRecreatedWithoutDisk(t *testing.T, stack *harness.Stack, name, peer s
 		}
 
 		res.Status.InUse = false
+		res.Status.DrbdState = "Diskless"
 		res.Status.Volumes = []blockstoriov1alpha1.ResourceVolumeStatus{{VolumeNumber: 0, DiskState: "Diskless"}}
 		res.Status.Connections = []blockstoriov1alpha1.ResourceConnectionStatus{
 			{PeerNodeName: peer, Connected: false, Message: "StandAlone"},
