@@ -1317,12 +1317,18 @@ func (s *Server) deleteDefinitionData(ctx context.Context, name string) ([]apiv1
 	// `linstor rd d <rd>` returns SUCCESS and the very next
 	// `linstor r l` shows phantom rows for 5–30 s until the cache
 	// catches up on its watch stream. See pkg/rest/cache_invalidation.go.
-	s.waitForRDDeletionVisible(ctx, name)
+	converged := s.waitForRDDeletionVisible(ctx, name)
 
 	answer := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource definition deleted: " + name,
 	}}
+	if !converged {
+		if pending := s.replicasStillDeleting(ctx, name); len(pending) > 0 {
+			answer = append(answer, deleteInProgress(name, pending))
+		}
+	}
+
 	if reaped != nil {
 		answer = append(answer, *reaped)
 	}

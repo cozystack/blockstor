@@ -102,17 +102,23 @@ var (
 		[]string{labelMethod, labelPath, labelStatus},
 	)
 
+	// requestDurationBuckets cover sub-millisecond reads (cache-hit
+	// view-API) through second-scale writes (cluster-wide spawn), and on
+	// past a minute to the take wait: a snapshot create holds its answer
+	// for the take, up to SnapshotTakeWait, and a CSI sidecar gives up
+	// after a minute, so a slow or aborted take lands in a bucket of its
+	// own rather than in +Inf.
+	requestDurationBuckets = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 150}
+
 	// requestDurationSeconds is a histogram of request-handling latency.
 	// Status is intentionally NOT a label — the cardinality would
 	// multiply by 6 (the 2xx/4xx/5xx classes we serve) for marginal
 	// dashboard value; SLOs are usually computed across all statuses.
-	// The bucket boundaries cover sub-millisecond reads (cache-hit
-	// view-API) through second-scale writes (cluster-wide spawn).
 	requestDurationSeconds = promauto.With(prometheus.DefaultRegisterer).NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "blockstor_request_duration_seconds",
 			Help:    "Latency of LINSTOR REST requests, in seconds, observed at the apiserver wire edge.",
-			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+			Buckets: requestDurationBuckets,
 		},
 		[]string{labelMethod, labelPath},
 	)

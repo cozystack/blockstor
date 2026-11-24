@@ -140,8 +140,8 @@ func TestSnapshotReconcileAddsFinalizer(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 
-	if !slices.Contains(got.Finalizers, controllers.SatelliteSnapshotFinalizer) {
-		t.Errorf("SatelliteSnapshotFinalizer missing after Reconcile: %v", got.Finalizers)
+	if !slices.Contains(got.Finalizers, controllers.SnapshotNodeFinalizer("n1")) {
+		t.Errorf("the node's snapshot finalizer missing after Reconcile: %v", got.Finalizers)
 	}
 }
 
@@ -250,7 +250,7 @@ func TestSnapshotReconcileMarksFailedOnTerminalError(t *testing.T) {
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-1.snap-1",
-			Finalizers: []string{controllers.SatelliteSnapshotFinalizer},
+			Finalizers: []string{controllers.SnapshotNodeFinalizer("n1")},
 		},
 		Spec: blockstoriov1alpha1.SnapshotSpec{
 			ResourceDefinitionName: "pvc-missing",
@@ -333,7 +333,7 @@ func TestSnapshotReconcileKeepsIncompleteOnTransientError(t *testing.T) {
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-1.snap-1",
-			Finalizers: []string{controllers.SatelliteSnapshotFinalizer},
+			Finalizers: []string{controllers.SnapshotNodeFinalizer("n1")},
 		},
 		Spec: blockstoriov1alpha1.SnapshotSpec{
 			ResourceDefinitionName: "pvc-1",
@@ -463,7 +463,7 @@ func TestSnapshotReconcileNoOpOnUnrelatedNode(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 
-	if slices.Contains(got.Finalizers, controllers.SatelliteSnapshotFinalizer) {
+	if len(got.Finalizers) != 0 {
 		t.Errorf("finalizer stamped on a Snapshot for another node: %v", got.Finalizers)
 	}
 }
@@ -551,10 +551,12 @@ func TestSnapshotDeleteScenarioW02PerReplicaBackendTeardown(t *testing.T) {
 		}
 
 		// This node's pass MUST strip the finalizer once the
-		// backend teardown succeeds. In the multi-replica production
-		// flow each satellite stripes the single shared finalizer
-		// optimistically — last write wins, which is safe because
-		// the teardown is idempotent.
+		// backend teardown succeeds. The fixture carries the old
+		// shared finalizer and no per-node one, so each node takes the
+		// migration path older satellites took: release the shared key
+		// after its own delete. A Snapshot stamped by current
+		// satellites carries one key per node instead; see
+		// snapshot_node_finalizer_test.go.
 		var got blockstoriov1alpha1.Snapshot
 
 		gErr := cli.Get(context.Background(), client.ObjectKey{Name: "pvc-1.snap-1"}, &got)
@@ -651,15 +653,12 @@ func TestSnapshotDeleteScenarioW02IdempotentOnAbsentFinalizer(t *testing.T) {
 // SnapshotReconciler MUST upsert our node's entry in
 // Status.NodeStatus with Ready=true and a non-zero CreateTimestamp.
 //
-// Why this matters: the apiserver's `stampSnapshotSuccessful`
-// derivation (commit 3c593c5f7) walks `Snapshots[].CreateTimestamp`
-// to decide whether every diskful peer reported back, and the
-// store-side projection in pkg/store/k8s/snapshots.go reads
-// `crd.Status.NodeStatus[i].CreateTimestamp` to populate it. Before
-// this stamp landed, no code path ever wrote to Status.NodeStatus
-// on success, so the wire field stayed zero, the apiserver's
-// success denominator never closed, and `linstor s l` rendered
-// State=Incomplete forever on a perfectly-materialised snapshot.
+// Why this matters: the controller-side SnapshotReconciler resumes
+// I/O and records SUCCESSFUL only once every targeted node's entry
+// is Ready. Before this stamp landed, no code path ever wrote to
+// Status.NodeStatus on success, so the take never closed and
+// `linstor s l` rendered State=Incomplete forever on a
+// perfectly-materialised snapshot.
 //
 // Setup mirrors TestSnapshotReconcileDrainsOnDelete's seed (one
 // thin-pool provider on n1, RD `pvc-1` already applied) but with
@@ -676,7 +675,7 @@ func TestSnapshotReconcileStampsNodeStatusOnSuccess(t *testing.T) {
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-1.snap-1",
-			Finalizers: []string{controllers.SatelliteSnapshotFinalizer},
+			Finalizers: []string{controllers.SnapshotNodeFinalizer("n1")},
 		},
 		Spec: blockstoriov1alpha1.SnapshotSpec{
 			ResourceDefinitionName: "pvc-1",
@@ -784,7 +783,7 @@ func TestSnapshotReconcileNodeStatusIdempotentRestamp(t *testing.T) {
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-1.snap-1",
-			Finalizers: []string{controllers.SatelliteSnapshotFinalizer},
+			Finalizers: []string{controllers.SnapshotNodeFinalizer("n1")},
 		},
 		Spec: blockstoriov1alpha1.SnapshotSpec{
 			ResourceDefinitionName: "pvc-1",
@@ -886,7 +885,7 @@ func TestSnapshotReconcileTakesItsNodeInAnotherSpelling(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 
-	if !slices.Contains(got.Finalizers, controllers.SatelliteSnapshotFinalizer) {
+	if !slices.Contains(got.Finalizers, controllers.SnapshotNodeFinalizer("node-1")) {
 		t.Errorf("node-1 passed by a snapshot listing Node-1: finalizers %v", got.Finalizers)
 	}
 }

@@ -52,6 +52,8 @@ func TestDeleteSnapshotMissingIsNoop(t *testing.T) {
 	// real-tool's "dataset does not exist" error.
 	fx.Expect("zfs list -H -o name tank/pvc-1_00000@snap-1",
 		storage.FakeResponse{Err: errZFSSnapMissing})
+	// The pool itself answers, so the missing dataset is really gone.
+	fx.Expect("zfs list -H -o name tank", storage.FakeResponse{Stdout: []byte("tank\n")})
 
 	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
 

@@ -176,7 +176,7 @@ func TestSatelliteRetriesASnapshotStatusStampThatRanOutOfRetries(t *testing.T) {
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-c.snap-c",
-			Finalizers: []string{controllers.SatelliteSnapshotFinalizer},
+			Finalizers: []string{controllers.SnapshotNodeFinalizer("n1")},
 		},
 		Spec: blockstoriov1alpha1.SnapshotSpec{
 			ResourceDefinitionName: "pvc-c",
@@ -247,7 +247,7 @@ func TestSatelliteLogsALostDeleteFailureStampBelowError(t *testing.T) {
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "pvc-c.snap-c",
-			Finalizers:        []string{controllers.SatelliteSnapshotFinalizer},
+			Finalizers:        []string{controllers.SnapshotNodeFinalizer("n1")},
 			DeletionTimestamp: &now,
 		},
 		Spec: blockstoriov1alpha1.SnapshotSpec{
@@ -257,11 +257,20 @@ func TestSatelliteLogsALostDeleteFailureStampBelowError(t *testing.T) {
 		},
 	}
 
+	// The delete walks every diskful pool on the node; one this satellite
+	// has no provider for fails it, which is the failure being stamped.
+	pool := &blockstoriov1alpha1.StoragePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "n1.pool-c"},
+		Spec: blockstoriov1alpha1.StoragePoolSpec{
+			NodeName: "n1", PoolName: "pool-c", ProviderKind: "ZFS",
+		},
+	}
+
 	cli := interceptor.NewClient(
 		fake.NewClientBuilder().
 			WithScheme(newSnapshotScheme(t)).
 			WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).
-			WithObjects(snap).
+			WithObjects(snap, pool).
 			Build(),
 		interceptor.Funcs{
 			SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {

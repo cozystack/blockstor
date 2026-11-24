@@ -951,7 +951,7 @@ func TestStampPostApplyReportsTheLiveMigrateToken(t *testing.T) {
 			cli := fake.NewClientBuilder().WithScheme(newToggleDiskTestScheme(t)).WithObjects(res, rd).Build()
 			reconciler := &ResourceReconciler{Client: cli, Config: Config{NodeName: node}}
 
-			reconciler.stampPostApply(context.Background(), res, rd, nil, tc.anyFailed, logr.Discard())
+			reconciler.stampPostApply(context.Background(), res, rd, nil, applyOutcome{failed: tc.anyFailed}, logr.Discard())
 
 			var after blockstoriov1alpha1.Resource
 			if err := cli.Get(context.Background(), client.ObjectKey{Name: res.Name}, &after); err != nil {

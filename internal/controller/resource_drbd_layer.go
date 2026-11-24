@@ -111,7 +111,8 @@ func (r *ResourceReconciler) getCachedOrLive(ctx context.Context, name string, o
 }
 
 // allocateDRBDIDsIfUsed runs the Bug 302 allocation for a replica whose
-// definition has a DRBD layer. done is true when the caller should
+// definition has a DRBD layer, the block size of its volume definitions
+// first. done is true when the caller should
 // return result instead of going on to the apply: the IDs just changed,
 // or the stack is not pinned yet. A definition without DRBD gets no
 // DRBD-IDs at all, and the satellite does not wait for them on it.
@@ -129,6 +130,16 @@ func (r *ResourceReconciler) allocateDRBDIDsIfUsed(
 
 	if !usesDRBD {
 		return ctrl.Result{}, false, nil
+	}
+
+	// The block size goes on the volume definitions before the replica
+	// gets its identity: the satellite brings nothing up before that,
+	// and the size of an attached device never changes afterwards.
+	if awaitingIdentity(target) {
+		err = r.decideBlockSize(ctx, target)
+		if err != nil {
+			return ctrl.Result{}, true, err
+		}
 	}
 
 	allocated, err := r.ensureDRBDIDs(ctx, target.DeepCopy(), nil)

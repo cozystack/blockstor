@@ -102,9 +102,12 @@ func (s *Server) registerResourceToggleDisk(mux *http.ServeMux) {
 // new diskful copy lands in on the destination node, and the
 // optional `layer_list` is forwarded through Spec.LayerStack so the
 // satellite assembles the same stack as the source replica. Both
-// fields are optional: an empty `storage_pool` falls through to the
-// controller's auto-diskful pool picker on the destination node,
-// matching upstream LINSTOR's behaviour when no pool is supplied.
+// fields are optional: with an empty `storage_pool` the destination
+// replica takes the resource definition's StorPoolName, and without
+// one it has no pool, which the satellite reports as a failed apply
+// once its short wait for a pool is over. Nothing picks a pool for it
+// later: the auto-diskful controller stamps a pool only on the
+// replicas it promotes itself.
 type migrateDiskBody struct {
 	StoragePool string   `json:"storage_pool,omitempty"`
 	LayerList   []string `json:"layer_list,omitempty"`
@@ -117,8 +120,7 @@ type migrateDiskBody struct {
 //
 // An absent body is tolerated — the empty pool is forwarded to the
 // migrate helper, which leaves Spec.StoragePool unset on the
-// destination and lets the controller's auto-diskful path pick a
-// pool from the hosting node during the next reconcile.
+// destination (see migrateDiskBody for what that replica gets).
 func (s *Server) handleResourceMigrateDiskBodyless(w http.ResponseWriter, r *http.Request) {
 	var body migrateDiskBody
 
@@ -184,8 +186,10 @@ func (s *Server) migrateDiskCommon(w http.ResponseWriter, r *http.Request, pool 
 // handleResourceToggleDisk flips Spec.Flags["DISKLESS"] on the
 // named replica. Path-suffix `storage-pool/{pool}` (when present)
 // stamps that pool name on Spec.StoragePool when promoting to
-// diskful — without it, the controller's auto-diskful path picks
-// a pool from the hosting node.
+// diskful. Without it the replica keeps whatever pool it carries, or
+// takes the resource definition's StorPoolName; nothing picks one for
+// it later, and the satellite reports a diskful replica without a pool
+// as a failed apply once its short wait for a pool is over.
 //
 // Idempotent: toggling a diskful replica when no pool argument
 // was given drops the DISKLESS flag if currently set; toggling
@@ -380,8 +384,11 @@ func (s *Server) handleResourceToggleDiskToDiskless(w http.ResponseWriter, r *ht
 //
 // When {pool} is present we stamp it on Spec so the satellite picks
 // the requested pool when reattaching storage. When absent the
-// controller's auto-diskful path picks a pool on the hosting node
-// during the next reconcile. Idempotent: a replica that's already
+// replica keeps the pool it carries (a demote keeps it), or takes the
+// resource definition's StorPoolName. Nothing picks a pool for it
+// later: the auto-diskful controller stamps one only on the replicas
+// it promotes itself, so a replica left without one fails its apply
+// on the satellite once the satellite's short wait for a pool is over. Idempotent: a replica that's already
 // diskful stays diskful (and gets its pool re-stamped if one was
 // supplied).
 func (s *Server) handleResourceToggleDiskToDiskful(w http.ResponseWriter, r *http.Request) {

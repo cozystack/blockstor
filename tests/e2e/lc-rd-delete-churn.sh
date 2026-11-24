@@ -23,6 +23,13 @@
 # Pin: same as lc-rd-delete-cascade.sh — NEVER force-strip finalizers;
 # if cleanup doesn't converge inside the per-iter timeout, that's a
 # real bug.
+#
+# Nothing reaps leftover volumes after the fact (the storage orphan
+# sweeper is gone): each replica's satellite releases its Resource only
+# after deleting the replica's zvol, so the no-orphan-ZVOL check below
+# holds the moment the cascade has converged. A `_deleted_churn-N_*`
+# zvol would mean a delete renamed a zvol that had snapshots, which this
+# scenario never takes; the same grep catches it.
 
 set -euo pipefail
 

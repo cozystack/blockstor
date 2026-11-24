@@ -1235,11 +1235,22 @@ func (s *Server) refuseNodeDeleteIfReferenced(w http.ResponseWriter, r *http.Req
 		return true
 	}
 
-	if len(resourceRefs) == 0 && len(spRefs) == 0 {
+	// A node holds every Snapshot with a copy on it until its satellite
+	// has deleted that copy. Once the node is gone nothing runs there and
+	// `node lost` can no longer be asked for it, so the Snapshot would stay
+	// terminating for good.
+	snapRefs, err := store.SnapshotsOnNode(r.Context(), s.Store, spellings)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return true
+	}
+
+	if len(resourceRefs) == 0 && len(spRefs) == 0 && len(snapRefs) == 0 {
 		return false
 	}
 
-	writeJSON(w, http.StatusConflict, buildNodeDeleteRefusal(name, resourceRefs, spRefs))
+	writeJSON(w, http.StatusConflict, buildNodeDeleteRefusal(name, resourceRefs, spRefs, snapRefs))
 
 	return true
 }
@@ -1319,7 +1330,7 @@ func (s *Server) referencesOnNode(ctx context.Context, spellings []string) ([]st
 // and/or storage pools") so audit-log greps disambiguate
 // node-delete refusals from RG-delete and SP-delete refusals which
 // reuse the same FAIL_IN_USE sub-code.
-func buildNodeDeleteRefusal(name string, resourceRefs, spRefs []string) []apiv1.APICallRc {
+func buildNodeDeleteRefusal(name string, resourceRefs, spRefs, snapRefs []string) []apiv1.APICallRc {
 	var causeParts []string
 
 	if len(resourceRefs) > 0 {
@@ -1334,8 +1345,15 @@ func buildNodeDeleteRefusal(name string, resourceRefs, spRefs []string) []apiv1.
 			len(spRefs), name, strings.Join(spRefs, ", ")))
 	}
 
+	if len(snapRefs) > 0 {
+		causeParts = append(causeParts, fmt.Sprintf(
+			"%d snapshot(s) with a copy on node '%s': %s",
+			len(snapRefs), name, strings.Join(snapRefs, ", ")))
+	}
+
 	correction := "Delete the listed resources first " +
-		"(`linstor r d <node> <rd>`) and storage pools " +
+		"(`linstor r d <node> <rd>`), snapshots " +
+		"(`linstor s d <rd> <snapshot>`) and storage pools " +
 		"(`linstor sp d <node> <pool>`), or evacuate the node " +
 		"(`linstor n evacuate <node>`); pass `?force=true` to " +
 		"delete the node anyway and cascade the orphans."
@@ -1343,7 +1361,7 @@ func buildNodeDeleteRefusal(name string, resourceRefs, spRefs []string) []apiv1.
 	return []apiv1.APICallRc{{
 		RetCode: apiCallRcError | apiCallRcFailInUse,
 		Message: "Node '" + name + "' cannot be deleted because " +
-			"it still hosts resource replicas and/or storage pools.",
+			"it still hosts resource replicas, snapshots and/or storage pools.",
 		Cause:  strings.Join(causeParts, "; "),
 		Correc: correction,
 		ObjRefs: map[string]string{
@@ -1407,7 +1425,7 @@ func (s *Server) rollbackNodeDeleteIfRaced(
 		return true
 	}
 
-	writeJSON(w, http.StatusConflict, buildNodeDeleteRefusal(name, resourceRefs, spRefs))
+	writeJSON(w, http.StatusConflict, buildNodeDeleteRefusal(name, resourceRefs, spRefs, nil))
 
 	return true
 }

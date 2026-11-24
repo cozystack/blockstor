@@ -1615,54 +1615,29 @@ func TestSnapshotViewSurfacesSatelliteReadyStatus(t *testing.T) {
 	}
 }
 
-// TestSnapshotStateIgnoresTieBreaker is the Bug-106 regression guard.
-// Setup mirrors the production trace: RD `bug106test` has two diskful
-// replicas (worker-1, worker-2 UpToDate) and one auto-placed TieBreaker
-// (worker-3, DISKLESS+TIE_BREAKER). The satellite reconciler stamps
-// Status.NodeStatus only for the diskful peers (TieBreaker holds no
-// data, never takes the snapshot). Before the fix, `linstor s l`
-// showed State=Incomplete forever because the apiserver never derived
-// the `SUCCESSFUL` flag the python CLI's State column reads. The fix
-// adds an apiserver-side derivation that excludes DISKLESS+TIE_BREAKER
-// peers from the "every replica is ready" denominator, then stamps
-// `SUCCESSFUL` on the top-level Flags slice.
-func TestSnapshotStateIgnoresTieBreaker(t *testing.T) {
+// SUCCESSFUL is what the controller recorded on the snapshot when the take
+// completed, as LINSTOR records it on the snapshot definition, and nothing
+// else: every node reporting its copy does not make a snapshot SUCCESSFUL
+// on a read before the record is there (the take may still hold I/O
+// suspended), and on every read path the answer is the same.
+func TestSnapshotSuccessfulIsOnlyTheRecordedFlag(t *testing.T) {
 	ctx := t.Context()
 
 	st := store.NewInMemory()
 
-	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-		Name: "bug106test",
-	}); err != nil {
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "src"}); err != nil {
 		t.Fatalf("seed RD: %v", err)
 	}
 
-	// Two diskful peers + one DISKLESS+TIE_BREAKER witness — the same
-	// topology `rd ap --place-count 2` auto-places on a 3-node stand.
-	resources := []apiv1.Resource{
-		{Name: "bug106test", NodeName: "worker-1"},
-		{Name: "bug106test", NodeName: "worker-2"},
-		{
-			Name:     "bug106test",
-			NodeName: "worker-3",
-			Flags:    []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
-		},
-	}
-
-	for i := range resources {
-		if err := st.Resources().Create(ctx, &resources[i]); err != nil {
-			t.Fatalf("seed Resource %s: %v", resources[i].NodeName, err)
+	for _, node := range []string{"worker-1", "worker-2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "src", NodeName: node}); err != nil {
+			t.Fatalf("seed Resource %s: %v", node, err)
 		}
 	}
 
-	// Snapshot row: Spec.Nodes is the diskful set only (the apiserver's
-	// hydrateSnapshotFromRD path already filters DISKLESS out via
-	// listDiskfulNodes), and the satellite has reported CreateTimestamp
-	// for both diskful peers — the "every diskful replica took it"
-	// success signal.
 	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
 		Name:         "snap1",
-		ResourceName: "bug106test",
+		ResourceName: "src",
 		Nodes:        []string{"worker-1", "worker-2"},
 		Snapshots: []apiv1.SnapshotPerNode{
 			{SnapshotName: "snap1", NodeName: "worker-1", CreateTimestamp: 1714000000},
@@ -1675,80 +1650,37 @@ func TestSnapshotStateIgnoresTieBreaker(t *testing.T) {
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	// 1) Aggregate view.
-	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
-	if len(got) != 1 {
-		t.Fatalf("view len: got %d, want 1", len(got))
-	}
-
-	if !slices.Contains(got[0].Flags, apiv1.SnapshotFlagSuccessful) {
-		t.Errorf("Flags: got %v, want SUCCESSFUL (every diskful peer reported, "+
-			"TieBreaker MUST be excluded from the denominator)", got[0].Flags)
-	}
-
-	// 2) Per-RD list — same derivation MUST fire on this path so the
-	// upstream CLI's `s l --resources bug106test` agrees with `s l`.
-	resp := httpGet(t, base+"/v1/resource-definitions/bug106test/snapshots")
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("per-RD list status: got %d, want 200", resp.StatusCode)
-	}
-
-	var perRD []apiv1.Snapshot
-	if err := json.NewDecoder(resp.Body).Decode(&perRD); err != nil {
-		t.Fatalf("per-RD decode: %v", err)
-	}
-
-	if len(perRD) != 1 || !slices.Contains(perRD[0].Flags, apiv1.SnapshotFlagSuccessful) {
-		t.Errorf("per-RD list Flags: got %+v, want SUCCESSFUL", perRD)
-	}
-
-	// 3) Single-snapshot GET — same.
-	getResp := httpGet(t, base+"/v1/resource-definitions/bug106test/snapshots/snap1")
-	defer func() { _ = getResp.Body.Close() }()
-
-	var single apiv1.Snapshot
-	if err := json.NewDecoder(getResp.Body).Decode(&single); err != nil {
-		t.Fatalf("single decode: %v", err)
-	}
-
-	if !slices.Contains(single.Flags, apiv1.SnapshotFlagSuccessful) {
-		t.Errorf("single GET Flags: got %v, want SUCCESSFUL", single.Flags)
+	for path, flags := range snapshotFlagsOnEveryReadPath(t, base, "src", "snap1") {
+		if slices.Contains(flags, apiv1.SnapshotFlagSuccessful) {
+			t.Errorf("%s: flags %v carry SUCCESSFUL the snapshot never recorded", path, flags)
+		}
 	}
 }
 
-// TestSnapshotStateIncompleteWhenDiskfulPeerMissing pins the
-// "still in progress" half of the Bug-106 derivation: when at least
-// one diskful peer hasn't reported a CreateTimestamp, the snapshot
-// MUST stay Incomplete (no `SUCCESSFUL` flag) — otherwise the
-// operator would think a half-taken snapshot is durable.
-func TestSnapshotStateIncompleteWhenDiskfulPeerMissing(t *testing.T) {
+// A snapshot outlives the volume it was taken from: once the source's
+// replicas are deleted, the recorded SUCCESSFUL is still served, so
+// linstor-csi's restore, which waits for it, can go ahead. Deriving it from
+// the replicas left read the snapshot as Incomplete forever and the restore
+// timed out.
+func TestSnapshotSuccessfulSurvivesTheSourceReplicas(t *testing.T) {
 	ctx := t.Context()
 
 	st := store.NewInMemory()
-	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-		Name: "bug106-incomplete",
-	}); err != nil {
+
+	// The definition stays because it has a snapshot; its replicas are gone.
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "src"}); err != nil {
 		t.Fatalf("seed RD: %v", err)
 	}
 
-	for _, nodeName := range []string{"worker-1", "worker-2"} {
-		if err := st.Resources().Create(ctx, &apiv1.Resource{
-			Name: "bug106-incomplete", NodeName: nodeName,
-		}); err != nil {
-			t.Fatalf("seed Resource: %v", err)
-		}
-	}
-
-	// Only worker-1 has reported back — worker-2 still in flight.
 	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
 		Name:         "snap1",
-		ResourceName: "bug106-incomplete",
-		Nodes:        []string{"worker-1", "worker-2"},
+		ResourceName: "src",
+		Nodes:        []string{"worker-1", "worker-2", "worker-3"},
+		Flags:        []string{apiv1.SnapshotFlagSuccessful},
 		Snapshots: []apiv1.SnapshotPerNode{
 			{SnapshotName: "snap1", NodeName: "worker-1", CreateTimestamp: 1714000000},
-			{SnapshotName: "snap1", NodeName: "worker-2", CreateTimestamp: 0},
+			{SnapshotName: "snap1", NodeName: "worker-2", CreateTimestamp: 1714000010},
+			{SnapshotName: "snap1", NodeName: "worker-3", CreateTimestamp: 1714000020},
 		},
 	}); err != nil {
 		t.Fatalf("seed Snapshot: %v", err)
@@ -1757,15 +1689,52 @@ func TestSnapshotStateIncompleteWhenDiskfulPeerMissing(t *testing.T) {
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
-	if len(got) != 1 {
-		t.Fatalf("view len: got %d, want 1", len(got))
+	for path, flags := range snapshotFlagsOnEveryReadPath(t, base, "src", "snap1") {
+		if !slices.Contains(flags, apiv1.SnapshotFlagSuccessful) {
+			t.Errorf("%s: flags %v, want the recorded SUCCESSFUL with no source replica left", path, flags)
+		}
+	}
+}
+
+// snapshotFlagsOnEveryReadPath reads one snapshot through the cluster-wide
+// view, the per-definition list and the single GET, keyed by path.
+func snapshotFlagsOnEveryReadPath(t *testing.T, base, rd, snap string) map[string][]string {
+	t.Helper()
+
+	out := map[string][]string{}
+
+	view := decodeSnapshotPage(t, base+"/v1/view/snapshots")
+	if len(view) != 1 {
+		t.Fatalf("view len: got %d, want 1", len(view))
 	}
 
-	if slices.Contains(got[0].Flags, apiv1.SnapshotFlagSuccessful) {
-		t.Errorf("Flags: leaked SUCCESSFUL while a diskful peer (worker-2) hasn't "+
-			"reported back: %v", got[0].Flags)
+	out["view"] = view[0].Flags
+
+	listResp := httpGet(t, base+"/v1/resource-definitions/"+rd+"/snapshots")
+	defer func() { _ = listResp.Body.Close() }()
+
+	var perRD []apiv1.Snapshot
+	if err := json.NewDecoder(listResp.Body).Decode(&perRD); err != nil {
+		t.Fatalf("per-RD decode: %v", err)
 	}
+
+	if len(perRD) != 1 {
+		t.Fatalf("per-RD list len: got %d, want 1", len(perRD))
+	}
+
+	out["per-definition list"] = perRD[0].Flags
+
+	getResp := httpGet(t, base+"/v1/resource-definitions/"+rd+"/snapshots/"+snap)
+	defer func() { _ = getResp.Body.Close() }()
+
+	var single apiv1.Snapshot
+	if err := json.NewDecoder(getResp.Body).Decode(&single); err != nil {
+		t.Fatalf("single decode: %v", err)
+	}
+
+	out["single get"] = single.Flags
+
+	return out
 }
 
 // TestSnapshotStateNotMarkedSuccessfulWhenFailed pins the precedence:
@@ -1812,225 +1781,6 @@ func TestSnapshotStateNotMarkedSuccessfulWhenFailed(t *testing.T) {
 
 	if slices.Contains(got[0].Flags, apiv1.SnapshotFlagSuccessful) {
 		t.Errorf("Flags: leaked SUCCESSFUL alongside FAILED: %v", got[0].Flags)
-	}
-}
-
-// Bug 352 regression set: the RD-level Snapshot success gate MUST scope
-// the "every replica reported" denominator to `Spec.Nodes` when the
-// caller restricted the snapshot to a subset via
-// `linstor snapshot create <rd> <snap> <node...>`. Mirrors upstream
-// CtrlSnapshotCrtApiCallHandler — the satellite only ever stamps the
-// listed nodes, so unlisted peers' missing Snapshot-children must NOT
-// gate the row to Incomplete.
-//
-// The four cases below pin both branches of the gate:
-//
-//   - empty Spec.Nodes + every diskful child reported -> Successful
-//   - empty Spec.Nodes + one diskful child still in flight -> Incomplete
-//   - Spec.Nodes=[n1] + n1 reported + n2 child never existed -> Successful
-//   - Spec.Nodes=[n1,n2] + only n1 reported -> Incomplete
-
-// TestSnapshotBug352BroadcastAllDiskfulSuccessfulMarked is the
-// default-broadcast branch: when `Spec.Nodes` is empty the gate must
-// still count every diskful peer (the pre-Bug-352 behaviour) — a
-// regression here would silently mis-mark broadcast snapshots.
-func TestSnapshotBug352BroadcastAllDiskfulSuccessfulMarked(t *testing.T) {
-	ctx := t.Context()
-
-	st := store.NewInMemory()
-	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-		Name: "bug352-broadcast-ok",
-	}); err != nil {
-		t.Fatalf("seed RD: %v", err)
-	}
-
-	for _, n := range []string{"worker-1", "worker-2"} {
-		if err := st.Resources().Create(ctx, &apiv1.Resource{
-			Name: "bug352-broadcast-ok", NodeName: n,
-		}); err != nil {
-			t.Fatalf("seed Resource %s: %v", n, err)
-		}
-	}
-
-	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
-		Name:         "snap1",
-		ResourceName: "bug352-broadcast-ok",
-		// Nodes intentionally empty -> broadcast form.
-		Snapshots: []apiv1.SnapshotPerNode{
-			{SnapshotName: "snap1", NodeName: "worker-1", CreateTimestamp: 1714000000},
-			{SnapshotName: "snap1", NodeName: "worker-2", CreateTimestamp: 1714000050},
-		},
-	}); err != nil {
-		t.Fatalf("seed Snapshot: %v", err)
-	}
-
-	base, stop := startServerWithStore(t, st)
-	defer stop()
-
-	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
-	if len(got) != 1 {
-		t.Fatalf("view len: got %d, want 1", len(got))
-	}
-
-	if !slices.Contains(got[0].Flags, apiv1.SnapshotFlagSuccessful) {
-		t.Errorf("Flags: got %v, want SUCCESSFUL (broadcast: all diskful peers reported)",
-			got[0].Flags)
-	}
-}
-
-// TestSnapshotBug352BroadcastOnePeerInFlightStaysIncomplete is the
-// "broadcast not done yet" pin: empty Spec.Nodes + one diskful peer
-// still missing -> Incomplete. Guards against a fix that
-// over-narrowed the denominator and accidentally Successful-stamped
-// half-taken broadcast snapshots.
-func TestSnapshotBug352BroadcastOnePeerInFlightStaysIncomplete(t *testing.T) {
-	ctx := t.Context()
-
-	st := store.NewInMemory()
-	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-		Name: "bug352-broadcast-partial",
-	}); err != nil {
-		t.Fatalf("seed RD: %v", err)
-	}
-
-	for _, n := range []string{"worker-1", "worker-2"} {
-		if err := st.Resources().Create(ctx, &apiv1.Resource{
-			Name: "bug352-broadcast-partial", NodeName: n,
-		}); err != nil {
-			t.Fatalf("seed Resource %s: %v", n, err)
-		}
-	}
-
-	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
-		Name:         "snap1",
-		ResourceName: "bug352-broadcast-partial",
-		// Nodes empty -> broadcast.
-		Snapshots: []apiv1.SnapshotPerNode{
-			{SnapshotName: "snap1", NodeName: "worker-1", CreateTimestamp: 1714000000},
-			// worker-2: zero CreateTimestamp -> still in flight.
-			{SnapshotName: "snap1", NodeName: "worker-2", CreateTimestamp: 0},
-		},
-	}); err != nil {
-		t.Fatalf("seed Snapshot: %v", err)
-	}
-
-	base, stop := startServerWithStore(t, st)
-	defer stop()
-
-	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
-	if len(got) != 1 {
-		t.Fatalf("view len: got %d, want 1", len(got))
-	}
-
-	if slices.Contains(got[0].Flags, apiv1.SnapshotFlagSuccessful) {
-		t.Errorf("Flags: leaked SUCCESSFUL while a diskful peer (worker-2) hasn't "+
-			"reported back: %v", got[0].Flags)
-	}
-}
-
-// TestSnapshotBug352SingleNodeScopedDenominatorMarksSuccessful is the
-// canonical Bug 352 reproduction: `linstor snapshot create <rd> <snap>
-// worker-1` against a 2-diskful RD. Spec.Nodes=[worker-1], only that
-// node ever takes the snapshot; the unlisted worker-2 has no
-// Snapshot-child. Pre-fix the gate counted worker-2 in the
-// denominator and the row hung in Incomplete forever. With the fix,
-// the denominator is `Spec.Nodes ∩ diskful` -> {worker-1}, and the
-// row stamps Successful as soon as worker-1 reports.
-func TestSnapshotBug352SingleNodeScopedDenominatorMarksSuccessful(t *testing.T) {
-	ctx := t.Context()
-
-	st := store.NewInMemory()
-	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-		Name: "bug352-single",
-	}); err != nil {
-		t.Fatalf("seed RD: %v", err)
-	}
-
-	// Two diskful peers — caller restricts to one.
-	for _, n := range []string{"worker-1", "worker-2"} {
-		if err := st.Resources().Create(ctx, &apiv1.Resource{
-			Name: "bug352-single", NodeName: n,
-		}); err != nil {
-			t.Fatalf("seed Resource %s: %v", n, err)
-		}
-	}
-
-	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
-		Name:         "snap1",
-		ResourceName: "bug352-single",
-		Nodes:        []string{"worker-1"}, // Spec.Nodes-restricted.
-		Snapshots: []apiv1.SnapshotPerNode{
-			// Only the listed node ever materialises a per-node row.
-			{SnapshotName: "snap1", NodeName: "worker-1", CreateTimestamp: 1714000000},
-		},
-	}); err != nil {
-		t.Fatalf("seed Snapshot: %v", err)
-	}
-
-	base, stop := startServerWithStore(t, st)
-	defer stop()
-
-	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
-	if len(got) != 1 {
-		t.Fatalf("view len: got %d, want 1", len(got))
-	}
-
-	if !slices.Contains(got[0].Flags, apiv1.SnapshotFlagSuccessful) {
-		t.Errorf("Flags: got %v, want SUCCESSFUL — Spec.Nodes=[worker-1] and "+
-			"worker-1 reported; unlisted worker-2 MUST NOT gate the row "+
-			"(Bug 352 regression)", got[0].Flags)
-	}
-}
-
-// TestSnapshotBug352TwoNodeScopedDenominatorOnePeerInFlightStaysIncomplete
-// pins the "scoped but partial" branch: Spec.Nodes lists two peers,
-// only one has reported -> still Incomplete. Without this case a
-// regression that always returned `len(snap.Nodes)==0 -> diskful,
-// else -> empty set` would silently mark every scoped snapshot
-// Successful.
-func TestSnapshotBug352TwoNodeScopedDenominatorOnePeerInFlightStaysIncomplete(t *testing.T) {
-	ctx := t.Context()
-
-	st := store.NewInMemory()
-	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-		Name: "bug352-scoped-partial",
-	}); err != nil {
-		t.Fatalf("seed RD: %v", err)
-	}
-
-	// Three diskful peers; caller restricts to two of them.
-	for _, n := range []string{"worker-1", "worker-2", "worker-3"} {
-		if err := st.Resources().Create(ctx, &apiv1.Resource{
-			Name: "bug352-scoped-partial", NodeName: n,
-		}); err != nil {
-			t.Fatalf("seed Resource %s: %v", n, err)
-		}
-	}
-
-	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
-		Name:         "snap1",
-		ResourceName: "bug352-scoped-partial",
-		Nodes:        []string{"worker-1", "worker-2"},
-		Snapshots: []apiv1.SnapshotPerNode{
-			{SnapshotName: "snap1", NodeName: "worker-1", CreateTimestamp: 1714000000},
-			// worker-2 listed but still in flight.
-			{SnapshotName: "snap1", NodeName: "worker-2", CreateTimestamp: 0},
-		},
-	}); err != nil {
-		t.Fatalf("seed Snapshot: %v", err)
-	}
-
-	base, stop := startServerWithStore(t, st)
-	defer stop()
-
-	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
-	if len(got) != 1 {
-		t.Fatalf("view len: got %d, want 1", len(got))
-	}
-
-	if slices.Contains(got[0].Flags, apiv1.SnapshotFlagSuccessful) {
-		t.Errorf("Flags: leaked SUCCESSFUL while a listed peer (worker-2) hasn't "+
-			"reported back: %v", got[0].Flags)
 	}
 }
 
@@ -2126,76 +1876,6 @@ func TestSnapshotCreateExcludesInactiveReplica_Bug394(t *testing.T) {
 		if sn.NodeName == "n3" {
 			t.Errorf("Snapshots[]: INACTIVE n3 included in per-node materialisation: %+v", got.Snapshots)
 		}
-	}
-}
-
-// TestSnapshotStateIgnoresInactiveReplica_Bug394 pins the
-// success-denominator half of the Bug 394 fix: diskfulPeerSet must
-// exclude INACTIVE replicas, exactly as it excludes DISKLESS and
-// TIE_BREAKER. The INACTIVE replica is never a snapshot target (it
-// holds no Snapshots[] entry), so if it stayed in the denominator the
-// snapshot would hang at Incomplete forever — every active peer can
-// report success yet the INACTIVE node can never satisfy the check.
-//
-// The snapshot row is seeded with an EMPTY Nodes list so the success
-// derivation takes the broadcast path (successDenominator returns the
-// full diskful set verbatim). That is what makes diskfulPeerSet's
-// INACTIVE skip load-bearing: with a non-empty Nodes list the absent
-// INACTIVE node would be filtered out by the Nodes∩diskful intersection
-// regardless, masking the bug.
-//
-// Topology: n1 + n2 ACTIVE diskful (both reported CreateTimestamp),
-// n3 INACTIVE diskful. The snapshot MUST be stamped SUCCESSFUL.
-func TestSnapshotStateIgnoresInactiveReplica_Bug394(t *testing.T) {
-	ctx := t.Context()
-
-	st := store.NewInMemory()
-
-	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-		Name: "bug394test",
-	}); err != nil {
-		t.Fatalf("seed RD: %v", err)
-	}
-
-	resources := []apiv1.Resource{
-		{Name: "bug394test", NodeName: "worker-1"},
-		{Name: "bug394test", NodeName: "worker-2"},
-		{Name: "bug394test", NodeName: "worker-3", Flags: []string{apiv1.ResourceFlagInactive}},
-	}
-
-	for i := range resources {
-		if err := st.Resources().Create(ctx, &resources[i]); err != nil {
-			t.Fatalf("seed Resource %s: %v", resources[i].NodeName, err)
-		}
-	}
-
-	// Broadcast snapshot row: empty Nodes → successDenominator returns
-	// the diskfulPeerSet verbatim. Both ACTIVE peers reported
-	// CreateTimestamp; the INACTIVE worker-3 reported nothing (its DRBD
-	// device is down). Pre-fix, diskfulPeerSet counted worker-3, so the
-	// "every diskful peer reported" check never passed → no SUCCESSFUL.
-	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
-		Name:         "snap1",
-		ResourceName: "bug394test",
-		Snapshots: []apiv1.SnapshotPerNode{
-			{SnapshotName: "snap1", NodeName: "worker-1", CreateTimestamp: 1714000000},
-			{SnapshotName: "snap1", NodeName: "worker-2", CreateTimestamp: 1714000050},
-		},
-	}); err != nil {
-		t.Fatalf("seed Snapshot: %v", err)
-	}
-
-	base, stop := startServerWithStore(t, st)
-	defer stop()
-
-	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
-	if len(got) != 1 {
-		t.Fatalf("view len: got %d, want 1", len(got))
-	}
-
-	if !slices.Contains(got[0].Flags, apiv1.SnapshotFlagSuccessful) {
-		t.Errorf("Flags: got %v, want SUCCESSFUL (every active diskful peer reported, "+
-			"INACTIVE worker-3 MUST be excluded from the denominator)", got[0].Flags)
 	}
 }
 
@@ -2415,45 +2095,5 @@ func TestSnapshotCreateScopesGateToTargetNodes_G5(t *testing.T) {
 
 	if badResp.StatusCode != http.StatusBadRequest {
 		t.Errorf("targeting thick n2: got %d, want 400 (thick pool refused)", badResp.StatusCode)
-	}
-}
-
-// A snapshot whose delete is in flight is Deleting: the python CLI checks the
-// DELETE flag first, and SUCCESSFUL stamped beside it reads as a usable
-// snapshot to any client that checks the flags in another order.
-func TestSnapshotStateNotMarkedSuccessfulWhileDeleting(t *testing.T) {
-	ctx := t.Context()
-
-	st := store.NewInMemory()
-	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "snap-deleting"}); err != nil {
-		t.Fatalf("seed RD: %v", err)
-	}
-
-	if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "snap-deleting", NodeName: "worker-1"}); err != nil {
-		t.Fatalf("seed Resource: %v", err)
-	}
-
-	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
-		Name:         "snap1",
-		ResourceName: "snap-deleting",
-		Nodes:        []string{"worker-1"},
-		Flags:        []string{apiv1.SnapshotFlagDelete},
-		Snapshots: []apiv1.SnapshotPerNode{
-			{SnapshotName: "snap1", NodeName: "worker-1", CreateTimestamp: 1714000000},
-		},
-	}); err != nil {
-		t.Fatalf("seed Snapshot: %v", err)
-	}
-
-	base, stop := startServerWithStore(t, st)
-	defer stop()
-
-	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
-	if len(got) != 1 {
-		t.Fatalf("view len: got %d, want 1", len(got))
-	}
-
-	if slices.Contains(got[0].Flags, apiv1.SnapshotFlagSuccessful) {
-		t.Errorf("Flags: SUCCESSFUL stamped beside DELETE: %v", got[0].Flags)
 	}
 }
