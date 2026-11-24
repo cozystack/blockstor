@@ -143,16 +143,18 @@ type EffectiveProperties map[string]EffectivePropEntry
 // maintaining resource group placement count" (lines 885-907).
 //
 // Scenario 2.W02: when this prop resolves to "false" at controller
-// scope, the RGRebalanceReconciler MUST short-circuit even with the
-// `blockstor.org/rebalance-pending` annotation present — operators
-// disable the periodic rescheduling for clusters that prefer manual
-// placement decisions, and a stamped annotation from a stale REST
-// modify shouldn't override that choice.
+// scope, the RGRebalanceReconciler skips the scheduled tick and the
+// pass for an `rg modify` that changed only a placement constraint.
+// Operators disable the periodic rescheduling for clusters that prefer
+// manual placement decisions. An `rg modify` that names a place count
+// still places at every scope: LINSTOR reads this switch in its
+// balance task alone, and its `rg modify` autoplaces without it.
 //
-// Resolution hierarchy (most-specific wins): RD > RG > controller.
-// The reconciler reads controller scope only for the first cut;
-// RD/RG-scope kill-switches land alongside the placer integration in
-// a follow-up.
+// Resolution hierarchy (most-specific wins): RD > RG > controller,
+// compared case-insensitively. The controller scope switches the
+// scheduled tick off; an RD or RG value only takes that definition out
+// of it, as LINSTOR's balance task does. linstor-csi sets it to "False"
+// on a definition while it deletes the volume.
 const PropBalanceResourcesEnabled = "BalanceResourcesEnabled"
 
 // PropBalanceResourcesInterval is the controller / RG / RD-scope

@@ -152,6 +152,22 @@ type DesiredResource struct {
 	// but keeping the tri-state matches the clusterIP append-only model
 	// and lets a future caller tell them apart.
 	SkipInitialSync *bool
+
+	// Deleting is true when this replica or its definition is on its way
+	// out: either carries a deletion timestamp, the replica is flagged
+	// DELETE or DELETING, or the definition is flagged DELETE. A replica that is being deleted is never promoted
+	// by a self-heal: losing its peers is the intended end state of the
+	// delete, not a wedge to repair. LINSTOR never promotes a resource
+	// it is deleting either.
+	Deleting bool
+
+	// OtherDiskfulReplica is true when the definition has a diskful
+	// replica on another node, counted over every sibling Resource:
+	// deactivated ones, ones being deleted and ones the allocator has not
+	// stamped yet included, all of which Peers leaves out. Any of them
+	// holds, or may hold, data this replica does not, so a replica that
+	// has one is never force-promoted as the definition's only copy.
+	OtherDiskfulReplica bool
 }
 
 // DesiredConnection is one (peer-pair, paths) entry on a
@@ -327,6 +343,26 @@ func (x *DesiredResource) GetPeerHasData() bool {
 	return x.PeerHasData
 }
 
+// GetDeleting reports whether this replica or its definition is being
+// deleted. Nil-safe.
+func (x *DesiredResource) GetDeleting() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.Deleting
+}
+
+// GetOtherDiskfulReplica reports whether the definition has a diskful
+// replica on another node, whatever its state. Nil-safe.
+func (x *DesiredResource) GetOtherDiskfulReplica() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.OtherDiskfulReplica
+}
+
 // GetSkipInitialSync returns the controller-authoritative skip-initial-
 // sync decision (true → may skip, false → must SyncTarget, nil → not
 // yet stamped). Nil-safe at the receiver level; the *bool tri-state is
@@ -390,6 +426,24 @@ type DesiredVolume struct {
 	// log on a volume with one is a crash to repair with apply-al, not a
 	// foreign superblock to re-initialise over.
 	ObservedGI string
+
+	// AppliedSizeKib is the size this replica last finished applying
+	// (Resource status), 0 when none was reported. While it is below
+	// SizeKib a grow is still pending here: the satellite grows the
+	// backing to what the layers need, runs `drbdadm resize` again when
+	// the backing needs no growing on this pass, so a resize that failed
+	// after the backing grew is retried rather than forgotten, and
+	// reports the size only once the device shows it.
+	AppliedSizeKib int64
+}
+
+// GetAppliedSizeKib returns the size last applied on this replica, or 0.
+func (x *DesiredVolume) GetAppliedSizeKib() int64 {
+	if x == nil {
+		return 0
+	}
+
+	return x.AppliedSizeKib
 }
 
 // GetObservedGI returns the GI last reported for this volume, or "".
@@ -485,6 +539,20 @@ type ResourceApplyResult struct {
 	// so linstor-csi / consumers reading the CRD can resolve the
 	// backing /dev path without an extra round-trip.
 	Volumes []*ResourceApplyVolumeResult
+
+	// GrowPending reports a volume whose grow has not reached its device
+	// yet, typically because a peer's backing has not grown: the pass
+	// is to be repeated so the size applied is reported once it has.
+	GrowPending bool
+}
+
+// GetGrowPending reports a volume whose grow has not reached its device.
+func (x *ResourceApplyResult) GetGrowPending() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.GrowPending
 }
 
 // ResourceApplyVolumeResult is the per-volume slice item the
@@ -494,6 +562,21 @@ type ResourceApplyResult struct {
 type ResourceApplyVolumeResult struct {
 	VolumeNumber int32
 	DevicePath   string
+
+	// AppliedSizeKib is the volume definition size this pass applied
+	// through every layer: the definition size when no grow was pending
+	// or the device has grown to it, the size reported before otherwise.
+	// Set only on a pass that succeeded.
+	AppliedSizeKib int64
+}
+
+// GetAppliedSizeKib returns the size this pass applied, or 0.
+func (v *ResourceApplyVolumeResult) GetAppliedSizeKib() int64 {
+	if v == nil {
+		return 0
+	}
+
+	return v.AppliedSizeKib
 }
 
 // GetVolumes returns the per-volume slice — nil-safe.
