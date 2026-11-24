@@ -75,8 +75,8 @@ func (o *ObserverRunnable) WorkaroundHints() WorkaroundHints {
 			continue
 		}
 
-		for _, vol := range volumes {
-			if vol.DiskState == drbdDiskStateInconsistent {
+		for num := range volumes {
+			if volumes[num].DiskState == drbdDiskStateInconsistent {
 				hints.Inconsistent = true
 			}
 		}
@@ -94,8 +94,9 @@ func (o *ObserverRunnable) OpenUnknown(name string) bool {
 	o.volMu.Lock()
 	defer o.volMu.Unlock()
 
-	for _, vol := range o.volCache[name] {
-		if vol.Open == drbdOpenUnknown {
+	volumes := o.volCache[name]
+	for num := range volumes {
+		if volumes[num].Open == drbdOpenUnknown {
 			return true
 		}
 	}
@@ -106,8 +107,8 @@ func (o *ObserverRunnable) OpenUnknown(name string) bool {
 // anyVolumeMaybeOpen reports whether some volume is open or its open
 // state is unknown.
 func anyVolumeMaybeOpen(volumes map[int32]volumeObservation) bool {
-	for _, vol := range volumes {
-		if vol.Open == drbdFlagYes || vol.Open == drbdOpenUnknown {
+	for num := range volumes {
+		if open := volumes[num].Open; open == drbdFlagYes || open == drbdOpenUnknown {
 			return true
 		}
 	}
