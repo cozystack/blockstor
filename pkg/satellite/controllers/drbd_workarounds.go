@@ -79,11 +79,17 @@ type WorkaroundsConfig struct {
 	StalledResyncMinRate int
 
 	// StalledResyncAct lets checkStalledResync disconnect the peer a
-	// stalled resync waits on, or reconnect the one it pulls from, where
-	// no Primary is in sight. Off by default: a reconnect can pick a
-	// Secondary as SyncSource while a Primary writes, and that left a
-	// replica UpToDate with data different from the Primary's on the
-	// test cluster (see checkStalledResync).
+	// stalled resync waits on, or reconnect the one it pulls from. Off
+	// by default: a reconnect can pick a Secondary as SyncSource while a
+	// Primary writes, and that left a replica UpToDate with data
+	// different from the Primary's on the test cluster (see
+	// checkStalledResync). With no Primary in sight it does either; with
+	// one in sight it only disconnects the paused peer, from a Secondary
+	// whose volumes are all Inconsistent, and owes the connect until
+	// every other link is Connected to a Secondary (reconnectOwed). Until
+	// then the two Secondaries are apart, so if the Primary's node fails
+	// a resource of three replicas has no quorum for a promotion before
+	// an operator connects them.
 	StalledResyncAct bool
 
 	// IdlePrimary demotes a Primary nobody uses (checkIdlePrimary).
@@ -1048,7 +1054,8 @@ func (w *DRBDWorkaroundsRunnable) reportReconnectWait(logger logr.Logger, replic
 
 	w.acted(logger, replica, name, "DRBDResyncStalled", fmt.Sprintf(
 		"not connecting again %s, disconnected for a stalled resync, while a Primary is in sight or not ruled out "+
-			"(LINBIT/drbd#153); the link stays down until none can be, or connect it by hand on %s: %s",
+			"(LINBIT/drbd#153); the link stays down until none can be, and a failover after the Primary's node fails "+
+			"may need it up for quorum; connect it by hand on %s: %s",
 		strings.Join(peers, ", "), w.NodeName, strings.Join(commands, ", ")))
 }
 

@@ -106,11 +106,16 @@ func registerWorkaroundFlags(flagSet *flag.FlagSet, cfg *controllers.Workarounds
 		"Resync progress in KiB/s below which a pass counts as stalled; keep it under the resource's "+
 			"c-min-rate, or its resync-rate when the rate is fixed.")
 	flagSet.BoolVar(&cfg.StalledResyncAct, "drbd-workaround-stalled-resync-act", def.StalledResyncAct,
-		"RISKY: also run the commands --drbd-workaround-stalled-resync reports, where no Primary is in sight and the resync is not an initial sync: "+
+		"RISKY: also run the commands --drbd-workaround-stalled-resync reports, unless the resync is an initial sync: "+
 			"disconnect and connect again the peer whose resync waits on the stalled one, or failing that "+
-			"the peer the stalled resync pulls from. With a Primary writing, such a reconnect made a "+
+			"reconnect the peer the stalled resync pulls from. With a Primary writing, such a reconnect made a "+
 			"Secondary the SyncSource of another Secondary and left the two with different data while DRBD "+
-			"reported both UpToDate (LINBIT/drbd#153, LINBIT/drbd#143).")
+			"reported both UpToDate (LINBIT/drbd#153, LINBIT/drbd#143), so with a Primary in sight it only "+
+			"disconnects the waiting peer, from a node whose volumes are all Inconsistent, and connects it again "+
+			"once every other link is Connected to a Secondary. With a running guest that is when the guest stops. "+
+			"Meanwhile the two Secondaries stay apart: if the Primary's node fails, its link is no longer Connected, "+
+			"the connect stays owed, and with three replicas neither Secondary has quorum to be promoted until an "+
+			"operator runs the `drbdadm connect` the Warning Event names.")
 	flagSet.BoolVar(&cfg.IdlePrimary, "drbd-workaround-idle-primary", def.IdlePrimary,
 		"Demote a Primary with no volume open (DRBD auto-demote not firing, piraeus-operator#942).")
 	flagSet.BoolVar(&cfg.ForcedIOFailures, "drbd-workaround-forced-io-failures", def.ForcedIOFailures,
