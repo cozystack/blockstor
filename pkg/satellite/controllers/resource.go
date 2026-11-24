@@ -48,6 +48,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
@@ -146,13 +147,16 @@ type ResourceReconciler struct {
 	client.Client
 
 	Config Config
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
-// Reconcile reads a Resource and drives the satellite-side
-// apply chain when the Resource is placed on this node.
-// Finalizer-aware: stamps `SatelliteResourceFinalizer` on
-// every live Resource so kube-apiserver waits for our tear-down
-// before allowing the object to disappear.
+// Reconcile runs one pass of reconcileResource, retries one that lost
+// an optimistic-concurrency race instead of reporting it as an error
+// (see conflict.Retrier), and settles the queue priority of the
+// result.
 //
 // Only a converged pass's periodic re-check keeps low priority. Every
 // other retry (a failed apply, an error, a wait on the allocator) is
@@ -161,12 +165,12 @@ type ResourceReconciler struct {
 // drift would repair it at low priority, behind every other replica's
 // idle re-check.
 func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	result, err := r.reconcileResource(ctx, req)
+	result, err := r.conflicts.Reconcile(ctx, req, r.reconcileResource)
 	if result.Priority == nil {
 		result.Priority = normalPriority()
 	}
 
-	return result, err
+	return result, err //nolint:wrapcheck // the pass's own error, already wrapped
 }
 
 // applyFailureRequeue is the backoff between satellite Apply
@@ -294,8 +298,11 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return nil
 }
 
-// reconcileResource is the body of Reconcile, which only settles the
-// queue priority of the result.
+// reconcileResource reads a Resource and drives the satellite-side
+// apply chain when the Resource is placed on this node.
+// Finalizer-aware: stamps `SatelliteResourceFinalizer` on
+// every live Resource so kube-apiserver waits for our tear-down
+// before allowing the object to disappear.
 func (r *ResourceReconciler) reconcileResource(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("resource", req.Name)
 

@@ -43,6 +43,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
 	"github.com/cozystack/blockstor/pkg/naming"
@@ -143,6 +144,10 @@ type ResourceReconciler struct {
 	// Workers is how many Resources reconcile at once; zero means
 	// DefaultResourceWorkers.
 	Workers int
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // DefaultResourceWorkers is how many Resources the controller
@@ -173,10 +178,17 @@ func (r *ResourceReconciler) workers() int {
 // +kubebuilder:rbac:groups=blockstor.org,resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch
 
-// Reconcile reads a Resource and pushes the matching DesiredResource
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass reads a Resource and pushes the matching DesiredResource
 // to the satellite that hosts it. Per-replica errors land in the
 // log; transport faults trigger a 10s requeue.
-func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *ResourceReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var target blockstoriov1alpha1.Resource
 
 	err := r.Get(ctx, req.NamespacedName, &target)

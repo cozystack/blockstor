@@ -30,6 +30,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -95,6 +96,10 @@ type RGRebalanceReconciler struct {
 	// race on the map.
 	nodeOfflineSinceMu sync.Mutex
 	nodeOfflineSince   map[string]time.Time
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcegroups,verbs=get;list;watch;update;patch
@@ -103,12 +108,19 @@ type RGRebalanceReconciler struct {
 // +kubebuilder:rbac:groups=blockstor.org,resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=blockstor.org,resources=controllerconfigs,verbs=get;list;watch
 
-// Reconcile is the explicit + periodic rebalance pass. See the type
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *RGRebalanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass is the explicit + periodic rebalance pass. See the type
 // comment for the five-step lifecycle. Returns `RequeueAfter =
 // BalanceResourcesInterval` on every path (annotation-driven,
 // scheduled-tick, kill-switched, grace-gated) so the cadence is
 // stable regardless of branch taken.
-func (r *RGRebalanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *RGRebalanceReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	if r.Store == nil {
 		return ctrl.Result{}, nil
 	}
