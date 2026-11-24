@@ -115,18 +115,16 @@ func TestAdmAdjustInvokesDrbdadm(t *testing.T) {
 
 // TestAdmCreateMD: `drbdadm create-md --force <res>` (used on first
 // activation; --force is needed when there is leftover signature from a
-// previous resource).
+// previous resource), with the replica's peer slots.
 func TestAdmCreateMD(t *testing.T) {
 	fx := storage.NewFakeExec()
 	adm := drbd.NewAdm(fx)
 
-	if err := adm.CreateMD(t.Context(), "pvc-1"); err != nil {
+	if err := adm.CreateMDWithGeometry(t.Context(), "pvc-1", drbd.GeometryForPeerSlots(drbd.LegacyPeerSlots)); err != nil {
 		t.Fatalf("CreateMD: %v", err)
 	}
 
-	// --max-peers pinned to MaxPeers-1 so the kernel can hold the
-	// connection mesh the allocator hands out.
-	want := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-1", drbd.MaxPeers-1)
+	want := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-1", drbd.LegacyPeerSlots)
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("missing %q in calls: %v", want, fx.CommandLines())
 	}

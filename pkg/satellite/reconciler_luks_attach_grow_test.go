@@ -89,7 +89,7 @@ func TestGrowBeforeAttachAttachesWithoutResizingTheDevice(t *testing.T) {
 
 			// The size the backing grows to: what a new one is created
 			// at for the adopted device, in whole MiB.
-			grownKib := (drbd.InternalMetadataGrossKiB(adoptedDev, drbd.DefaultGeometry()) + header + 1023) / 1024 * 1024
+			grownKib := (drbd.InternalMetadataGrossKiB(adoptedDev, drbd.GeometryForPeerSlots(drbd.LegacyPeerSlots)) + header + 1023) / 1024 * 1024
 			bytes := func(kib int64) storage.FakeResponse {
 				return storage.FakeResponse{Stdout: []byte(strconv.FormatInt(kib*1024, 10) + "\n")}
 			}

@@ -43,6 +43,14 @@ const (
 func createdZvolKiB(t *testing.T, vol *intent.DesiredVolume, layerStack []string) int64 {
 	t.Helper()
 
+	return createdZvolKiBWithPeerSlots(t, vol, layerStack, nil)
+}
+
+// createdZvolKiBWithPeerSlots is createdZvolKiB for a replica with the
+// given peer-slot count, nil for one without a recorded count.
+func createdZvolKiBWithPeerSlots(t *testing.T, vol *intent.DesiredVolume, layerStack []string, peerSlots *int32) int64 {
+	t.Helper()
+
 	fx := storage.NewFakeExec()
 	fx.Expect("zfs list -H -o name data/pvc-adopted_00000", storage.FakeResponse{Stdout: []byte("")})
 
@@ -55,6 +63,7 @@ func createdZvolKiB(t *testing.T, vol *intent.DesiredVolume, layerStack []string
 		NodeName:   "n2",
 		Volumes:    []*intent.DesiredVolume{vol},
 		LayerStack: layerStack,
+		PeerSlots:  peerSlots,
 	}})
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -94,13 +103,40 @@ func TestNewLowerDiskHoldsAdoptedDevice(t *testing.T) {
 		t.Fatalf("zvol created at the definition's size, %d KiB, leaving no room for metadata", zvol)
 	}
 
-	data := drbd.InternalMetadataNetKiB(zvol, drbd.DefaultGeometry())
+	data := drbd.InternalMetadataNetKiB(zvol, drbd.GeometryForPeerSlots(drbd.LegacyPeerSlots))
 	if data < adoptedDeviceKiB {
 		t.Fatalf("zvol of %d KiB holds a %d KiB data area, below the %d KiB device", zvol, data, adoptedDeviceKiB)
 	}
 
 	if zvol != 20490*1024 {
 		t.Errorf("zvol: got %d KiB, want 20490 MiB", zvol)
+	}
+}
+
+// TestNewLowerDiskIsSizedForTheReplicaPeerSlots: a replica with LINSTOR's
+// seven peer slots gets the lower disk LINSTOR gives it: 20976040 KiB for
+// a 20 GiB data area, rounded up to the provider's MiB, and its data area
+// holds the adopted device. Sized for fifteen it would be 20490 MiB, a
+// bitmap per missing slot larger than LINSTOR's.
+func TestNewLowerDiskIsSizedForTheReplicaPeerSlots(t *testing.T) {
+	t.Parallel()
+
+	seven := int32(drbd.DefaultPeerSlots)
+
+	zvol := createdZvolKiBWithPeerSlots(t, &intent.DesiredVolume{
+		VolumeNumber:  0,
+		SizeKib:       adoptedVolumeKiB,
+		StoragePool:   "data",
+		DeviceSizeKib: adoptedDeviceKiB,
+	}, nil, &seven)
+
+	if want := int64(20485 * 1024); zvol != want {
+		t.Errorf("zvol for 7 peer slots: got %d KiB, want %d (20976040 KiB rounded up to MiB)", zvol, want)
+	}
+
+	data := drbd.InternalMetadataNetKiB(zvol, drbd.GeometryForPeerSlots(drbd.DefaultPeerSlots))
+	if data < adoptedDeviceKiB {
+		t.Fatalf("zvol of %d KiB holds a %d KiB data area with 7 slots, below the %d KiB device", zvol, data, adoptedDeviceKiB)
 	}
 }
 
@@ -119,7 +155,7 @@ func TestNewLowerDiskHoldsLargestReportedDevice(t *testing.T) {
 		DeviceSizeKib: device,
 	}, nil)
 
-	data := drbd.InternalMetadataNetKiB(zvol, drbd.DefaultGeometry())
+	data := drbd.InternalMetadataNetKiB(zvol, drbd.GeometryForPeerSlots(drbd.LegacyPeerSlots))
 	if data < device {
 		t.Fatalf("zvol of %d KiB holds a %d KiB data area, below the reported %d KiB device", zvol, data, device)
 	}
@@ -154,7 +190,7 @@ func TestNewLowerDiskHoldsAdoptedLUKSDevice(t *testing.T) {
 		DeviceSizeKib: adoptedDeviceKiB,
 	}, []string{"DRBD", "LUKS", "STORAGE"})
 
-	data := drbd.InternalMetadataNetKiB(zvol-luks.HeaderKiB, drbd.DefaultGeometry())
+	data := drbd.InternalMetadataNetKiB(zvol-luks.HeaderKiB, drbd.GeometryForPeerSlots(drbd.LegacyPeerSlots))
 	if data < adoptedDeviceKiB {
 		t.Fatalf("zvol of %d KiB holds a %d KiB data area under the LUKS header, below the %d KiB device",
 			zvol, data, adoptedDeviceKiB)
