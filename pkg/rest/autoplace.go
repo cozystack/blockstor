@@ -36,6 +36,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -127,7 +128,7 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]apiv1.ResourceWithVolumes, 0, len(resList))
 	for i := range resList {
-		out = append(out, wrapResourceWithLayers(&resList[i], rd.LayerStack, vdSizes))
+		out = append(out, wrapResourceWithLayers(&resList[i], rd.LayerStack, s.placeholderPool(r.Context(), &resList[i]), vdSizes))
 	}
 
 	// Bug 188 (P0): scrub deny-listed sensitive keys (passphrase,
@@ -203,8 +204,8 @@ func balancingStopped(rd *apiv1.ResourceDefinition) bool {
 // unconditionally and crashes on `None.iter`. Mirrors the
 // ensureVolumesForView contract used by /v1/view/resources: a non-nil
 // (possibly empty) slice survives the JSON encode as `[]`.
-func wrapResourceWithVolumes(res *apiv1.Resource, vdSizes map[int32]int64) apiv1.ResourceWithVolumes {
-	return apiv1.ResourceWithVolumes{Resource: *res, Volumes: ensureVolumesForView(res.Volumes, res, vdSizes)}
+func wrapResourceWithVolumes(res *apiv1.Resource, poolFor func(int32) string, vdSizes map[int32]int64) apiv1.ResourceWithVolumes {
+	return apiv1.ResourceWithVolumes{Resource: *res, Volumes: ensureVolumesForView(res.Volumes, poolFor, vdSizes)}
 }
 
 // wrapResourceWithLayers wraps a replica re-stamped with its
@@ -216,9 +217,9 @@ func wrapResourceWithVolumes(res *apiv1.Resource, vdSizes map[int32]int64) apiv1
 //
 // The volumes are copied before the re-stamp: a store may hand back a
 // slice it still holds.
-func wrapResourceWithLayers(res *apiv1.Resource, stack []string, vdSizes map[int32]int64) apiv1.ResourceWithVolumes {
+func wrapResourceWithLayers(res *apiv1.Resource, stack []string, poolFor func(int32) string, vdSizes map[int32]int64) apiv1.ResourceWithVolumes {
 	if len(stack) == 0 {
-		return wrapResourceWithVolumes(res, vdSizes)
+		return wrapResourceWithVolumes(res, poolFor, vdSizes)
 	}
 
 	stamped := *res
@@ -227,7 +228,7 @@ func wrapResourceWithLayers(res *apiv1.Resource, stack []string, vdSizes map[int
 	apiv1.ApplyLayerStack(&stamped, stack)
 	apiv1.ApplyLayerStackToVolumes(stamped.Volumes, stack)
 
-	return wrapResourceWithVolumes(&stamped, vdSizes)
+	return wrapResourceWithVolumes(&stamped, poolFor, vdSizes)
 }
 
 // handleResourceGet answers `GET /v1/resource-definitions/{rd}/resources/{node}`,
@@ -290,7 +291,7 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 	// outer `volumes` JSON key serialises as `[]` instead of `null` when
 	// the Resource carries no Volumes; protects python-linstor's
 	// `rsc._rest_data['volumes']` dereference.
-	writeJSON(w, http.StatusOK, wrapResourceWithLayers(&res, rd.LayerStack, s.definitionVolumeSizes(r.Context(), rdName)))
+	writeJSON(w, http.StatusOK, wrapResourceWithLayers(&res, rd.LayerStack, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName)))
 }
 
 // handleAutoplace selects up to `place_count` nodes that have a storage
@@ -411,19 +412,30 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.runPlaceAndReport(w, r, rdName, &filter, srcKind) {
+	deployed, ok := s.runPlaceAndReport(w, r, rdName, &filter, srcKind)
+	if !ok {
 		return
 	}
 
-	// Java LINSTOR replies with a `[]ApiCallRc` envelope on success.
-	// golinstor's RD.Autoplace ignores an empty body, but tools that
-	// surface API messages (e.g. the linstor CLI) want a real result
-	// to log. Return MASK_INFO + RC_PLACEMENT_DONE-style entry so the
-	// shape matches the oracle's.
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+	s.writeAutoplaceDone(w, r, rdName, deployed)
+}
+
+// writeAutoplaceDone answers a successful autoplace once the
+// satellites brought up the replicas it deployed, as LINSTOR does;
+// see waitDeployedReplicasReady.
+//
+// Java LINSTOR replies with a `[]ApiCallRc` envelope on success.
+// golinstor's RD.Autoplace ignores an empty body, but tools that
+// surface API messages (e.g. the linstor CLI) want a real result
+// to log. Return MASK_INFO + RC_PLACEMENT_DONE-style entry so the
+// shape matches the oracle's.
+func (s *Server) writeAutoplaceDone(w http.ResponseWriter, r *http.Request, rdName string, deployed []string) {
+	notReady := s.waitDeployedReplicasReady(r.Context(), rdName, deployed)
+
+	writeJSON(w, http.StatusOK, append([]apiv1.APICallRc{{
 		RetCode: apiCallRcInfo | apiCallRcRDAutoplaceDone,
 		Message: "Resource definition '" + rdName + "' auto-placed",
-	}})
+	}}, notReady...))
 }
 
 // refuseAutoplaceMultiPlaceWithoutReplication is Bug 335's
@@ -636,8 +648,9 @@ func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Reques
 }
 
 // runPlaceAndReport drives the placer and writes the appropriate
-// HTTP error on shortfall. Returns true on success (caller writes
-// the success body), false on any error path (caller returns).
+// HTTP error on shortfall. On success it returns the nodes this call
+// deployed a replica to and true (caller writes the success body);
+// on any error path it returns false (caller returns).
 // Pulled out of handleAutoplace to keep that function under the
 // cyclomatic / funlen budget once the snapshot-clone provider-kind
 // constraint was added.
@@ -650,8 +663,8 @@ func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Reques
 // path now emit the full envelope shape so the CLI surfaces the
 // same diagnostic upstream Java LINSTOR does (criteria bullet list +
 // "Auto-place configuration details" block).
-func (s *Server) runPlaceAndReport(w http.ResponseWriter, r *http.Request, rdName string, filter *apiv1.AutoSelectFilter, srcKind string) bool {
-	placed, want, err := placer.New(s.Store).Place(r.Context(), rdName, filter)
+func (s *Server) runPlaceAndReport(w http.ResponseWriter, r *http.Request, rdName string, filter *apiv1.AutoSelectFilter, srcKind string) ([]string, bool) {
+	placement, err := placer.New(s.Store).PlaceDeployed(r.Context(), rdName, filter)
 	if err != nil {
 		// Capacity-shortfall (Bug 35) is operator-actionable, not a
 		// 500. Surface as a structured 409 envelope so the Python
@@ -661,21 +674,21 @@ func (s *Server) runPlaceAndReport(w http.ResponseWriter, r *http.Request, rdNam
 		if errors.As(err, &capErr) {
 			writeAutoplaceShortfall(w, filter, srcKind, capErr)
 
-			return false
+			return nil, false
 		}
 
 		writeError(w, http.StatusInternalServerError, err.Error())
 
-		return false
+		return nil, false
 	}
 
-	if placed < want {
+	if placement.Placed < placement.Want {
 		writeAutoplaceShortfall(w, filter, srcKind, nil)
 
-		return false
+		return nil, false
 	}
 
-	return true
+	return placement.Deployed, true
 }
 
 // resolveAdditionalPlaceCount implements the W17 `--auto-place +N`
@@ -1426,12 +1439,16 @@ func (s *Server) handleResourceCreate(w http.ResponseWriter, r *http.Request) {
 		s.bumpPeerChangedOnSiblings(r.Context(), rdName, created[i].NodeName)
 	}
 
+	// LINSTOR answers an explicit create after the same wait as an
+	// autoplace (CtrlRscCrtApiCallHandler → deployResources).
+	notReady := s.waitDeployedReplicasReady(r.Context(), rdName, replicaNodes(created))
+
 	// Python CLI demands an ApiCallRc list envelope; upstream's
 	// `linstor r c` walks it on every reply.
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+	writeJSON(w, http.StatusCreated, append([]apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource(s) created on resource-definition: " + rdName,
-	}})
+	}}, notReady...))
 }
 
 // handleResourceCreateOnNode answers `POST /v1/resource-definitions/
@@ -1514,11 +1531,15 @@ func (s *Server) handleResourceCreateOnNode(w http.ResponseWriter, r *http.Reque
 		s.bumpPeerChangedOnSiblings(r.Context(), rdName, created[i].NodeName)
 	}
 
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+	// The create linstor-csi's Manual scheduler posts: answer it after
+	// the same wait as an autoplace, as LINSTOR does.
+	notReady := s.waitDeployedReplicasReady(r.Context(), rdName, replicaNodes(created))
+
+	writeJSON(w, http.StatusCreated, append([]apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource created on resource-definition: " + rdName +
 			" / node: " + node,
-	}})
+	}}, notReady...))
 }
 
 // createResources walks the envelopes from a POST to
@@ -1542,6 +1563,10 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 			writeError(w, http.StatusNotImplemented, "drbd_client is not supported: blockstor has no diskless "+
 				"replica without a quorum vote, create a DRBD diskless replica instead")
 
+			return nil, false
+		}
+
+		if refuseUnwhitelistedProps(w, propwhitelist.Resource, envelopes[i].Resource.Props) {
 			return nil, false
 		}
 	}
@@ -2650,16 +2675,21 @@ func decodeMakeAvailableBody(w http.ResponseWriter, r *http.Request) (apiv1.Reso
 }
 
 // applyMakeAvailable dispatches to update-or-create depending on
-// whether a Resource already lives on the target node. Writes the
-// HTTP error response on failure and returns false.
-func (s *Server) applyMakeAvailable(w http.ResponseWriter, r *http.Request, rdName, node string, req *apiv1.ResourceMakeAvailable) bool {
+// whether a Resource already lives on the target node, and reports
+// whether it created one. Writes the HTTP error response on failure
+// and returns false.
+func (s *Server) applyMakeAvailable(w http.ResponseWriter, r *http.Request, rdName, node string, req *apiv1.ResourceMakeAvailable) (bool, bool) {
 	existing, err := s.Store.Resources().Get(r.Context(), rdName, node)
+
+	created := false
 
 	switch {
 	case err == nil:
 		err = s.makeAvailableUpdate(r.Context(), &existing, req)
 	case errors.Is(err, store.ErrNotFound):
 		err = s.makeAvailableCreate(r.Context(), rdName, node, req)
+		created = err == nil
+
 		if errors.Is(err, store.ErrAlreadyExists) {
 			// A replica appeared on the node since the read: the
 			// tiebreaker reconciler put a witness there. LINSTOR
@@ -2675,10 +2705,10 @@ func (s *Server) applyMakeAvailable(w http.ResponseWriter, r *http.Request, rdNa
 	if err != nil {
 		writeStoreError(w, err)
 
-		return false
+		return false, false
 	}
 
-	return true
+	return created, true
 }
 
 // makeAvailableUpdate mutates an existing replica to match the

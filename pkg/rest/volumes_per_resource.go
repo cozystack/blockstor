@@ -26,6 +26,7 @@ import (
 	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 )
 
 // registerVolumesPerResource wires the per-Resource Volume routes
@@ -80,7 +81,7 @@ func (s *Server) handleVolumesPerResourceList(w http.ResponseWriter, r *http.Req
 	// (see ensureVolumesForView). REST 1.28 added the `props` filter
 	// here, on the volumes' own props.
 	propFilter := propsQuery(r)
-	listed := ensureVolumesForView(res.Volumes, &res, s.definitionVolumeSizes(r.Context(), rdName))
+	listed := ensureVolumesForView(res.Volumes, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName))
 	vols := make([]apiv1.Volume, 0, len(listed))
 
 	for i := range listed {
@@ -127,7 +128,7 @@ func (s *Server) handleVolumesPerResourceGet(w http.ResponseWriter, r *http.Requ
 	// device path, as LINSTOR's does, rather than 404: linstor-csi's
 	// attach then reports "could not determine device path" and
 	// retries, instead of failing on a volume that does exist.
-	if vol, ok := placeholderVolume(&res, vlmNr, s.definitionVolumeSizes(r.Context(), rdName)); ok {
+	if vol, ok := placeholderVolume(&res, vlmNr, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName)); ok {
 		writeJSON(w, http.StatusOK, vol)
 
 		return
@@ -174,6 +175,10 @@ func (s *Server) handleVolumesPerResourceModify(w http.ResponseWriter, r *http.R
 	var patch apiv1.GenericPropsModify
 
 	if !decodeJSON(w, r, &patch) {
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.Volume, patch.OverrideProps) {
 		return
 	}
 
@@ -247,8 +252,8 @@ func mergeVolumePropsPatch(vol *apiv1.Volume, patch *apiv1.GenericPropsModify) {
 
 // placeholderVolume is volume vlmNr of the replica as the volume list
 // answers it (ensureVolumesForView), and whether that list has it.
-func placeholderVolume(res *apiv1.Resource, vlmNr int32, vdSizes map[int32]int64) (apiv1.Volume, bool) {
-	vols := ensureVolumesForView(res.Volumes, res, vdSizes)
+func placeholderVolume(res *apiv1.Resource, vlmNr int32, poolFor func(int32) string, vdSizes map[int32]int64) (apiv1.Volume, bool) {
+	vols := ensureVolumesForView(res.Volumes, poolFor, vdSizes)
 
 	idx := findVolumeIndexByNumber(vols, vlmNr)
 	if idx < 0 {

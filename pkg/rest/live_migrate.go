@@ -76,10 +76,10 @@ const (
 
 // Return codes of the dual-Primary refusals: LINSTOR's FAIL_EXISTS_LIVE_MIGRATE
 // and FAIL_INVLD_LAYER_STACK, so golinstor's errors.Is matches them.
+// FAIL_INVLD_PROP is apiCallRcFailInvldProp (props_whitelist.go).
 const (
 	apiCallRcFailExistsLiveMigrate int64 = 901
 	apiCallRcFailInvldLayerStack   int64 = 225
-	apiCallRcFailInvldProp         int64 = 213
 )
 
 // dualPrimaryRefusalError is a make-available or unmake-available the server

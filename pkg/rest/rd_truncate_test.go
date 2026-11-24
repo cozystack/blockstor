@@ -68,7 +68,7 @@ func seedTruncateFixture(t *testing.T, st store.Store, rdName string, withSnapsh
 	}
 }
 
-func replicaNodes(t *testing.T, st store.Store, rdName string) []string {
+func storedReplicaNodes(t *testing.T, st store.Store, rdName string) []string {
 	t.Helper()
 
 	replicas, err := st.Resources().ListByDefinition(t.Context(), rdName)
@@ -117,7 +117,7 @@ func TestRDTruncateFollowsDeleteVolume(t *testing.T) {
 			t.Fatalf("snapshot=%v: Truncate: %v", withSnapshot, err)
 		}
 
-		if got := replicaNodes(t, st, "pvc-trunc"); len(got) != 0 {
+		if got := storedReplicaNodes(t, st, "pvc-trunc"); len(got) != 0 {
 			t.Errorf("snapshot=%v: replicas left: %v", withSnapshot, got)
 		}
 
@@ -156,7 +156,7 @@ func TestRDTruncateKeepsTheDefinitionWithoutTheFlag(t *testing.T) {
 		t.Fatalf("Truncate: %v", err)
 	}
 
-	if got := replicaNodes(t, st, "pvc-plain"); len(got) != 0 {
+	if got := storedReplicaNodes(t, st, "pvc-plain"); len(got) != 0 {
 		t.Errorf("replicas left: %v", got)
 	}
 
@@ -189,7 +189,7 @@ func TestRDTruncateRefusesAReplicaInUse(t *testing.T) {
 		t.Fatalf("Truncate of an in-use definition: %v, want FAIL_IN_USE", err)
 	}
 
-	if got := replicaNodes(t, st, "pvc-used"); !slices.Equal(got, []string{"w1", "w2", "w3"}) {
+	if got := storedReplicaNodes(t, st, "pvc-used"); !slices.Equal(got, []string{"w1", "w2", "w3"}) {
 		t.Errorf("a refused truncate deleted replicas: %v left", got)
 	}
 

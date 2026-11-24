@@ -71,7 +71,8 @@ func (s *Server) makeAvailableAndPrepareMigration(w http.ResponseWriter, r *http
 		}
 	}
 
-	if !s.applyMakeAvailable(w, r, rdName, node, req) {
+	created, ok := s.applyMakeAvailable(w, r, rdName, node, req)
+	if !ok {
 		return
 	}
 
@@ -79,6 +80,15 @@ func (s *Server) makeAvailableAndPrepareMigration(w http.ResponseWriter, r *http
 		RetCode: maskInfo,
 		Message: "Resource '" + rdName + "' on node '" + node + "' made available",
 	}}
+
+	// A replica make-available created goes through LINSTOR's
+	// createResource and so its deployResources: the answer comes once
+	// the satellite built it. linstor-csi's ControllerPublishVolume
+	// reads the replica's device path right after this call, and a
+	// replica the call only changed was built before.
+	if created {
+		msgs = append(msgs, s.waitMadeAvailableReplicaReady(r.Context(), rdName, node)...)
+	}
 
 	if req.AutoManageDualPrimary {
 		opened, err := s.openDualPrimary(r.Context(), rdName, source, node)

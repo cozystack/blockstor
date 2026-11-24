@@ -20,6 +20,7 @@ package controllers_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,6 +40,9 @@ import (
 // pinning a sentinel here makes the FakeExec wiring intent-clear
 // to readers.
 var errNoDRBDMeta = errors.New("drbdmeta: no metadata")
+
+// errZvolGone is wipefs on a zvol destroyed after lsblk listed it.
+var errZvolGone = errors.New("wipefs -n /dev/zd16: wipefs: error: /dev/zd16: probing initialization failed: No such file or directory: exit status 1")
 
 // lsblkCmdLine is the exact command line FakeExec keys responses on
 // for `satellite.Lsblk`. Centralised here so a change to Lsblk's
@@ -652,6 +656,11 @@ func TestPublishDeviceFiltersZFSZvols(t *testing.T) {
 
 	fx.Expect(pvsCmdLine, storage.FakeResponse{Stdout: []byte("")})
 	fx.Expect("zpool list -PHv", storage.FakeResponse{Stdout: []byte("")})
+	// zd16 is destroyed between lsblk and the probes, as a volume
+	// being deleted is: a probe of it fails with ENOENT.
+	fx.Expect("wipefs -n /dev/zd16", storage.FakeResponse{
+		Err: errZvolGone,
+	})
 
 	runnable := &controllers.PhysicalDeviceDiscoveryRunnable{
 		Client:   cli,
@@ -662,6 +671,18 @@ func TestPublishDeviceFiltersZFSZvols(t *testing.T) {
 	err := controllers.ScanOnceForTest(t.Context(), runnable, logr.Discard())
 	if err != nil {
 		t.Fatalf("scanOnce: %v", err)
+	}
+
+	// The probes must not reach a zvol at all: FakeExec answers an
+	// unregistered command with success, so only the call log shows
+	// a probe that ran, and a zvol that vanished under one fails it
+	// and logs that failure at ERROR on every volume delete.
+	for _, call := range fx.CallsSnapshot() {
+		for _, arg := range call.Args {
+			if strings.HasPrefix(arg, "/dev/zd") {
+				t.Errorf("Bug 70: zvol probed: %s %s", call.Name, strings.Join(call.Args, " "))
+			}
+		}
 	}
 
 	var list blockstoriov1alpha1.PhysicalDeviceList

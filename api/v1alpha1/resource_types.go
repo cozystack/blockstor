@@ -440,18 +440,18 @@ type ResourceStatus struct {
 	// +optional
 	Suspended string `json:"suspended,omitempty"`
 
-	// promotionScore is the kernel's score for promoting this
-	// replica, parsed from the `promotion_score:` token in
-	// `drbdsetup events2` resource frames. Zero means the kernel
-	// would refuse a promotion here: no reachable UpToDate data, or
-	// no quorum. linstor-csi's volume health reads it as LINSTOR
-	// reports it, so a replica with a score of 0 is an unhealthy
-	// one. Unset until the satellite has seen a resource frame.
+	// promotionScore is the kernel-reported DRBD-9 promotion score of
+	// this replica, parsed from the `promotion_score:` token in
+	// `drbdsetup events2` resource frames. Upstream LINSTOR publishes
+	// it as `layer_object.drbd.promotion_score`, and linstor-csi
+	// reports a volume abnormal on every node whose score is 0 or
+	// missing. Unset until the satellite has observed the resource.
 	// +optional
 	PromotionScore *int32 `json:"promotionScore,omitempty"`
 
-	// mayPromote is the kernel's `may_promote:` token from the same
-	// frame: whether a promotion would succeed right now.
+	// mayPromote is the kernel-reported DRBD-9 `may_promote:` flag
+	// from the same frames, published upstream as
+	// `layer_object.drbd.may_promote`. Unset until observed.
 	// +optional
 	MayPromote *bool `json:"mayPromote,omitempty"`
 

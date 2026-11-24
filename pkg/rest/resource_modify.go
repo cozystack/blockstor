@@ -22,6 +22,7 @@ import (
 	"net/http"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 )
 
 // registerResourceModify wires `PUT /v1/resource-definitions/{rd}/resources/{node}`
@@ -72,6 +73,10 @@ func (s *Server) handleResourceModify(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotImplemented, "drbd_tiebreaker and drbd_client are not supported: "+
 			"blockstor manages tiebreakers itself and has no diskless replica without a quorum vote")
 
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.Resource, patch.OverrideProps) {
 		return
 	}
 

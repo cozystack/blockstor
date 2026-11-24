@@ -365,8 +365,8 @@ func TestGroupEVDSetProperty(t *testing.T) {
 
 	const (
 		rdName = "vd-sp"
-		key    = "DrbdOptions/Net/protocol"
-		val    = "C"
+		key    = "DrbdOptions/Disk/al-extents"
+		val    = "6007"
 	)
 
 	cli.Run(t, "resource-definition", "create", rdName)
