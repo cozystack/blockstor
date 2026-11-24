@@ -218,7 +218,9 @@ func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserver
 		Namespace: namespace,
 		// The passphrase Secret is read past the cache, so no informer
 		// watches every Secret in the cluster for it.
-		SecretReader:       mgr.GetAPIReader(),
+		SecretReader: mgr.GetAPIReader(),
+		// A snapshot create answers once its take is over, as LINSTOR's.
+		SnapshotTakeWait:   rest.SnapshotTakeWait,
 		OnReady:            ready.MarkBound,
 		ResourceReadyWait:  rest.DefaultResourceReadyWait,
 		ResourceDeployWait: rest.DefaultResourceDeployWait,

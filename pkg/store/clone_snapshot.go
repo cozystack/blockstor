@@ -75,7 +75,7 @@ func OwnedCloneSnapshot(ctx context.Context, st Store, rdName string) (ClonedSna
 	// Past the cache: a clone deleted right after it was created can be
 	// served by a replica whose informer has not seen the snapshot yet, and
 	// a cached miss would skip the reap with nothing to say so.
-	snap, err := uncachedSnapshot(ctx, st, source, snapName)
+	snap, err := UncachedSnapshot(ctx, st, source, snapName)
 	if errors.Is(err, ErrNotFound) {
 		return ClonedSnapshotRef{}, nil
 	}
@@ -265,11 +265,11 @@ func dropReapingMark(ctx context.Context, st Store, source, snapshot, mark strin
 	return err //nolint:wrapcheck // callers wrap with the snapshot they name
 }
 
-// uncachedSnapshot reads one snapshot from the API server, both names
+// UncachedSnapshot reads one snapshot from the API server, both names
 // compared the way LINSTOR compares names. The scoped read compares the
 // definition name verbatim, so it asks under the spelling the definition is
 // stored with; a snapshot whose definition is gone is asked for as named.
-func uncachedSnapshot(ctx context.Context, st Store, srcRD, snapName string) (apiv1.Snapshot, error) {
+func UncachedSnapshot(ctx context.Context, st Store, srcRD, snapName string) (apiv1.Snapshot, error) {
 	rd, err := st.ResourceDefinitions().GetUncached(ctx, srcRD)
 	if err == nil {
 		srcRD = rd.Name
@@ -316,7 +316,7 @@ func reapingMarkIsLive(mark string, now time.Time) bool {
 // Any other error means the answer could not be had, and the caller
 // withdraws as well.
 func RestoreSourceWithdrawn(ctx context.Context, st Store, source, snapshot string) error {
-	snap, err := uncachedSnapshot(ctx, st, source, snapshot)
+	snap, err := UncachedSnapshot(ctx, st, source, snapshot)
 	if errors.Is(err, ErrNotFound) {
 		return fmt.Errorf("%w: %s/%s was deleted: %w", ErrRestoreSourceWithdrawn, source, snapshot, err)
 	}
