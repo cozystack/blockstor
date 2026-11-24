@@ -22,6 +22,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
@@ -66,7 +67,8 @@ func (r *Reconciler) SetDemoteRetryForTest(backoff []time.Duration, every time.D
 }
 
 // DrbdGrossKibForTest re-exports the backing size a grow gives a DRBD
-// volume with internal metadata.
+// volume with internal metadata, for a replica without a recorded
+// peer-slot count.
 func DrbdGrossKibForTest(netKib int64) int64 {
-	return drbdGrossKib(netKib)
+	return drbdGrossKib(netKib, drbd.LegacyPeerSlots)
 }

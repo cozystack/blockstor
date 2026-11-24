@@ -242,7 +242,7 @@ func TestBUG048LateAddStillRunsMetadataPassForUnattachedVolume(t *testing.T) {
 		storage.FakeResponse{Stdout: []byte("version \"v09\";\nla-size-sect 2048;\n")})
 	fx.Expect("drbdadm dump-md "+rd+"/1",
 		storage.FakeResponse{Err: errDrbdadmDumpMdNoMeta})
-	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d %s/1", drbd.MaxPeers-1, rd),
+	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d %s/1", drbd.LegacyPeerSlots, rd),
 		storage.FakeResponse{})
 
 	// KERNEL TRUTH: only vol-0 is attached; vol-1 is absent from the device
@@ -283,7 +283,7 @@ func TestBUG048LateAddStillRunsMetadataPassForUnattachedVolume(t *testing.T) {
 
 	calls := fx.CommandLines()
 
-	wantCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d %s/1", drbd.MaxPeers-1, rd)
+	wantCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d %s/1", drbd.LegacyPeerSlots, rd)
 	if !slices.Contains(calls, wantCreateMD) {
 		t.Errorf("BUG-048 REGRESSED: late-added unattached vol-1 got NO metadata pass — it would come up Diskless / Inconsistent with no winner seed and wedge; want %q in %v", wantCreateMD, calls)
 	}
@@ -294,7 +294,7 @@ func TestBUG048LateAddStillRunsMetadataPassForUnattachedVolume(t *testing.T) {
 	}
 
 	// vol-0 (attached) must NOT be re-created (would wipe its GI + bitmap).
-	forbidden := fmt.Sprintf("drbdadm create-md --force --max-peers=%d %s/0", drbd.MaxPeers-1, rd)
+	forbidden := fmt.Sprintf("drbdadm create-md --force --max-peers=%d %s/0", drbd.LegacyPeerSlots, rd)
 	if slices.Contains(calls, forbidden) {
 		t.Errorf("re-ran create-md on the attached vol-0 (would wipe operator-stamped metadata): %v", calls)
 	}

@@ -1330,6 +1330,13 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 		logger.Error(err, "record apply failure")
 	}
 
+	err = r.recordMetadataPeerSlots(ctx, res, results)
+	if err != nil {
+		failed = true
+
+		logger.Error(err, "record the superblock's peer slots")
+	}
+
 	if !outcome.failed {
 		err = r.stampLiveMigrateApplied(ctx, res, rd)
 		if err != nil {
@@ -1374,6 +1381,33 @@ func (r *ResourceReconciler) stampLiveMigrateApplied(ctx context.Context, res *b
 	err = r.Patch(ctx, res, client.RawPatch(types.MergePatchType, body))
 	if err != nil {
 		return errors.Wrap(err, "merge-patch annotation "+blockstoriov1alpha1.ResourceAnnotationLiveMigrateApplied)
+	}
+
+	return nil
+}
+
+// recordMetadataPeerSlots publishes the peer-slot count the pass read
+// from the replica's superblock (Status.MetadataPeerSlots), for the
+// controller to record as the replica's count. Written once: a value
+// already there is the one the superblock holds.
+func (r *ResourceReconciler) recordMetadataPeerSlots(
+	ctx context.Context, res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult,
+) error {
+	if len(results) == 0 || res.Status.MetadataPeerSlots != nil {
+		return nil
+	}
+
+	slots := results[0].GetMetadataPeerSlots()
+	if slots == 0 {
+		return nil
+	}
+
+	base := res.DeepCopy()
+	res.Status.MetadataPeerSlots = &slots
+
+	err := r.Status().Patch(ctx, res, client.MergeFrom(base))
+	if err != nil {
+		return errors.Wrap(err, "patch Status.MetadataPeerSlots")
 	}
 
 	return nil

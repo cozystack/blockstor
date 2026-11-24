@@ -150,6 +150,11 @@ func (s *inMemoryResources) Update(_ context.Context, r *apiv1.Resource) error {
 	// Bug-021: nil wire annotations = "untouched"; empty = "clear".
 	// Mirrors the k8s store's mergeUserAnnotationsInto contract.
 	next.Annotations = carryAnnotationsOnNil(next.Annotations, prev.Annotations)
+	// The peer-slot count is recorded once, as on the k8s store.
+	if prev.PeerSlots != 0 {
+		next.PeerSlots = prev.PeerSlots
+	}
+
 	s.m[key] = next
 
 	return nil

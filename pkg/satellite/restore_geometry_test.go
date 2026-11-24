@@ -76,24 +76,32 @@ func TestARestoredCloneKeepsThePeerSlotsOfItsSource(t *testing.T) {
 // LINSTOR created carries metadata for 7 slots, and re-initialised with 15,
 // drbdmeta refused it under ext4, and under a partition table or a VM disk
 // --force let it overwrite the end of the data. It keeps its 7. A
-// superblock with more slots than blockstor creates gets 15, which is
-// smaller and fits; one blockstor made keeps its 15. An adopted replica
+// superblock with more slots than the replica has gets the replica's,
+// which is smaller and fits: 15 for a replica without a recorded count,
+// 7 for one with LINSTOR's; one blockstor made keeps its 15. An adopted replica
 // with no GI recorded here is not re-initialised at all, see
 // TestAnUncleanVolumeWithNoRecordedGIIsRefused.
 func TestAReinitialisedSuperblockKeepsItsLayout(t *testing.T) {
+	seven := int32(7)
+
 	for name, tc := range map[string]struct {
-		source string
-		slots  int
-		want   string
+		source  string
+		slots   int
+		replica *int32
+		want    string
 	}{
-		"restore of LINSTOR's":   {source: "pvc-source:snap-1", slots: 7, want: "--max-peers=7"},
-		"restore of 31 slots":    {source: "pvc-source:snap-1", slots: 31, want: "--max-peers=15"},
-		"restore of blockstor's": {source: "pvc-source:snap-1", slots: 15, want: "--max-peers=15"},
+		"restore of LINSTOR's":        {source: "pvc-source:snap-1", slots: 7, want: "--max-peers=7"},
+		"restore of 31 slots":         {source: "pvc-source:snap-1", slots: 31, want: "--max-peers=15"},
+		"restore of blockstor's":      {source: "pvc-source:snap-1", slots: 15, want: "--max-peers=15"},
+		"restore of 31 onto 7 slots":  {source: "pvc-source:snap-1", slots: 31, replica: &seven, want: "--max-peers=7"},
+		"restore of 15 onto 7 slots":  {source: "pvc-source:snap-1", slots: 15, replica: &seven, want: "--max-peers=7"},
+		"restore of LINSTOR's onto 7": {source: "pvc-source:snap-1", slots: 7, replica: &seven, want: "--max-peers=7"},
 	} {
 		for _, path := range []string{"ensureMetadata", "ensurePerVolumeMetadata"} {
 			t.Run(name+"/"+path, func(t *testing.T) {
 				rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
 				dr.Volumes[0].SourceSnapshot = tc.source
+				dr.PeerSlots = tc.replica
 
 				fx.Expect(uncleanDumpMDForced, storage.FakeResponse{Stdout: dumpWithPeerSlots(tc.slots)})
 

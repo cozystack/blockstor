@@ -43,10 +43,6 @@ const (
 	// drbdMetaActivityLogKib is the default activity log: one stripe of
 	// 32 KiB.
 	drbdMetaActivityLogKib = 32
-	// drbdMetaPeers is the number of bitmap slots blockstor creates
-	// metadata with (create-md --max-peers), which also covers the seven
-	// slots LINSTOR gives a volume by default.
-	drbdMetaPeers = drbd.MaxPeers - 1
 	// luks2HeaderKib is the LUKS2 header cryptsetup reserves by default.
 	luks2HeaderKib = 16 * 1024
 	// drbdMetaAlignKib is the alignment of DRBD's on-disk bitmap.
@@ -73,12 +69,12 @@ func ceilDiv(n, d int64) int64 { return (n + d - 1) / d }
 func alignUp(n, to int64) int64 { return ceilDiv(n, to) * to }
 
 // drbdInternalMetaKib is an upper bound on the internal metadata DRBD
-// keeps at the end of a backing device of backingKib: the superblock,
-// the activity log, and a bitmap of one bit per 4 KiB per peer slot,
-// in 64-bit words, rounded to 4 KiB.
-func drbdInternalMetaKib(backingKib int64) int64 {
+// keeps at the end of a backing device of backingKib for the given peer
+// slots: the superblock, the activity log, and a bitmap of one bit per
+// 4 KiB per peer slot, in 64-bit words, rounded to 4 KiB.
+func drbdInternalMetaKib(backingKib int64, peerSlots int) int64 {
 	bits := alignUp(ceilDiv(backingKib, kibPerBitmapBit), 64)
-	bitmapKib := alignUp(ceilDiv(bits/bitsPerByte*drbdMetaPeers, bytesPerKib), drbdMetaAlignKib)
+	bitmapKib := alignUp(ceilDiv(bits/bitsPerByte*int64(peerSlots), bytesPerKib), drbdMetaAlignKib)
 
 	return drbdMetaSuperblockKib + drbdMetaActivityLogKib + bitmapKib
 }
@@ -141,12 +137,13 @@ func (p *disklessProbe) holds(ctx context.Context, vn int32) bool {
 }
 
 // drbdGrossKib is the backing size a DRBD volume with internal metadata
-// needs to offer netKib: the bitmap covers the whole backing device, so
-// the smallest size whose metadata leaves netKib for data.
-func drbdGrossKib(netKib int64) int64 {
-	gross := netKib + drbdInternalMetaKib(netKib)
-	for gross-drbdInternalMetaKib(gross) < netKib {
-		gross = netKib + drbdInternalMetaKib(gross)
+// for peerSlots needs to offer netKib: the bitmap covers the whole
+// backing device, so the smallest size whose metadata leaves netKib for
+// data.
+func drbdGrossKib(netKib int64, peerSlots int) int64 {
+	gross := netKib + drbdInternalMetaKib(netKib, peerSlots)
+	for gross-drbdInternalMetaKib(gross, peerSlots) < netKib {
+		gross = netKib + drbdInternalMetaKib(gross, peerSlots)
 	}
 
 	return gross
@@ -155,7 +152,8 @@ func drbdGrossKib(netKib int64) int64 {
 // growBackingKib is the backing size a grow of vol has to reach for the
 // device the consumer sees to have the definition size: the size plus
 // DRBD's internal metadata when DRBD keeps it on this device, plus the
-// LUKS header when LUKS sits under it. LINSTOR sizes the backing the
+// LUKS header when LUKS sits under it. The metadata is sized for the
+// slots its superblock holds (grownPeerSlots). LINSTOR sizes the backing the
 // same way, so an adopted volume's backing already carries both. Under
 // DRBD the data area is the definition or the largest device any
 // replica reports, whichever is larger, as for a new lower disk
@@ -166,7 +164,7 @@ func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withD
 	size := vol.GetSizeKib()
 
 	if withDRBD && vol.GetMetaPool() == "" {
-		size = drbdGrossKib(max(size, vol.GetDeviceSizeKib()))
+		size = drbdGrossKib(max(size, vol.GetDeviceSizeKib()), grownPeerSlots(dr))
 	}
 
 	if needsLUKS(dr.GetLayerStack()) {
@@ -175,6 +173,29 @@ func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withD
 
 	// The provider rounds it up to its allocation unit, as LINSTOR does.
 	return size
+}
+
+// grownPeerSlots is the peer-slot count a grow sizes the metadata of an
+// existing device for: the count its superblock holds, which the
+// satellite read once and published (Status.MetadataPeerSlots).
+//
+// `drbdadm resize` runs without --size, so DRBD gives the data area all
+// of the lower disk beyond the metadata the superblock holds. Sized for
+// more slots than that, the grow enlarges the device past the
+// definition, by 32 KiB per GiB for each slot too many, past what a
+// clone or a restore created at the definition's size provides; sized
+// for fewer, it leaves the device short of the definition.
+//
+// Until the superblock was read, the replica's record is not enough: a
+// satellite that predates the record creates 15 whatever the controller
+// stamped, as during a rolling upgrade. So it is sized for at least 15
+// then, which can only leave the device larger, never short.
+func grownPeerSlots(dr *intent.DesiredResource) int {
+	if read := dr.GetMetadataPeerSlots(); read != nil {
+		return int(*read)
+	}
+
+	return int(max(drbd.EffectivePeerSlots(dr.GetPeerSlots()), drbd.LegacyPeerSlots))
 }
 
 // growKey builds the key of the per-volume grow tables.
@@ -208,7 +229,7 @@ type growStep struct {
 // planGrow sees no grow, and the attach would be retried and refused
 // for good.
 //
-// The backing grows to what a new one would be created at
+// The backing grows as a grow of the definition would grow it
 // (growBackingKib), so the next attach succeeds and the replica syncs
 // from its peers. It grows only while the kernel positively reports the
 // volume Diskless: a backing it cannot attach holds no data the device

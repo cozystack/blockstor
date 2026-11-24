@@ -85,7 +85,7 @@ spec:
                   drbdNodeID is the DRBD-9 node-id assigned to this replica.
                   Per-replica, allocated once and stable for the replica's life —
                   re-numbering a live replica re-maps its DRBD bitmaps and
-                  corrupts peer-to-peer resync. Range 0..15 (drbd-9 max-peers).
+                  corrupts peer-to-peer resync. Range 0..31 (DRBD 9 node ids).
 
                   clusterIP-style allocation: nil means "controller, allocate";
                   non-nil is authoritative and NEVER overwritten (restore-safe).
@@ -314,6 +314,29 @@ spec:
               nodeName:
                 description: nodeName is the satellite hosting this replica.
                 type: string
+              peerSlots:
+                description: |-
+                  peerSlots is the DRBD peer-slot count this replica's metadata is
+                  created with (`create-md --max-peers`) and its lower disk is sized
+                  for. The controller copies it from the definition when it
+                  allocates the replica's identities, as LINSTOR copies the
+                  definition's count to each replica it creates, so changing the
+                  definition's count later leaves the replicas already there alone.
+
+                  Unset means a replica created before blockstor recorded a count:
+                  by blockstor with 15, or by LINSTOR, whose count only the
+                  superblock tells (status.metadataPeerSlots). The controller
+                  records it from there. Settable once: the metadata on disk does
+                  not change with it.
+                format: int32
+                maximum: 31
+                minimum: 1
+                type: integer
+                x-kubernetes-validations:
+                - message: 'peerSlots is settable-once: the replica''s metadata was
+                    created with it'
+                  optionalOldSelf: true
+                  rule: '!oldSelf.hasValue() || self == oldSelf.value()'
               props:
                 additionalProperties:
                   type: string
@@ -785,6 +808,19 @@ spec:
                   mayPromote is the kernel's `may_promote:` token from the same
                   frame: whether a promotion would succeed right now.
                 type: boolean
+              metadataPeerSlots:
+                description: |-
+                  metadataPeerSlots is the peer-slot count the replica's DRBD
+                  metadata holds, read once from its superblock by the satellite.
+                  A grow sizes the metadata for it, so the device stays at the
+                  definition. A replica created before blockstor recorded counts,
+                  by blockstor with 15 or by LINSTOR with its definition's count,
+                  7 by default, when it was adopted, gets it as spec.peerSlots
+                  from the controller, never a guess.
+                format: int32
+                maximum: 31
+                minimum: 1
+                type: integer
               promotionScore:
                 description: |-
                   promotionScore is the kernel's score for promoting this
