@@ -586,15 +586,9 @@ func (r *ResourceReconciler) enqueueResourcesForRG(ctx context.Context, obj clie
 // up. Pulled out of Reconcile to keep the orchestration under the
 // cyclomatic / funlen budgets.
 func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger) (ctrl.Result, error) {
-	var rd blockstoriov1alpha1.ResourceDefinition
-
-	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(res.Spec.ResourceDefinitionName)}, &rd)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
-
-		return ctrl.Result{}, errors.Wrap(err, "get parent RD")
+	rd, found, err := r.definitionForApply(ctx, res, logger)
+	if !found || err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Read peer Resources fresh via APIReader (uncached). The c-r
@@ -627,7 +621,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// election relies on (Bug 80).
 	adoptAuthoritativeFlags(res, peers)
 
-	err = r.checkLayerStackPinned(ctx, &rd)
+	err = r.checkLayerStackPinned(ctx, rd)
 	if errors.Is(err, errLayerStackNotPinned) {
 		logger.Info("waiting for the controller to pin the layer stack", "rd", rd.Name)
 
@@ -643,13 +637,13 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// renders no .res and the kernel never sees a node-id, so waiting
 	// for the controller to stamp Status.DRBDNodeID/Port/Minor would
 	// block apply forever — they never come.
-	if rdNeedsDRBD(&rd) {
-		if waitResult, waitOK := r.prepareDRBDApply(ctx, res, &rd, peers, logger); !waitOK {
+	if rdNeedsDRBD(rd) {
+		if waitResult, waitOK := r.prepareDRBDApply(ctx, res, rd, peers, logger); !waitOK {
 			return waitResult, nil
 		}
 	}
 
-	desired, err := r.buildDesiredFromCRD(ctx, res, &rd, peers)
+	desired, err := r.buildDesiredFromCRD(ctx, res, rd, peers)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -659,7 +653,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
 	}
 
-	anyFailed := r.afterApply(ctx, res, &rd, results, logger)
+	anyFailed := r.afterApply(ctx, res, rd, results, logger)
 
 	// Apply chain surfaces per-resource errors via results (e.g.
 	// drbdadm adjust failing on a stale .res rendered before the
@@ -689,7 +683,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// new one waits minutes behind re-checks that find nothing to do.
 	// LINSTOR's satellite re-dispatches only resources with a pending
 	// change outside a full sync (DeviceManagerImpl.devMgrLoop).
-	if rdNeedsDRBD(&rd) {
+	if rdNeedsDRBD(rd) {
 		return ctrl.Result{RequeueAfter: activeDRBDRequeue, Priority: lowPriority()}, nil
 	}
 
@@ -1867,6 +1861,62 @@ func (r *ResourceReconciler) waitForControllerAllocation(ctx context.Context, re
 	}
 
 	return ctrl.Result{}, true
+}
+
+// definitionForApply reads the replica's definition, past the cache
+// while the replica has never been applied here (see
+// refreshDefinitionForFirstApply). A definition that is gone is not
+// found and no error: there is nothing to apply.
+func (r *ResourceReconciler) definitionForApply(
+	ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger,
+) (*blockstoriov1alpha1.ResourceDefinition, bool, error) {
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := r.Get(ctx, client.ObjectKey{Name: naming.Key(res.Spec.ResourceDefinitionName)}, &rd)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, false, nil
+		}
+
+		return nil, false, errors.Wrap(err, "get parent RD")
+	}
+
+	r.refreshDefinitionForFirstApply(ctx, res, &rd, logger)
+
+	return &rd, true, nil
+}
+
+// refreshDefinitionForFirstApply replaces the cached definition with the
+// API server's copy while the replica has never been applied here. The
+// controller writes the volume block size onto the definition before it
+// gives the replica its DRBD identity, but the two objects reach this
+// satellite through separate watches, so the cached definition can still
+// predate the size when the identity arrives. The first apply attaches
+// the device, and drbdsetup never changes the block size of an attached
+// device, so a size read late is a size lost until the next detach. A
+// failed read keeps the cached copy.
+func (r *ResourceReconciler) refreshDefinitionForFirstApply(
+	ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, logger logr.Logger,
+) {
+	if _, applied := res.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers]; applied {
+		return
+	}
+
+	reader := r.peerReader()
+	if reader == nil {
+		return
+	}
+
+	var fresh blockstoriov1alpha1.ResourceDefinition
+
+	err := reader.Get(ctx, client.ObjectKey{Name: rd.Name}, &fresh)
+	if err != nil {
+		logger.V(1).Info("definition refresh before the first apply failed; using the cached copy", "err", err.Error())
+
+		return
+	}
+
+	*rd = fresh
 }
 
 // refreshTargetFromAPIReader does an uncached Get on the target
