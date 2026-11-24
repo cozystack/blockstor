@@ -1750,6 +1750,13 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 		return nil, errors.Wrap(err, "resolve effective props")
 	}
 
+	// An RD that pins its own passphrase Secret gets a Condition
+	// saying the key is ignored: the field is declared but not
+	// implemented, so the volume gets the cluster's per-replica key.
+	// Advisory, never fatal: see noteIgnoredPerRDKey in
+	// luks_passphrase.go for why this is not a refusal.
+	r.noteIgnoredPerRDKey(ctx, target, rd)
+
 	// A passphrase property never reaches the apply chain: each LUKS
 	// volume's password is its own (luks_keys.go).
 	dropPlaintextPassphraseProps(ctx, rd, effectiveProps)
