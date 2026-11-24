@@ -120,16 +120,20 @@ func TestRestartedSatelliteShowsItsReplicasWithinSeconds(t *testing.T) {
 		_, _ = io.WriteString(feed, restartInitialState())
 	}()
 
-	events := make(chan drbd.Event, observerEventBuffer)
-
-	go func() { _ = drbd.NewWatcher(stream).Watch(ctx, events) }()
-
 	exec := slowExec{delay: restartExecLatency}
-	o := &ObserverRunnable{Client: cli, Exec: exec, NodeName: "n1", Incarnation: "after"}
+	o := &ObserverRunnable{
+		Client:      cli,
+		Exec:        exec,
+		NodeName:    "n1",
+		Incarnation: "after",
+		startEvents2: func(context.Context) (*drbd.Watcher, func(), error) {
+			return drbd.NewWatcher(stream), func() {}, nil
+		},
+	}
 
 	started := time.Now()
 
-	go o.consume(ctx, drbd.NewAdm(exec), observationsFrom(events))
+	go func() { _ = o.Start(ctx) }()
 
 	deadline := started.Add(4 * restartWindowLimit)
 

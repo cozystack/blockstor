@@ -20,6 +20,8 @@ package controllers
 
 import (
 	"context"
+	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,9 +29,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/satellite"
+	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
@@ -155,5 +160,120 @@ func TestObserverSignsTheStateItWrites(t *testing.T) {
 	if got.Status.SatelliteIncarnation != "inc-2" || got.Status.DrbdState != "Inconsistent" {
 		t.Errorf("status = incarnation %q state %q; want inc-2 with the new state",
 			got.Status.SatelliteIncarnation, got.Status.DrbdState)
+	}
+}
+
+// A replica the kernel no longer holds is absent from the new
+// satellite's initial dump. It must stay as the previous process left
+// it, signed with the old incarnation, so reads keep hiding it; a write
+// would sign it with the new incarnation and show the old state as
+// current.
+func TestObserverLeavesAReplicaTheDumpDoesNotReport(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	replica := func(rd string) *blockstoriov1alpha1.Resource {
+		return &blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: k8s.ResourceCRName(rd, "n1")},
+			Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: rd, NodeName: "n1"},
+		}
+	}
+
+	base := fake.NewClientBuilder().WithScheme(incarnationScheme(t)).
+		WithObjects(replica("res-a"), replica("res-gone")).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).Build()
+
+	var (
+		mu     sync.Mutex
+		writes = map[string]int{}
+	)
+
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object,
+			patch client.Patch, opts ...client.SubResourcePatchOption,
+		) error {
+			mu.Lock()
+			writes[obj.GetName()]++
+			mu.Unlock()
+
+			return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+		},
+	})
+
+	previous := &ObserverRunnable{Client: base, NodeName: "n1", Incarnation: "before"}
+	for _, rd := range []string{"res-a", "res-gone"} {
+		err := previous.writeStatus(ctx, &observation{ResourceName: rd, DrbdState: "UpToDate", Role: "Secondary"})
+		if err != nil {
+			t.Fatalf("seed %s: %v", rd, err)
+		}
+	}
+
+	stream, feed := io.Pipe()
+	defer func() { _ = feed.Close() }()
+
+	go func() {
+		_, _ = io.WriteString(feed, "exists resource name:res-a role:Secondary suspended:no\n"+
+			"exists device name:res-a volume:0 minor:1000 disk:UpToDate client:no quorum:yes\n"+
+			"exists -\n")
+	}()
+
+	o := &ObserverRunnable{
+		Client:      cli,
+		Exec:        storage.NewFakeExec(),
+		NodeName:    "n1",
+		Incarnation: "after",
+		startEvents2: func(context.Context) (*drbd.Watcher, func(), error) {
+			return drbd.NewWatcher(stream), func() {}, nil
+		},
+	}
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		_ = o.Start(ctx)
+	}()
+
+	var got blockstoriov1alpha1.Resource
+
+	for deadline := time.Now().Add(5 * time.Second); got.Status.SatelliteIncarnation != "after"; {
+		if time.Now().After(deadline) {
+			t.Fatalf("res-a status = %+v; want it written by the new satellite", got.Status)
+		}
+
+		time.Sleep(10 * time.Millisecond)
+
+		err := base.Get(ctx, client.ObjectKey{Name: k8s.ResourceCRName("res-a", "n1")}, &got)
+		if err != nil {
+			t.Fatalf("get res-a: %v", err)
+		}
+	}
+
+	// The pass that wrote res-a has finished once writeMu is free.
+	o.writeMu.Lock()
+	o.writeMu.Unlock() //nolint:staticcheck // an empty critical section waits for the pass in flight
+
+	// The watcher reads until its stream ends, as drbdsetup's does
+	// when the process is stopped.
+	cancel()
+	_ = feed.Close()
+	<-done
+
+	var gone blockstoriov1alpha1.Resource
+
+	err := base.Get(t.Context(), client.ObjectKey{Name: k8s.ResourceCRName("res-gone", "n1")}, &gone)
+	if err != nil {
+		t.Fatalf("get res-gone: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if n := writes[gone.Name]; n != 0 || gone.Status.SatelliteIncarnation != "before" {
+		t.Errorf("a replica the dump did not report was written %d times and reads incarnation %q; "+
+			"want it untouched and still signed \"before\" so reads hide it", n, gone.Status.SatelliteIncarnation)
 	}
 }
