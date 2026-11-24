@@ -1,6 +1,7 @@
 {
 "items": [
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "driver_name": "ZFS",
 "external_locking": false,
@@ -12,6 +13,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "driver_name": "ZFS",
 "external_locking": false,
@@ -23,6 +25,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "driver_name": "DISKLESS",
 "external_locking": false,
@@ -34,6 +37,7 @@
 }
 },
 {
+"apiVersion": "internal.linstor.linbit.com/v1-31-1",
 "spec": {
 "driver_name": "ZFS",
 "external_locking": false,

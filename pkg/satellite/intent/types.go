@@ -443,6 +443,13 @@ type DesiredVolume struct {
 	// foreign superblock to re-initialise over.
 	ObservedGI string
 
+	// DiskOptions are the volume's own DRBD disk options, keyed by bare
+	// option name (block-size, rs-discard-granularity): those set on its
+	// volume definition or volume group, resolved by
+	// effectiveprops.VolumeDiskOptions. The .res renders them inside the
+	// volume, where they override the resource-scope disk section.
+	DiskOptions map[string]string
+
 	// DeviceSizeKib is the largest DRBD device size, in KiB, any replica
 	// of the definition reports for this volume; 0 when none reports
 	// one. A new lower disk must hold at least this much: the kernel
@@ -459,6 +466,15 @@ type DesiredVolume struct {
 	// after the backing grew is retried rather than forgotten, and
 	// reports the size only once the device shows it.
 	AppliedSizeKib int64
+}
+
+// GetDiskOptions returns the volume's own disk options.
+func (x *DesiredVolume) GetDiskOptions() map[string]string {
+	if x == nil {
+		return nil
+	}
+
+	return x.DiskOptions
 }
 
 // GetDeviceSizeKib returns the largest DRBD device size any replica
@@ -573,6 +589,12 @@ type ResourceApplyResult struct {
 	// so linstor-csi / consumers reading the CRD can resolve the
 	// backing /dev path without an extra round-trip.
 	Volumes []*ResourceApplyVolumeResult
+
+	// DroppedOptions says why each option the satellite left out of the
+	// resource's .res went: drbdadm would have refused the whole file
+	// over it. The c-r reconciler reports each as a Warning Event on the
+	// Resource, since the operator set it and it does not take effect.
+	DroppedOptions []string
 
 	// GrowPending reports a volume whose grow has not reached its device
 	// yet, typically because a peer's backing has not grown: the pass

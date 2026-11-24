@@ -21,12 +21,10 @@ limitations under the License.
 // tables when running with the k8s connector) into blockstor
 // `blockstor.org/v1alpha1` CRD manifests.
 //
-// The input is the directory produced by:
-//
-//	kubectl get crds | grep -o ".*.internal.linstor.linbit.com" | \
-//	  xargs -I{} sh -c "kubectl get {} -ojson > {}.json"
-//
-// Each file is a v1.List whose items carry one SQL row in `spec` —
+// The input is a directory of `<crd>.json` files, one per LINSTOR CRD,
+// each read at that CRD's storage version (the migration runbook has
+// the command). Each file is a v1.List whose items carry one SQL row in
+// `spec` —
 // the schema mirrors LINSTOR's relational tables (RESOURCE_DEFINITIONS,
 // VOLUME_DEFINITIONS, LAYER_DRBD_RESOURCES, PROPS_CONTAINERS, ...).
 package linstormigrate
@@ -83,10 +81,13 @@ type ResourceGroupRow struct {
 	DoNotPlaceWithRsc    string `json:"do_not_place_with_rsc_list,omitempty"`
 	ReplicasOnSame       string `json:"replicas_on_same,omitempty"`
 	ReplicasOnDifferent  string `json:"replicas_on_different,omitempty"`
+	// XReplicasOnDifferent is a JSON object in a string, a node
+	// property name to the most replicas one value of it may hold.
+	XReplicasOnDifferent string `json:"x_replicas_on_different,omitempty"`
 	AllowedProviderList  string `json:"allowed_provider_list,omitempty"`
-	UUID                 string `json:"uuid"`
 	// PeerSlots is the group's `--peer-slots`, null when it has none.
 	PeerSlots *int32 `json:"peer_slots,omitempty"`
+	UUID      string `json:"uuid"`
 }
 
 // VolumeGroupRow is one row of the VOLUME_GROUPS table.
@@ -184,7 +185,8 @@ type LayerDrbdResourceDefinitionRow struct {
 }
 
 // LayerDrbdResourceRow is one row of LAYER_DRBD_RESOURCES — per-replica
-// DRBD identity (node_id).
+// DRBD identity (node_id) and, since LINSTOR moved the port from the
+// definition to the replica, the ports it listens on.
 type LayerDrbdResourceRow struct {
 	LayerResourceID int32 `json:"layer_resource_id"`
 	NodeID          int32 `json:"node_id"`
@@ -192,6 +194,11 @@ type LayerDrbdResourceRow struct {
 	AlStripes       int64 `json:"al_stripes"`
 	AlStripeSize    int64 `json:"al_stripe_size"`
 	Flags           int64 `json:"flags"`
+	// TCPPortList is a JSON array in a string: the replica's ports, as
+	// "[7000]", or for a snapshot's row the negated count of ports the
+	// replica had, as "[-1]". Nil when the column is absent, which on a
+	// schema that has it means the API server pruned it.
+	TCPPortList *string `json:"tcp_port_list,omitempty"`
 }
 
 // LayerDrbdVolumeDefinitionRow is one row of
@@ -247,6 +254,10 @@ type LinstorRemoteRow struct {
 
 // Dump is the loaded LINSTOR database.
 type Dump struct {
+	// APIVersions is, by table, the apiVersions its objects were read
+	// at, sorted. Empty for a table whose dump carries none.
+	APIVersions map[string][]string
+
 	Nodes                        []NodeRow
 	NodeNetInterfaces            []NodeNetInterfaceRow
 	NodeStorPools                []NodeStorPoolRow

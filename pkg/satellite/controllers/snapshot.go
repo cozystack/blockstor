@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/naming"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
@@ -68,19 +69,30 @@ type SnapshotReconciler struct {
 
 	Config Config
 
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
+
 	windowsOnce sync.Once
 	windows     *snapshotWindows
 	timing      snapshotWindowTiming
 }
 
-// Reconcile handles the satellite-side snapshot lifecycle:
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass) //nolint:wrapcheck // the pass's own error, already wrapped
+}
+
+// ReconcilePass handles the satellite-side snapshot lifecycle:
 // create on first appearance, delete on `DeletionTimestamp`.
 // Finalizer-aware: stamps `SatelliteSnapshotFinalizer` on
 // every observed Snapshot scoped to this node so kube-apiserver
 // waits for our `DeleteSnapshot` before allowing the CRD to
 // disappear. Idempotent — re-runs on a snapshot that already
 // exists are safe.
-func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *SnapshotReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("snapshot", req.Name)
 
 	var snap blockstoriov1alpha1.Snapshot
@@ -634,6 +646,8 @@ func (r *SnapshotReconciler) stampSnapshotPerNodeFailed(
 ) error {
 	key := client.ObjectKeyFromObject(snap)
 
+	var lastConflict error
+
 	for attempt := range snapshotStatusUpdateRetries {
 		_ = attempt
 
@@ -679,9 +693,11 @@ func (r *SnapshotReconciler) stampSnapshotPerNodeFailed(
 		if !apierrors.IsConflict(err) {
 			return errors.Wrap(err, "stamp Status.Flags=FAILED + NodeStatus.Failed")
 		}
+
+		lastConflict = err
 	}
 
-	return errors.New("Status FAILED stamp conflicted out of retries")
+	return errors.Wrap(lastConflict, "Status FAILED stamp conflicted out of retries")
 }
 
 // upsertPerNodeStatusField is the Status.NodeStatus
@@ -697,6 +713,8 @@ func (r *SnapshotReconciler) upsertPerNodeStatusField(
 	mutate func(*blockstoriov1alpha1.SnapshotPerNodeStatus) bool,
 ) error {
 	key := client.ObjectKeyFromObject(snap)
+
+	var lastConflict error
 
 	for attempt := range snapshotStatusUpdateRetries {
 		_ = attempt
@@ -725,9 +743,11 @@ func (r *SnapshotReconciler) upsertPerNodeStatusField(
 		if !apierrors.IsConflict(err) {
 			return errors.Wrap(err, "stamp Status.NodeStatus")
 		}
+
+		lastConflict = err
 	}
 
-	return errors.New("Status.NodeStatus update conflicted out of retries")
+	return errors.Wrap(lastConflict, "Status.NodeStatus update conflicted out of retries")
 }
 
 // upsertPerNodeStatusInPlace finds the per-node entry for
@@ -850,6 +870,8 @@ func (r *SnapshotReconciler) stampSnapshotPerNodeReady(
 ) error {
 	key := client.ObjectKeyFromObject(snap)
 
+	var lastConflict error
+
 	for attempt := range snapshotStatusUpdateRetries {
 		_ = attempt
 
@@ -885,11 +907,13 @@ func (r *SnapshotReconciler) stampSnapshotPerNodeReady(
 			return errors.Wrap(err, "stamp Status.NodeStatus")
 		}
 
+		lastConflict = err
+
 		// Conflict — sibling satellite raced our write. Re-fetch
 		// and try again. The loop budget bounds the worst case.
 	}
 
-	return errors.New("Status.NodeStatus update conflicted out of retries")
+	return errors.Wrap(lastConflict, "Status.NodeStatus update conflicted out of retries")
 }
 
 // snapshotStatusUpdateRetries bounds the optimistic-lock retry
@@ -1003,7 +1027,7 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 	if err != nil {
 		stampErr := r.stampSnapshotDeleteFailure(ctx, snap, err.Error())
 		if stampErr != nil {
-			log.FromContext(ctx).Error(stampErr, "record snapshot delete failure")
+			conflict.LogFailure(ctx, stampErr, "record snapshot delete failure")
 		}
 
 		return ctrl.Result{}, errors.Wrap(err, "DeleteSnapshot")
@@ -1018,7 +1042,7 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 
 		err = r.stampSnapshotDeleteFailure(ctx, snap, resp.GetMessage())
 		if err != nil {
-			log.FromContext(ctx).Error(err, "record snapshot delete failure")
+			conflict.LogFailure(ctx, err, "record snapshot delete failure")
 		}
 
 		return ctrl.Result{Requeue: true}, nil
@@ -1048,6 +1072,8 @@ func (r *SnapshotReconciler) stampSnapshotDeleteFailure(
 	}
 
 	key := client.ObjectKeyFromObject(snap)
+
+	var lastConflict error
 
 	for range snapshotStatusUpdateRetries {
 		var current blockstoriov1alpha1.Snapshot
@@ -1084,9 +1110,11 @@ func (r *SnapshotReconciler) stampSnapshotDeleteFailure(
 		if !apierrors.IsConflict(err) {
 			return errors.Wrap(err, "stamp Status.DeleteFailures")
 		}
+
+		lastConflict = err
 	}
 
-	return errors.New("Status.DeleteFailures stamp conflicted out of retries")
+	return errors.Wrap(lastConflict, "Status.DeleteFailures stamp conflicted out of retries")
 }
 
 // snapshotNodePredicate filters Snapshot events to those whose

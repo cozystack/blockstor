@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/naming"
 )
 
@@ -86,19 +87,30 @@ const ResourceStateProjectionFieldOwner = "blockstor-controller-resource-project
 // per-volume column shows the last observed disk state.
 type ResourceStateProjectionReconciler struct {
 	client.Client
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources/status,verbs=get;patch;update
 // +kubebuilder:rbac:groups=blockstor.org,resources=nodes,verbs=get;list;watch
 
-// Reconcile reads the Resource's owning Node, decides whether to
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *ResourceStateProjectionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass reads the Resource's owning Node, decides whether to
 // project Unknown or release the claim, and applies via SSA. No-op
 // when the Resource is being deleted (DeletionTimestamp non-zero)
 // or when the owning Node row is absent (treat the resource as
 // orphaned; the satellite-resource finalizer will eventually
 // clean it).
-func (r *ResourceStateProjectionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *ResourceStateProjectionReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var res blockstoriov1alpha1.Resource
 
 	err := r.Get(ctx, req.NamespacedName, &res)

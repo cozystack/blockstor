@@ -33,6 +33,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -547,6 +548,10 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 	// matching the Bug 92 / Bug 111 refusal pattern — and the
 	// `?force=true` query string preserves the deliberate-renumber
 	// escape hatch.
+	if refuseUnwhitelistedProps(w, propwhitelist.Node, n.Props) {
+		return
+	}
+
 	if !isForce(r) && s.refuseNodeIPRewrite(w, r, &n) {
 		return
 	}
@@ -927,6 +932,10 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeStoreError(w, err)
 
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.Node, patch.OverrideProps) {
 		return
 	}
 

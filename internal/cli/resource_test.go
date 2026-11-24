@@ -22,6 +22,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -520,5 +521,178 @@ func TestNodeCreateRefusesAMalformedAddress(t *testing.T) {
 
 	if got := app.Run(t.Context(), []string{"n", "c", "node-1", "10.0.0.1 ; rm"}); got == 0 {
 		t.Fatal("a malformed address was accepted")
+	}
+}
+
+// seedWitness is a definition whose replica on node-2 is the
+// TIE_BREAKER witness the controller placed while a replica was being
+// replaced there.
+func seedWitness(ctx context.Context, backend store.Store) {
+	_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
+	_ = backend.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-x", NodeName: "node-1",
+		Props: map[string]string{"StorPoolName": "data"},
+	})
+	_ = backend.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-x", NodeName: "node-2",
+		Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+	})
+}
+
+// `r c <node> <rd> --storage-pool <pool>` on a node that holds a
+// TIE_BREAKER witness turns the witness into the diskful replica asked
+// for, as LINSTOR's resource create does, instead of failing with
+// "object already exists" and leaving the witness where the replica
+// was meant to go.
+func TestResourceCreateTakesOverTheWitness(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedWitness)
+
+	if got := app.Run(t.Context(), []string{"r", "c", "node-2", "pvc-x", "--storage-pool", "data"}); got != 0 {
+		t.Fatalf("resource create exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	res := getResource(t, app, "node-2")
+
+	if containsFlag(res.Flags, apiv1.ResourceFlagDiskless) || containsFlag(res.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Errorf("flags = %v, want the witness promoted to diskful", res.Flags)
+	}
+
+	if pool := res.Props["StorPoolName"]; pool != "data" {
+		t.Errorf("StorPoolName = %q, want data", pool)
+	}
+}
+
+// `r c --diskless` on the witness's node keeps it diskless and makes it
+// an ordinary diskless replica, no longer the controller's witness.
+func TestResourceCreateDisklessTakesOverTheWitness(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedWitness)
+
+	if got := app.Run(t.Context(), []string{"r", "c", "--diskless", "node-2", "pvc-x"}); got != 0 {
+		t.Fatalf("resource create exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	res := getResource(t, app, "node-2")
+
+	if !containsFlag(res.Flags, apiv1.ResourceFlagDiskless) || containsFlag(res.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Errorf("flags = %v, want DISKLESS without TIE_BREAKER", res.Flags)
+	}
+}
+
+// A diskful replica already on the node is a real conflict: the create
+// fails and the replica is left as it is.
+func TestResourceCreateOnADiskfulReplicaStillFails(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedWitness)
+
+	if got := app.Run(t.Context(), []string{"r", "c", "node-1", "pvc-x", "--storage-pool", "other"}); got == 0 {
+		t.Fatal("resource create on a diskful replica succeeded, want a conflict")
+	}
+
+	if !strings.Contains(errBuf.String(), "already exists") {
+		t.Errorf("stderr = %q, want the conflict reported", errBuf.String())
+	}
+
+	if pool := getResource(t, app, "node-1").Props["StorPoolName"]; pool != "data" {
+		t.Errorf("StorPoolName = %q, want the replica left on data", pool)
+	}
+}
+
+// A diskful `r c` with no --storage-pool, where neither a diskful
+// sibling nor the resource group names a pool, has nothing to put the
+// replica on. The witness, adopted from LINSTOR on its diskless pool,
+// stays diskless and only stops being the witness, as the REST door
+// leaves it, instead of turning "diskful" on the diskless pool.
+func TestResourceCreateWithNoPoolKeepsTheWitnessDiskless(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
+		_ = backend.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-x", NodeName: "node-1"})
+		_ = backend.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-x", NodeName: "node-2",
+			Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+			Props: map[string]string{"StorPoolName": "DfltDisklessStorPool"},
+		})
+	})
+
+	if got := app.Run(t.Context(), []string{"r", "c", "node-2", "pvc-x"}); got != 0 {
+		t.Fatalf("resource create exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	res := getResource(t, app, "node-2")
+
+	if !containsFlag(res.Flags, apiv1.ResourceFlagDiskless) || containsFlag(res.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Errorf("flags = %v, want DISKLESS kept and TIE_BREAKER dropped", res.Flags)
+	}
+
+	if pool := res.Props["StorPoolName"]; pool != "DfltDisklessStorPool" {
+		t.Errorf("StorPoolName = %q, want the witness's own pool left alone", pool)
+	}
+}
+
+// seedDyingWitness is seedWitness with the witness on node-2 already
+// marked for deletion: the controller is collapsing it and its
+// finalizer has not run yet.
+func seedDyingWitness(ctx context.Context, backend store.Store) {
+	_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
+	_ = backend.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-x", NodeName: "node-1",
+		Props: map[string]string{"StorPoolName": "data"},
+	})
+	_ = backend.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-x", NodeName: "node-2",
+		Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker, apiv1.ResourceFlagDelete},
+	})
+}
+
+// `r c` on a node whose witness the controller is deleting waits for
+// the witness to go and then creates the replica, as the REST door
+// does, instead of returning "already exists" for the operator to
+// retry by hand.
+func TestResourceCreateWaitsForADyingWitness(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedDyingWitness)
+	backend := appStore(t, app)
+
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+
+		_ = backend.Resources().Delete(context.Background(), "pvc-x", "node-2")
+	}()
+
+	if got := app.Run(t.Context(), []string{"r", "c", "node-2", "pvc-x", "--storage-pool", "data"}); got != 0 {
+		t.Fatalf("resource create exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	res := getResource(t, app, "node-2")
+
+	if len(res.Flags) != 0 || res.Props["StorPoolName"] != "data" {
+		t.Errorf("flags = %v, pool = %q, want a fresh diskful replica on data", res.Flags, res.Props["StorPoolName"])
+	}
+}
+
+// A witness that never finishes going is not waited on forever: the
+// create fails, saying the witness is still being deleted.
+func TestResourceCreateGivesUpOnAWitnessThatStays(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedDyingWitness)
+
+	if got := app.Run(t.Context(), []string{"r", "c", "node-2", "pvc-x", "--storage-pool", "data"}); got == 0 {
+		t.Fatal("resource create succeeded while the witness was still there")
+	}
+
+	if !strings.Contains(errBuf.String(), "still being deleted") {
+		t.Errorf("stderr = %q, want the pending delete named", errBuf.String())
+	}
+
+	if !containsFlag(getResource(t, app, "node-2").Flags, apiv1.ResourceFlagDelete) {
+		t.Error("the dying witness was patched")
 	}
 }
