@@ -21,6 +21,7 @@ package controller
 import (
 	"context"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -380,3 +381,76 @@ func replicaNotUpToDate(res *blockstoriov1alpha1.Resource) (string, bool) {
 // only state safe to snapshot. Matches the literal the rest of the
 // controller already compares against (resource_migration_controller).
 const drbdDiskStateUpToDate = "UpToDate"
+
+// stampIOSuspendedCondition keeps the IOSuspended condition in step
+// with the per-node acks. A satellite sets its ack once the kernel
+// froze I/O and clears it only once the kernel reports it resumed, so
+// the condition says what the kernels say. A Snapshot that never
+// suspended gets no condition at all.
+func (r *SnapshotReconciler) stampIOSuspendedCondition(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) error {
+	if _, ok := ioSuspendedCondition(snap); !ok {
+		return nil
+	}
+
+	key := client.ObjectKeyFromObject(snap)
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var current blockstoriov1alpha1.Snapshot
+
+		getErr := r.Get(ctx, key, &current)
+		if getErr != nil {
+			if apierrors.IsNotFound(getErr) {
+				return nil
+			}
+
+			return errors.Wrap(getErr, "get Snapshot for IOSuspended stamp")
+		}
+
+		fresh, freshOK := ioSuspendedCondition(&current)
+		if !freshOK || !setSnapshotCondition(&current.Status.Conditions, &fresh) {
+			return nil
+		}
+
+		return r.Status().Update(ctx, &current)
+	})
+	if err != nil {
+		return errors.Wrap(err, "stamp Snapshot IOSuspended condition")
+	}
+
+	return nil
+}
+
+// ioSuspendedCondition computes the IOSuspended condition for snap.
+// ok is false when nothing was ever suspended and the condition does
+// not exist yet.
+func ioSuspendedCondition(snap *blockstoriov1alpha1.Snapshot) (metav1.Condition, bool) {
+	var nodes []string
+
+	for i := range snap.Status.NodeStatus {
+		if snap.Status.NodeStatus[i].SuspendIOAcked {
+			nodes = append(nodes, snap.Status.NodeStatus[i].NodeName)
+		}
+	}
+
+	if len(nodes) > 0 {
+		return metav1.Condition{
+			Type:    blockstoriov1alpha1.SnapshotIOSuspendedConditionType,
+			Status:  metav1.ConditionTrue,
+			Reason:  "Suspended",
+			Message: "I/O is suspended on node(s) " + strings.Join(nodes, ", "),
+		}, true
+	}
+
+	for i := range snap.Status.Conditions {
+		if snap.Status.Conditions[i].Type == blockstoriov1alpha1.SnapshotIOSuspendedConditionType {
+			return metav1.Condition{
+				Type:    blockstoriov1alpha1.SnapshotIOSuspendedConditionType,
+				Status:  metav1.ConditionFalse,
+				Reason:  "Resumed",
+				Message: "I/O is not suspended on any replica",
+			}, true
+		}
+	}
+
+	return metav1.Condition{}, false
+}

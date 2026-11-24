@@ -107,14 +107,14 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 	// ControllerPublishVolume right after the spawn; a sibling
 	// apiserver replica's cache may still trail the spawn write.
 	// See pkg/rest/cache_retry.go.
-	_, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
+	rd, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
 	if err != nil {
 		writeStoreError(w, err)
 
 		return
 	}
 
-	resList, err := s.Store.Resources().ListByDefinition(r.Context(), rdName)
+	resList, err := s.definitionReplicas(r.Context(), &rd)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
@@ -125,7 +125,7 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]apiv1.ResourceWithVolumes, 0, len(resList))
 	for i := range resList {
-		out = append(out, wrapResourceWithVolumes(&resList[i], vdSizes))
+		out = append(out, wrapResourceWithLayers(&resList[i], rd.LayerStack, vdSizes))
 	}
 
 	// Bug 188 (P0): scrub deny-listed sensitive keys (passphrase,
@@ -149,6 +149,47 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// definitionReplicas lists rd's replicas for handleResourceList: from
+// the cache, unless balancing is switched off for rd or rd is being
+// deleted, and then from the API server.
+//
+// linstor-csi deletes a volume by switching balancing off on its
+// definition, listing its replicas and deleting each one it listed. A
+// placement pass can create a replica right before the switch, and
+// LINSTOR answers that list with it, since it reads under the lock the
+// placement holds. A cache that has not seen the create yet answers
+// without it, the replica is never deleted, and it keeps the definition,
+// a kernel resource and its ports for good. The pass re-reads the
+// definition after it placed, so everything it created before the
+// switch exists on the API server by the time linstor-csi lists.
+//
+// The definition is read past the cache too, unless the cached copy
+// already shows the switch: the switch may have been written through
+// another replica of this server, whose write this cache has not seen
+// either. A definition that cannot be read that way is listed past the
+// cache as well.
+func (s *Server) definitionReplicas(ctx context.Context, rd *apiv1.ResourceDefinition) ([]apiv1.Resource, error) {
+	stopped := balancingStopped(rd)
+	if !stopped {
+		current, err := s.Store.ResourceDefinitions().GetUncached(ctx, rd.Name)
+		stopped = err != nil || balancingStopped(&current)
+	}
+
+	if stopped {
+		return store.LiveReplicas(ctx, s.Store, rd.Name) //nolint:wrapcheck // the handler reports it as is
+	}
+
+	return s.Store.Resources().ListByDefinition(ctx, rd.Name) //nolint:wrapcheck // the handler reports it as is
+}
+
+// balancingStopped reports whether rd is being deleted or carries
+// BalanceResourcesEnabled=false itself, which is where linstor-csi
+// writes it for the length of a volume delete.
+func balancingStopped(rd *apiv1.ResourceDefinition) bool {
+	return slices.Contains(rd.Flags, apiv1.ResourceFlagDelete) ||
+		strings.EqualFold(rd.Props[apiv1.PropBalanceResourcesEnabled], "false")
+}
+
 // wrapResourceWithVolumes wraps a Resource into ResourceWithVolumes with
 // a volume for every volume definition (see ensureVolumesForView) and
 // the `volumes` JSON key always present (never `null`). Bug-hunt
@@ -162,6 +203,29 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 // (possibly empty) slice survives the JSON encode as `[]`.
 func wrapResourceWithVolumes(res *apiv1.Resource, vdSizes map[int32]int64) apiv1.ResourceWithVolumes {
 	return apiv1.ResourceWithVolumes{Resource: *res, Volumes: ensureVolumesForView(res.Volumes, res, vdSizes)}
+}
+
+// wrapResourceWithLayers wraps a replica re-stamped with its
+// definition's layer stack. The store hands every replica back as DRBD
+// over STORAGE, and `/v1/view/resources` re-stamps it; without the same
+// step here the two endpoints described one replica two ways, this one
+// with a DRBD layer a STORAGE-only replica does not have and an
+// `in_use: false` nothing observed.
+//
+// The volumes are copied before the re-stamp: a store may hand back a
+// slice it still holds.
+func wrapResourceWithLayers(res *apiv1.Resource, stack []string, vdSizes map[int32]int64) apiv1.ResourceWithVolumes {
+	if len(stack) == 0 {
+		return wrapResourceWithVolumes(res, vdSizes)
+	}
+
+	stamped := *res
+	stamped.Volumes = slices.Clone(res.Volumes)
+
+	apiv1.ApplyLayerStack(&stamped, stack)
+	apiv1.ApplyLayerStackToVolumes(stamped.Volumes, stack)
+
+	return wrapResourceWithVolumes(&stamped, vdSizes)
 }
 
 // handleResourceGet answers `GET /v1/resource-definitions/{rd}/resources/{node}`,
@@ -189,7 +253,7 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 	// the replica back immediately; both the RD probe and the replica
 	// read may be served by a cache that still trails those writes —
 	// see pkg/rest/cache_retry.go.
-	_, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
+	rd, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound,
@@ -224,7 +288,7 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 	// outer `volumes` JSON key serialises as `[]` instead of `null` when
 	// the Resource carries no Volumes; protects python-linstor's
 	// `rsc._rest_data['volumes']` dereference.
-	writeJSON(w, http.StatusOK, wrapResourceWithVolumes(&res, s.definitionVolumeSizes(r.Context(), rdName)))
+	writeJSON(w, http.StatusOK, wrapResourceWithLayers(&res, rd.LayerStack, s.definitionVolumeSizes(r.Context(), rdName)))
 }
 
 // handleAutoplace selects up to `place_count` nodes that have a storage

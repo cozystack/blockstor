@@ -150,3 +150,31 @@ func TestAdoptAuthoritativeFlags_MatchesOnBothNodeAndRD(t *testing.T) {
 		t.Fatalf("cross-RD match leaked: Flags = %v, want empty", target.Spec.Flags)
 	}
 }
+
+// TestAdoptAuthoritativeFlags_AdoptsDeletionTimestamp: `rd d` stamps every
+// replica at once, so the uncached read that already misses the peers
+// torn down first shows this replica's own deletion while the cache may
+// not. Adopting it keeps the desired state from calling a replica in the
+// middle of its delete a lone survivor that the solo-promote may force
+// Primary.
+func TestAdoptAuthoritativeFlags_AdoptsDeletionTimestamp(t *testing.T) {
+	t.Parallel()
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{NodeName: "worker-3", ResourceDefinitionName: "pvc-1"},
+	}
+
+	now := metav1.Now()
+	peers := []blockstoriov1alpha1.Resource{
+		{
+			ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &now},
+			Spec:       blockstoriov1alpha1.ResourceSpec{NodeName: "worker-3", ResourceDefinitionName: "pvc-1"},
+		},
+	}
+
+	adoptAuthoritativeFlags(target, peers)
+
+	if target.DeletionTimestamp == nil || !target.DeletionTimestamp.Equal(&now) {
+		t.Fatalf("uncached deletion timestamp not adopted: %v", target.DeletionTimestamp)
+	}
+}
