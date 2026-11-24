@@ -514,11 +514,15 @@ func resourceCreate(ctx context.Context, run *runContext) error {
 // "object already exists" and a witness in place of the replica.
 //
 // A diskful request promotes the witness to diskful on res's pool; a
-// diskless one keeps it diskless and only drops TIE_BREAKER. A replica
-// that is diskful already, or being deleted, is left as it is and
-// createErr is returned.
+// diskless one keeps it diskless and only drops TIE_BREAKER. So does a
+// diskful request that resolved no pool, as the REST door does: the
+// witness keeps its own pool, which for one adopted from LINSTOR is the
+// diskless one, and dropping DISKLESS there would ask for a diskful
+// replica on a pool with no storage. A replica that is diskful already,
+// or being deleted, is left as it is and createErr is returned.
 func takeOverWitness(ctx context.Context, st store.Store, res *apiv1.Resource, createErr error) error {
-	wantDiskful := !slices.Contains(res.Flags, apiv1.ResourceFlagDiskless)
+	pool := res.Props[storPoolNameProp]
+	wantDiskful := pool != "" && !slices.Contains(res.Flags, apiv1.ResourceFlagDiskless)
 
 	err := st.Resources().PatchResourceSpec(ctx, res.Name, res.NodeName, func(live *apiv1.Resource) error {
 		keep, wasDiskless := apiv1.PromoteWitnessFlags(live.Flags, wantDiskful)
@@ -528,7 +532,7 @@ func takeOverWitness(ctx context.Context, st store.Store, res *apiv1.Resource, c
 
 		live.Flags = keep
 
-		if pool := res.Props[storPoolNameProp]; wantDiskful && pool != "" {
+		if wantDiskful {
 			if live.Props == nil {
 				live.Props = map[string]string{}
 			}

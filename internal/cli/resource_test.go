@@ -600,3 +600,36 @@ func TestResourceCreateOnADiskfulReplicaStillFails(t *testing.T) {
 		t.Errorf("StorPoolName = %q, want the replica left on data", pool)
 	}
 }
+
+// A diskful `r c` with no --storage-pool, where neither a diskful
+// sibling nor the resource group names a pool, has nothing to put the
+// replica on. The witness, adopted from LINSTOR on its diskless pool,
+// stays diskless and only stops being the witness, as the REST door
+// leaves it, instead of turning "diskful" on the diskless pool.
+func TestResourceCreateWithNoPoolKeepsTheWitnessDiskless(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, func(ctx context.Context, backend store.Store) {
+		_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
+		_ = backend.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-x", NodeName: "node-1"})
+		_ = backend.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-x", NodeName: "node-2",
+			Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+			Props: map[string]string{"StorPoolName": "DfltDisklessStorPool"},
+		})
+	})
+
+	if got := app.Run(t.Context(), []string{"r", "c", "node-2", "pvc-x"}); got != 0 {
+		t.Fatalf("resource create exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	res := getResource(t, app, "node-2")
+
+	if !containsFlag(res.Flags, apiv1.ResourceFlagDiskless) || containsFlag(res.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Errorf("flags = %v, want DISKLESS kept and TIE_BREAKER dropped", res.Flags)
+	}
+
+	if pool := res.Props["StorPoolName"]; pool != "DfltDisklessStorPool" {
+		t.Errorf("StorPoolName = %q, want the witness's own pool left alone", pool)
+	}
+}
