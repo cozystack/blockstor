@@ -1077,27 +1077,34 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Holding both, this node keeps its own until the shared one is gone,
-	// unless no other node depends on the shared one. Released alone, its
-	// own would leave it holding only the shared one, and its next pass
-	// would read that as a node that never stamped its own and release the
-	// shared one too, before an older satellite in the list had deleted
-	// its copy.
-	if holdsOwn && holdsShared &&
-		!finalizers.OthersHoldTheirOwn(snap.Spec.Nodes, snap.Finalizers, r.Config.NodeName) {
-		return ctrl.Result{}, nil
+	return ctrl.Result{}, r.releaseSnapshotFinalizers(ctx, snap, holdsOwn && holdsShared)
+}
+
+// releaseSnapshotFinalizers drops this node's finalizers from a snapshot
+// whose copy on this node is gone. Holding both, this node keeps its own
+// until the shared one is gone, unless no other node depends on the
+// shared one. Released alone, its own would leave it holding only the
+// shared one, and its next pass would read that as a node that never
+// stamped its own and release the shared one too, before an older
+// satellite in the list had deleted its copy.
+func (r *SnapshotReconciler) releaseSnapshotFinalizers(
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, holdsBoth bool,
+) error {
+	if holdsBoth && !finalizers.OthersHoldTheirOwn(snap.Spec.Nodes, snap.Finalizers, r.Config.NodeName) {
+		return nil
 	}
 
+	mine := snapshotNodeFinalizer(r.Config.NodeName)
 	snap.Finalizers = slices.DeleteFunc(snap.Finalizers, func(f string) bool {
 		return f == mine || f == SatelliteSnapshotFinalizer
 	})
 
-	err = r.Update(ctx, snap)
+	err := r.Update(ctx, snap)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "strip snapshot finalizer")
+		return errors.Wrap(err, "strip snapshot finalizer")
 	}
 
-	return ctrl.Result{}, nil
+	return nil
 }
 
 // diskfulPools names this node's pools that can hold a snapshot, so a
