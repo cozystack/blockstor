@@ -27,6 +27,7 @@ import (
 	"k8s.io/client-go/tools/events"
 
 	"github.com/cozystack/blockstor/pkg/satellite"
+	"github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
@@ -182,5 +183,34 @@ func TestAnApplyThatRecoversIsReportedOnce(t *testing.T) {
 
 	if evs := drain(); len(evs) != 0 {
 		t.Fatalf("an apply with no failure before it reported %q", evs)
+	}
+}
+
+// A grow the apply left unfinished is retried on the short timer even
+// when the same apply failed often enough to be backed off: the resize
+// waiting on the device must not wait out the back-off of an unrelated
+// failure.
+func TestAnUnfinishedGrowIsNotBackedOff(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(0, 0)
+
+	var r ResourceReconciler
+
+	r.retries.now = func() time.Time { return now }
+
+	failed := []*intent.ResourceApplyResult{{Name: "pvc-g", Ok: false, Message: "adjust failed"}}
+	for range 5 {
+		now = now.Add(r.retryAfterApply("pvc-g", failed, true, false))
+	}
+
+	growing := []*intent.ResourceApplyResult{{Name: "pvc-g", Ok: false, Message: "adjust failed", GrowPending: true}}
+	if got := r.retryAfterApply("pvc-g", growing, true, false); got != applyFailureRequeue {
+		t.Errorf("a failed apply with a grow pending retried after %v, want %v", got, applyFailureRequeue)
+	}
+
+	grew := []*intent.ResourceApplyResult{{Name: "pvc-h", Ok: true, GrowPending: true}}
+	if got := r.retryAfterApply("pvc-h", grew, false, false); got != applyFailureRequeue {
+		t.Errorf("an apply with a grow pending retried after %v, want %v", got, applyFailureRequeue)
 	}
 }
