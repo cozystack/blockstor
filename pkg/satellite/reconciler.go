@@ -1870,10 +1870,20 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 // reports true. That is also the case for a grow whose backing grew on
 // an earlier pass but whose `drbdadm resize` failed: nothing else would
 // ask for the resize again.
+//
+// With no grow pending, a backing too small to attach to the device the
+// replicas report grows before the attach (planAttachGrow). That leaves
+// the device's size alone, so it reports false.
 func (r *Reconciler) growBacking(
 	ctx context.Context, provider storage.Provider, dr *intent.DesiredResource, vol *intent.DesiredVolume, usableKib int64,
 ) (bool, error) {
-	step := r.planGrow(dr, vol, usableKib, r.cfg.Adm != nil && needsDRBD(dr.GetLayerStack()))
+	withDRBD := r.cfg.Adm != nil && needsDRBD(dr.GetLayerStack())
+
+	step := r.planGrow(dr, vol, usableKib, withDRBD)
+	if !step.pending && withDRBD {
+		step = r.planAttachGrow(ctx, dr, vol, usableKib)
+	}
+
 	r.recordGrowStep(dr.GetName(), vol.GetVolumeNumber(), step)
 
 	if step.backingKib > 0 {
@@ -1887,7 +1897,7 @@ func (r *Reconciler) growBacking(
 				dr.GetName(), vol.GetVolumeNumber(), step.backingKib)
 		}
 
-		return true, nil
+		return !step.beforeAttach, nil
 	}
 
 	return step.retryResize, nil

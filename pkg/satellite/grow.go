@@ -84,6 +84,35 @@ func drbdInternalMetaKib(backingKib int64) int64 {
 	return drbdMetaSuperblockKib + drbdMetaActivityLogKib + bitmapKib
 }
 
+// drbdLeastMetaKib is the least internal metadata DRBD can keep at the
+// end of a backing device of backingKib: the superblock, the activity
+// log and a bitmap for a single peer slot.
+func drbdLeastMetaKib(backingKib int64) int64 {
+	bits := alignUp(ceilDiv(backingKib, kibPerBitmapBit), 64)
+
+	return drbdMetaSuperblockKib + drbdMetaActivityLogKib + alignUp(ceilDiv(bits/bitsPerByte, bytesPerKib), drbdMetaAlignKib)
+}
+
+// backingTooSmallForDevice reports whether vol's backing of usableKib
+// cannot hold the DRBD device the replicas report even with the least
+// metadata DRBD keeps on it, so the kernel refuses to attach it ("cannot
+// attach smaller disk"). Such a backing was never attached at that
+// device size: a replica attached to it would have kept the device
+// within it.
+func backingTooSmallForDevice(dr *intent.DesiredResource, vol *intent.DesiredVolume, usableKib int64) bool {
+	device := vol.GetDeviceSizeKib()
+	if usableKib <= 0 || device <= 0 || vol.GetMetaPool() != "" {
+		return false
+	}
+
+	data := usableKib
+	if needsLUKS(dr.GetLayerStack()) {
+		data -= luks2HeaderKib
+	}
+
+	return data-drbdLeastMetaKib(data) < device
+}
+
 // drbdGrossKib is the backing size a DRBD volume with internal metadata
 // needs to offer netKib: the bitmap covers the whole backing device, so
 // the smallest size whose metadata leaves netKib for data.
@@ -138,6 +167,49 @@ type growStep struct {
 	// retryResize: the backing needs no growing, but the layers above
 	// have not caught up, so they are resized again.
 	retryResize bool
+	// beforeAttach: the backing grows so the kernel can attach it to
+	// a device that is already larger (planAttachGrow); the device keeps
+	// its size, so nothing above is resized.
+	beforeAttach bool
+}
+
+// planAttachGrow decides a grow of the backing of a replica the kernel
+// holds without its disk, when that backing cannot hold the device the
+// replicas report. An older satellite created such backings at the
+// definition's size for volumes adopted from LINSTOR, whose device is a
+// few KiB larger than the definition, and the kernel refused each attach
+// with "cannot attach smaller disk". The definition never changed, so
+// planGrow sees no grow, and the attach would be retried and refused
+// for good.
+//
+// The backing grows to what a new one would be created at
+// (growBackingKib), so the next attach succeeds and the replica syncs
+// from its peers. It grows only while the kernel positively reports the
+// volume Diskless: a backing it cannot attach holds no data the device
+// serves, and a replica the kernel does not hold yet, as after a reboot,
+// is left alone. An attached backing is never grown here, so volumes
+// whose backings are exactly the definition keep them.
+func (r *Reconciler) planAttachGrow(
+	ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume, usableKib int64,
+) growStep {
+	if !backingTooSmallForDevice(dr, vol, usableKib) {
+		return growStep{}
+	}
+
+	if _, diskless := r.cfg.Adm.DisklessVolumes(ctx, dr.GetName())[vol.GetVolumeNumber()]; !diskless {
+		return growStep{}
+	}
+
+	target := growBackingKib(dr, vol, true)
+	if target <= usableKib {
+		return growStep{}
+	}
+
+	log.FromContext(ctx).Info("growing a backing too small for the device before attaching it",
+		"resource", dr.GetName(), "volume", vol.GetVolumeNumber(),
+		"backingKib", usableKib, "deviceSizeKib", vol.GetDeviceSizeKib(), "targetKib", target)
+
+	return growStep{backingKib: target, beforeAttach: true}
 }
 
 // planGrow decides the grow step for vol, whose backing has usableKib.

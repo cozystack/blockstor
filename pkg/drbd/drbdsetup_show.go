@@ -352,6 +352,35 @@ func parseShowJSON(out []byte) map[string]KernelSlot {
 // possibly needing metadata and runs the (idempotent) per-volume pass — the
 // fail-toward-correctness direction (the pre-BUG-048 behaviour).
 func (a *Adm) AttachedVolumes(ctx context.Context, resource string) map[int32]struct{} {
+	devices := a.statusDevices(ctx, resource)
+	if devices == nil {
+		return nil
+	}
+
+	return attachedVolumeSet(devices)
+}
+
+// DisklessVolumes returns the local volume numbers of resource the
+// kernel holds Diskless: the resource is up and the volume has no lower
+// disk attached. It is positive evidence, unlike AttachedVolumes: a
+// probe or parse failure, a resource the kernel does not hold, and a
+// volume mid-transition all leave the volume out.
+func (a *Adm) DisklessVolumes(ctx context.Context, resource string) map[int32]struct{} {
+	out := map[int32]struct{}{}
+
+	for _, dev := range a.statusDevices(ctx, resource) {
+		if DiskState(dev.DiskState) == DiskStateDiskless {
+			out[dev.VolumeNumber] = struct{}{}
+		}
+	}
+
+	return out
+}
+
+// statusDevices returns the local devices `drbdsetup status <res>
+// --json` reports, or nil when the probe fails or the kernel does not
+// hold the resource.
+func (a *Adm) statusDevices(ctx context.Context, resource string) []drbdsetupStatusDevice {
 	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
 	if err != nil {
 		return nil
@@ -364,7 +393,7 @@ func (a *Adm) AttachedVolumes(ctx context.Context, resource string) map[int32]st
 		return nil
 	}
 
-	return attachedVolumeSet(status[0].Devices)
+	return status[0].Devices
 }
 
 // attachedVolumeSet returns the volume numbers from `devices` whose

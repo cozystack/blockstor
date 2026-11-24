@@ -19,6 +19,7 @@ limitations under the License.
 package satellite
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -176,5 +177,91 @@ func TestLUKSUnderDRBDMatchesLinstor(t *testing.T) {
 		&intent.DesiredVolume{SizeKib: 20971520, DeviceSizeKib: 20971528})
 	if want := drbd.InternalMetadataGrossKiB(20971528, drbd.DefaultGeometry()) + luks.HeaderKiB; got != want {
 		t.Fatalf("lowerDiskKib under LUKS: got %d, want %d", got, want)
+	}
+}
+
+// TestGrowBackingBeforeAttach: a backing an older satellite created at
+// the definition's size for a volume adopted from LINSTOR cannot hold
+// the device the replicas report, and the kernel refuses to attach it.
+// The satellite grows it to what a new backing gets while the kernel
+// holds the volume Diskless, without resizing the device, and leaves it
+// alone when the kernel holds it attached or does not hold it at all.
+func TestGrowBackingBeforeAttach(t *testing.T) {
+	t.Parallel()
+
+	const (
+		gib20      = 20971520
+		adoptedDev = 20971528
+		oldDev     = 20961884 // device over backings of exactly the definition
+	)
+
+	status := func(diskState string) []byte {
+		return []byte(`[{"name":"pvc-a","node-id":1,"role":"Secondary","devices":[` +
+			`{"volume":0,"minor":1000,"disk-state":"` + diskState + `"}],"connections":[]}]`)
+	}
+
+	cases := []struct {
+		name     string
+		device   int64
+		onDisk   int64
+		kernel   []byte
+		wantGrow bool
+	}{
+		{"attach refused: backing at the definition under an adopted device", adoptedDev, gib20, status("Diskless"), true},
+		{"backing at the definition attached", adoptedDev, gib20, status("UpToDate"), false},
+		{"backing at the definition mid-attach", adoptedDev, gib20, status("Attaching"), false},
+		{"resource the kernel does not hold", adoptedDev, gib20, nil, false},
+		{"backing that holds the device", oldDev, gib20, status("Diskless"), false},
+		{"backing sized for metadata", adoptedDev, 20981760, status("Diskless"), false},
+		// LINSTOR sized it for its seven peer slots: fewer than the
+		// fifteen blockstor creates metadata with, and still attachable.
+		{"LINSTOR backing not attached yet", adoptedDev, 20976048, status("Diskless"), false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			storageExec := storage.NewFakeExec()
+			provider := zfs.NewProvider(zfs.Config{Pool: "data", Thin: true}, storageExec)
+
+			drbdExec := storage.NewFakeExec()
+			if tc.kernel != nil {
+				drbdExec.Expect("drbdsetup status pvc-a --json", storage.FakeResponse{Stdout: tc.kernel})
+			} else {
+				drbdExec.Expect("drbdsetup status pvc-a --json", storage.FakeResponse{Err: storage.FakeExitError{Code: 10}})
+			}
+
+			dr := &intent.DesiredResource{Name: "pvc-a"}
+			vol := &intent.DesiredVolume{SizeKib: gib20, DeviceSizeKib: tc.device, AppliedSizeKib: gib20}
+
+			r := NewReconciler(ReconcilerConfig{Adm: drbd.NewAdm(drbdExec)})
+
+			resized, err := r.growBacking(t.Context(), provider, dr, vol, tc.onDisk)
+			if err != nil {
+				t.Fatalf("growBacking: %v", err)
+			}
+
+			if resized {
+				t.Errorf("resized = true: growing a backing to attach it must not resize the device")
+			}
+
+			want := ""
+			if tc.wantGrow {
+				want = fmt.Sprintf("zfs set volsize=%dM data/pvc-a_00000", growBackingKib(dr, vol, true)/kibPerMib)
+			}
+
+			got := ""
+
+			for _, line := range storageExec.CommandLines() {
+				if strings.HasPrefix(line, "zfs set volsize=") {
+					got = line
+				}
+			}
+
+			if got != want {
+				t.Errorf("storage grow = %q, want %q (%v)", got, want, storageExec.CommandLines())
+			}
+		})
 	}
 }
