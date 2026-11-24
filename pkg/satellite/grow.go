@@ -153,9 +153,9 @@ func drbdGrossKib(netKib int64, peerSlots int) int64 {
 
 // growBackingKib is the backing size a grow of vol has to reach for the
 // device the consumer sees to have the definition size: the size plus
-// DRBD's internal metadata for the replica's peer slots when DRBD keeps
-// it on this device, plus the
-// LUKS header when LUKS sits under it. LINSTOR sizes the backing the
+// DRBD's internal metadata when DRBD keeps it on this device, plus the
+// LUKS header when LUKS sits under it. The metadata is sized for the
+// replica's peer slots but never for fewer than 15 (grownPeerSlots). LINSTOR sizes the backing the
 // same way, so an adopted volume's backing already carries both. Under
 // DRBD the data area is the definition or the largest device any
 // replica reports, whichever is larger, as for a new lower disk
@@ -166,7 +166,7 @@ func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withD
 	size := vol.GetSizeKib()
 
 	if withDRBD && vol.GetMetaPool() == "" {
-		size = drbdGrossKib(max(size, vol.GetDeviceSizeKib()), drbd.EffectivePeerSlots(dr.GetPeerSlots()))
+		size = drbdGrossKib(max(size, vol.GetDeviceSizeKib()), grownPeerSlots(dr))
 	}
 
 	if needsLUKS(dr.GetLayerStack()) {
@@ -176,6 +176,18 @@ func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withD
 	// The LVM and ZFS providers resize in whole MiB, rounding down, so
 	// an unaligned size would lose the margin added above.
 	return alignUp(size, kibPerMib)
+}
+
+// grownPeerSlots is the peer-slot count a grow sizes the metadata of an
+// existing device for. The superblock can hold more slots than the
+// replica records: a satellite that predates the record creates 15
+// whatever the controller stamped, as during a rolling upgrade. Sized
+// for the record alone, the grow would leave the device short of the
+// definition by the difference; sized for 15 when the record is lower,
+// it only oversizes the bitmap, by 32 KiB per GiB for each slot too
+// many.
+func grownPeerSlots(dr *intent.DesiredResource) int {
+	return max(drbd.EffectivePeerSlots(dr.GetPeerSlots()), drbd.LegacyPeerSlots)
 }
 
 // growKey builds the key of the per-volume grow tables.
@@ -209,7 +221,7 @@ type growStep struct {
 // planGrow sees no grow, and the attach would be retried and refused
 // for good.
 //
-// The backing grows to what a new one would be created at
+// The backing grows as a grow of the definition would grow it
 // (growBackingKib), so the next attach succeeds and the replica syncs
 // from its peers. It grows only while the kernel positively reports the
 // volume Diskless: a backing it cannot attach holds no data the device

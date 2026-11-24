@@ -21,6 +21,7 @@ package satellite
 import (
 	"testing"
 
+	"github.com/cozystack/blockstor/pkg/drbd"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -58,26 +59,31 @@ func TestDrbdInternalMetaCoversLinstorDefault(t *testing.T) {
 	}
 }
 
-// TestGrowBackingKibFollowsTheReplicaPeerSlots: a grow sizes the backing
-// for the metadata the replica has, its own peer slots, and for 15 when
-// it has no recorded count, which is what blockstor created it with.
-func TestGrowBackingKibFollowsTheReplicaPeerSlots(t *testing.T) {
+// TestGrowBackingKibNeverSizesBelowFifteenPeerSlots: a grow sizes the
+// backing of a device that already exists, whose superblock may hold
+// more slots than the replica records: a satellite that predates the
+// record creates 15 whatever the controller stamped. Sized for the
+// record alone, a 7-slot grow on such a disk would leave the device
+// short of the definition; sized for 15 it only oversizes the bitmap.
+func TestGrowBackingKibNeverSizesBelowFifteenPeerSlots(t *testing.T) {
 	const definition = 20 << 20
 
-	seven := int32(7)
+	fifteen := alignUp(drbdGrossKib(definition, drbd.LegacyPeerSlots), kibPerMib)
 	vol := &intent.DesiredVolume{SizeKib: definition}
 
-	got := growBackingKib(&intent.DesiredResource{PeerSlots: &seven}, vol, true)
-	if want := alignUp(drbdGrossKib(definition, 7), kibPerMib); got != want {
-		t.Errorf("7 peer slots: got %d KiB, want %d", got, want)
+	seven := int32(7)
+	if got := growBackingKib(&intent.DesiredResource{PeerSlots: &seven}, vol, true); got != fifteen {
+		t.Errorf("7 recorded peer slots: got %d KiB, want %d, the size for 15", got, fifteen)
 	}
 
-	legacy := growBackingKib(&intent.DesiredResource{}, vol, true)
-	if want := alignUp(drbdGrossKib(definition, 15), kibPerMib); legacy != want {
-		t.Errorf("no recorded count: got %d KiB, want %d for 15 slots", legacy, want)
+	if got := growBackingKib(&intent.DesiredResource{}, vol, true); got != fifteen {
+		t.Errorf("no recorded count: got %d KiB, want %d for 15 slots", got, fifteen)
 	}
 
-	if got >= legacy {
-		t.Errorf("7 peer slots (%d KiB) should need less than 15 (%d KiB)", got, legacy)
+	thirtyOne := int32(31)
+
+	got := growBackingKib(&intent.DesiredResource{PeerSlots: &thirtyOne}, vol, true)
+	if want := alignUp(drbdGrossKib(definition, 31), kibPerMib); got != want {
+		t.Errorf("31 recorded peer slots: got %d KiB, want %d", got, want)
 	}
 }
