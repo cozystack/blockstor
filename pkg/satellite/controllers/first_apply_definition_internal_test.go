@@ -170,7 +170,7 @@ func TestRunApplyLaysTheFirstApplyDownFromTheAPIServer(t *testing.T) {
 	}
 
 	creates := slices.DeleteFunc(fx.CommandLines(), func(c string) bool { return !strings.HasPrefix(c, "lvcreate ") })
-	if len(creates) != 1 || !strings.Contains(creates[0], "--virtualsize 8MiB") {
+	if len(creates) != 1 || !strings.Contains(creates[0], "--virtualsize 8192k") {
 		t.Fatalf("first apply carved %v, want one volume at the API server's 8MiB", creates)
 	}
 }
