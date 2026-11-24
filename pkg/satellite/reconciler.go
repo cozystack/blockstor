@@ -7474,6 +7474,14 @@ func dropRejectedDiskOptions(schema *drbd.OptionSchema, resourceDisk map[string]
 	return dropped
 }
 
+// BuildResFile renders the resource file the satellite on localNode
+// writes for dr, with the storage paths guessed rather than read off the
+// local devices. It lets a test check what a definition change renders
+// on a node without a satellite running there.
+func BuildResFile(dr *intent.DesiredResource, localNode, localAddr string) (string, error) {
+	return buildResFile(dr, localNode, localAddr, nil, nil, nil)
+}
+
 // buildResConnections translates the DesiredResource's logical
 // connection overrides (scenario 3.7 multi-path) into the .res
 // renderer's drbd.ResourceConnection shape. Empty input returns nil
@@ -7507,10 +7515,23 @@ func buildResConnections(dr *intent.DesiredResource, hosts []drbd.Host) []drbd.R
 			NodeA: hostSpelling(hosts, conn.NodeA),
 			NodeB: hostSpelling(hosts, conn.NodeB),
 			Paths: paths,
+			// Only the net options are per connection in the .res;
+			// the connection's other DRBD props stay resource-wide.
+			Net: nilIfEmpty(splitDRBDOptions(conn.DrbdOptions).Net),
 		})
 	}
 
 	return out
+}
+
+// nilIfEmpty answers nil for an empty map, so a connection without
+// options compares equal to one that never had any.
+func nilIfEmpty(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+
+	return m
 }
 
 // hostSpelling answers the name of the host that node names, or node as it

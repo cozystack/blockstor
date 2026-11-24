@@ -26,10 +26,6 @@ import (
 	"github.com/cozystack/blockstor/pkg/propwhitelist"
 )
 
-// apiCallRcFailInvldProp mirrors upstream LINSTOR's `ApiConsts.FAIL_INVLD_PROP`
-// (213), the code it refuses a property its whitelist does not allow with.
-const apiCallRcFailInvldProp int64 = 213
-
 // refuseUnwhitelistedProps answers a write that would store a DrbdOptions
 // property LINSTOR's whitelist does not allow on obj: a key it does not list
 // for that object, or a value its rule refuses. LINSTOR stores nothing in
