@@ -183,10 +183,16 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 		return ctrl.Result{RequeueAfter: time.Second}, err
 	}
 
+	// The controller recorded how the take ended. A suspend order next
+	// to that record is stale, written by a pass that never saw it, and
+	// a suspend for it would freeze I/O for a take that is over; it is
+	// read as the resume the controller has already decided on.
+	suspendIO := snap.Spec.SuspendIO && !snapshotTakeEnded(snap)
+
 	// Phase 1: parent RD I/O suspend. Per-node ack lives on
 	// Status.NodeStatus[us].SuspendIOAcked. Idempotent — the
 	// helper short-circuits when already acked.
-	if snap.Spec.SuspendIO && !perNodeStatusSuspendIOAcked(snap.Status.NodeStatus, r.Config.NodeName) {
+	if suspendIO && !perNodeStatusSuspendIOAcked(snap.Status.NodeStatus, r.Config.NodeName) {
 		return r.handleSuspendPhase(ctx, snap)
 	}
 
@@ -194,7 +200,7 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 	// after every diskful peer either succeeded or one of them
 	// Failed. Drain our local suspend regardless — see the
 	// "resume on abort" note on Spec.SuspendIO.
-	if !snap.Spec.SuspendIO && perNodeStatusSuspendIOAcked(snap.Status.NodeStatus, r.Config.NodeName) {
+	if !suspendIO && perNodeStatusSuspendIOAcked(snap.Status.NodeStatus, r.Config.NodeName) {
 		return r.handleResumePhase(ctx, snap)
 	}
 
@@ -204,6 +210,12 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 	// which a snapshot taken before that record gets here too.
 	if perNodeStatusReady(snap.Status.NodeStatus, r.Config.NodeName) {
 		return ctrl.Result{}, r.recordSnapshotPool(ctx, snap)
+	}
+
+	// A take that already ended gets no snapshot of this node either,
+	// whatever stale order still stands next to its outcome.
+	if snap.Spec.SuspendIO && !suspendIO {
+		return ctrl.Result{}, nil
 	}
 
 	// Phase 2: take the per-node snapshot. Gated on Spec.TakeSnapshot
@@ -216,6 +228,27 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 	}
 
 	return r.handleTakeSnapshotPhase(ctx, snap)
+}
+
+// snapshotTakeEnded reports whether the controller recorded an outcome
+// for snap's take: an abort reason, in the spec or in the annotation an
+// older writer cannot drop, or an outcome flag on the status. The
+// controller never orders a suspend for such a snapshot again.
+func snapshotTakeEnded(snap *blockstoriov1alpha1.Snapshot) bool {
+	if snap.Spec.AbortReason != "" || snap.Annotations[blockstoriov1alpha1.AnnotationSnapshotAbortReason] != "" {
+		return true
+	}
+
+	return slices.ContainsFunc(snap.Status.Flags, func(flag string) bool {
+		switch flag {
+		case blockstoriov1alpha1.SnapshotStatusFlagSuccessful,
+			blockstoriov1alpha1.SnapshotStatusFlagFailed,
+			blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect:
+			return true
+		}
+
+		return false
+	})
 }
 
 // handleSuspendPhase dispatches Phase 1 of the Bug-351
