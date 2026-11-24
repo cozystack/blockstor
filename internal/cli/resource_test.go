@@ -22,6 +22,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -631,5 +632,67 @@ func TestResourceCreateWithNoPoolKeepsTheWitnessDiskless(t *testing.T) {
 
 	if pool := res.Props["StorPoolName"]; pool != "DfltDisklessStorPool" {
 		t.Errorf("StorPoolName = %q, want the witness's own pool left alone", pool)
+	}
+}
+
+// seedDyingWitness is seedWitness with the witness on node-2 already
+// marked for deletion: the controller is collapsing it and its
+// finalizer has not run yet.
+func seedDyingWitness(ctx context.Context, backend store.Store) {
+	_ = backend.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"})
+	_ = backend.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-x", NodeName: "node-1",
+		Props: map[string]string{"StorPoolName": "data"},
+	})
+	_ = backend.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-x", NodeName: "node-2",
+		Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker, apiv1.ResourceFlagDelete},
+	})
+}
+
+// `r c` on a node whose witness the controller is deleting waits for
+// the witness to go and then creates the replica, as the REST door
+// does, instead of returning "already exists" for the operator to
+// retry by hand.
+func TestResourceCreateWaitsForADyingWitness(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedDyingWitness)
+	backend := appStore(t, app)
+
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+
+		_ = backend.Resources().Delete(context.Background(), "pvc-x", "node-2")
+	}()
+
+	if got := app.Run(t.Context(), []string{"r", "c", "node-2", "pvc-x", "--storage-pool", "data"}); got != 0 {
+		t.Fatalf("resource create exit = %d (stderr: %s)", got, errBuf.String())
+	}
+
+	res := getResource(t, app, "node-2")
+
+	if len(res.Flags) != 0 || res.Props["StorPoolName"] != "data" {
+		t.Errorf("flags = %v, pool = %q, want a fresh diskful replica on data", res.Flags, res.Props["StorPoolName"])
+	}
+}
+
+// A witness that never finishes going is not waited on forever: the
+// create fails, saying the witness is still being deleted.
+func TestResourceCreateGivesUpOnAWitnessThatStays(t *testing.T) {
+	t.Parallel()
+
+	app, _, errBuf := newApp(t, seedDyingWitness)
+
+	if got := app.Run(t.Context(), []string{"r", "c", "node-2", "pvc-x", "--storage-pool", "data"}); got == 0 {
+		t.Fatal("resource create succeeded while the witness was still there")
+	}
+
+	if !strings.Contains(errBuf.String(), "still being deleted") {
+		t.Errorf("stderr = %q, want the pending delete named", errBuf.String())
+	}
+
+	if !containsFlag(getResource(t, app, "node-2").Flags, apiv1.ResourceFlagDelete) {
+		t.Error("the dying witness was patched")
 	}
 }
