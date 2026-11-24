@@ -808,6 +808,12 @@ spec:
                   ~15 e2e tests `grep role:` from `drbdsetup status`; surfacing
                   it on Status lets them switch to a k8s-native read.
                 type: string
+              satelliteIncarnation:
+                description: |-
+                  satelliteIncarnation is the node's status.satelliteIncarnation of
+                  the satellite process that wrote the runtime state above. Written
+                  by the satellite observer with that state; do not hand-set.
+                type: string
               suspended:
                 description: |-
                   suspended is the kernel-reported reason for I/O suspension on

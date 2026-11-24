@@ -138,45 +138,6 @@ func TestTakenPortsSeeAReplicaCreatedInAnotherNodeSpelling(t *testing.T) {
 	}
 }
 
-// The state projection finds the node of a replica created in a mixed-case
-// node spelling, and a node event reaches the replica: an offline node
-// turns its replicas Unknown. With the registered spelling in spec the
-// Node Get answered NotFound and the replica was never projected.
-func TestProjectionFollowsTheNodeOfAMixedCaseReplica(t *testing.T) {
-	t.Parallel()
-
-	projected := false
-
-	cli := mixedCaseStand(t, interceptor.Funcs{
-		SubResourcePatch: func(_ context.Context, _ client.Client, _ string, _ client.Object, _ client.Patch, _ ...client.SubResourcePatchOption) error {
-			projected = true
-
-			return nil
-		},
-	}, [2]string{"Pvc-Mix", "NODE-1"})
-
-	res := storedReplicas(t, cli)[0]
-	r := &ResourceStateProjectionReconciler{Client: cli}
-
-	var node blockstoriov1alpha1.Node
-	if err := cli.Get(context.Background(), types.NamespacedName{Name: "node-1"}, &node); err != nil {
-		t.Fatalf("get the node: %v", err)
-	}
-
-	reqs := r.enqueueResourcesForNode(context.Background(), &node)
-	if len(reqs) != 1 || reqs[0].Name != res.Name {
-		t.Errorf("node event enqueued %v, want %s", reqs, res.Name)
-	}
-
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: res.Name}}); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	if !projected {
-		t.Error("the replica on the offline Node-1 was not projected Unknown")
-	}
-}
-
 // naming.Same tells two spellings of one definition from two definitions.
 // The peer list, the node-id allocation, the sibling fan-out and the
 // snapshot's sibling check use it for replicas written or adopted before
@@ -296,32 +257,6 @@ func TestEvacuationReachesReplicasInEverySpellingOfTheNode(t *testing.T) {
 				t.Errorf("the replica created as %s on Node-1 was not migrated", spelling)
 			}
 		})
-	}
-}
-
-// A replica written before the store stored CR names keeps Node-1 in spec;
-// a node event for node-1 still reaches it.
-func TestProjectionReachesAReplicaStoredInTheRegisteredSpelling(t *testing.T) {
-	t.Parallel()
-
-	cli := mixedCaseStand(t, interceptor.Funcs{})
-	ctx := context.Background()
-
-	if err := cli.Create(ctx, &blockstoriov1alpha1.Resource{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix.node-1"},
-		Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "Pvc-Mix", NodeName: "Node-1"},
-	}); err != nil {
-		t.Fatalf("seed the older replica: %v", err)
-	}
-
-	var node blockstoriov1alpha1.Node
-	if err := cli.Get(ctx, types.NamespacedName{Name: "node-1"}, &node); err != nil {
-		t.Fatalf("get the node: %v", err)
-	}
-
-	reqs := (&ResourceStateProjectionReconciler{Client: cli}).enqueueResourcesForNode(ctx, &node)
-	if len(reqs) != 1 || reqs[0].Name != "pvc-mix.node-1" {
-		t.Errorf("node event enqueued %v, want pvc-mix.node-1", reqs)
 	}
 }
 

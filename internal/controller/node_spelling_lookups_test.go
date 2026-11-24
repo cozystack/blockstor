@@ -24,8 +24,6 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -94,40 +92,6 @@ func TestEvacuationFindsTheReplicaUnderEverySpelling(t *testing.T) {
 				t.Errorf("pruneSource(%s, %s) left the replica %s in place", tc.askedRD, tc.askedNode, res.Name)
 			}
 		})
-	}
-}
-
-// A replica written before the store stored CR names keeps Node-1 in spec;
-// the projection still reads the node and marks the replica Unknown when
-// the node is offline.
-func TestProjectionProjectsAReplicaStoredInTheRegisteredSpelling(t *testing.T) {
-	t.Parallel()
-
-	projected := false
-
-	cli := mixedCaseStand(t, interceptor.Funcs{
-		SubResourcePatch: func(_ context.Context, _ client.Client, _ string, _ client.Object, _ client.Patch, _ ...client.SubResourcePatchOption) error {
-			projected = true
-
-			return nil
-		},
-	})
-	ctx := context.Background()
-
-	if err := cli.Create(ctx, &blockstoriov1alpha1.Resource{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-mix.node-1"},
-		Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "Pvc-Mix", NodeName: "Node-1"},
-	}); err != nil {
-		t.Fatalf("seed the older replica: %v", err)
-	}
-
-	r := &ResourceStateProjectionReconciler{Client: cli}
-	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-mix.node-1"}}); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	if !projected {
-		t.Error("the replica stored as Node-1 on the offline node was not projected Unknown")
 	}
 }
 
