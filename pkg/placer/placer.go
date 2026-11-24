@@ -178,6 +178,25 @@ func New(st store.Store) *Placer {
 // the migration semantic: even if 2 replicas exist, if one is on an
 // evicted node the placer will create a third on a healthy peer.
 func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) (int, int, error) {
+	_, placed, want, err := p.PlaceCreating(ctx, rdName, filter)
+
+	return placed, want, err
+}
+
+// PlaceCreating is Place that also names the nodes it created a replica
+// on, for a caller that may have to take back what this call did and
+// nothing else: a replica that was already there, one another writer
+// created meanwhile, and a diskless witness promoted in place are not
+// on the list. It holds whatever was created before an error, too.
+func (p *Placer) PlaceCreating(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) ([]string, int, int, error) {
+	var created []string
+
+	placed, want, err := p.place(ctx, rdName, filter, &created)
+
+	return created, placed, want, err
+}
+
+func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter, created *[]string) (int, int, error) {
 	defer lockDefinition(rdName)()
 
 	// Bug 038: an RD born from a snapshot restore / clone must never
@@ -192,26 +211,17 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 		return 0, 0, err
 	}
 
+	defer func() {
+		if plan.state != nil {
+			*created = plan.state.created
+		}
+	}()
+
 	if plan.capacityShortfall {
 		// Fail-fast: no pool can host the largest volume. Surface the
 		// actionable error so REST returns 409 instead of 200 + a
 		// downstream satellite failure (Bug 35 / 7.15 e2e).
-		//
-		// Precedence: the physical FreeCapacity floor (Bug 35) is the
-		// more fundamental gate, so a non-zero maxFreeKib wins over an
-		// oversub witness — operators see the hard floor first. Only
-		// when the floor was clean (every rejected pool tripped a ratio
-		// cap, not the floor) do we surface the OversubscriptionShortfall
-		// envelope so the relevant ratio (Free / Total / Master) is
-		// named in the 409 (scenarios 7.W10 / 7.W11).
-		if plan.maxFreeKib == 0 && plan.oversubShortfall != nil {
-			return 0, int(filter.PlaceCount), plan.oversubShortfall
-		}
-
-		return 0, int(filter.PlaceCount), &CapacityShortfallError{
-			RequiredKib: plan.requiredKib,
-			MaxFreeKib:  plan.maxFreeKib,
-		}
+		return 0, int(filter.PlaceCount), plan.shortfallError()
 	}
 
 	placed := countDiskfulReplicas(plan.existing, plan.disabled)
@@ -288,6 +298,26 @@ type placePlan struct {
 	// mutually exclusive so REST can render a single 409 naming the
 	// exact ratio the operator needs to tune.
 	oversubShortfall *OversubscriptionShortfallError
+}
+
+// shortfallError is the error of a plan with capacityShortfall set.
+//
+// Precedence: the physical FreeCapacity floor (Bug 35) is the more
+// fundamental gate, so a non-zero maxFreeKib wins over an oversub
+// witness — operators see the hard floor first. Only when the floor was
+// clean (every rejected pool tripped a ratio cap, not the floor) do we
+// surface the OversubscriptionShortfall envelope so the relevant ratio
+// (Free / Total / Master) is named in the 409 (scenarios 7.W10 /
+// 7.W11).
+func (pl *placePlan) shortfallError() error {
+	if pl.maxFreeKib == 0 && pl.oversubShortfall != nil {
+		return pl.oversubShortfall
+	}
+
+	return &CapacityShortfallError{
+		RequiredKib: pl.requiredKib,
+		MaxFreeKib:  pl.maxFreeKib,
+	}
 }
 
 // buildPlan does the read-side legwork: load VDs, candidate pools,
@@ -499,6 +529,10 @@ func (p *Placer) placeDisklessOnRemaining(ctx context.Context, rdName string, st
 			return errors.Wrap(err, "create diskless witness")
 		}
 
+		if err == nil {
+			state.created = append(state.created, nodeName)
+		}
+
 		state.taken[naming.Key(nodeName)] = struct{}{}
 	}
 
@@ -508,6 +542,8 @@ func (p *Placer) placeDisklessOnRemaining(ctx context.Context, rdName string, st
 // state holds the per-call lookup tables. Pulled out of Placer so a
 // concurrent Placer call doesn't share the mutable bookkeeping.
 type state struct {
+	// created names the nodes this Place call created a replica on.
+	created    []string
 	nodes      map[string]map[string]string
 	taken      map[string]struct{}
 	sameTuple  map[string]string
@@ -808,6 +844,12 @@ func (s *state) writeReplica(ctx context.Context, st store.Store, rdName string,
 	}
 
 	err := st.Resources().Create(ctx, &res)
+	if err == nil {
+		s.created = append(s.created, pool.NodeName)
+
+		return nil
+	}
+
 	if errors.Is(err, store.ErrAlreadyExists) {
 		err = s.takeOverReplicaWrittenMeanwhile(ctx, st, rdName, pool)
 	}
@@ -1445,6 +1487,19 @@ func (p *Placer) disabledNodes(ctx context.Context) (map[string]struct{}, error)
 		return nil, errors.Wrap(err, "list nodes")
 	}
 
+	return disabledNodeSet(nodes), nil
+}
+
+// DiskfulReplicaCount is how many of a definition's replicas Place
+// counts toward the place count, given the cluster's nodes. A caller
+// that already holds both can tell from it, without a read of its own,
+// that Place would add no diskful replica.
+func DiskfulReplicaCount(existing []apiv1.Resource, nodes []apiv1.Node) int {
+	return countDiskfulReplicas(existing, disabledNodeSet(nodes))
+}
+
+// disabledNodeSet is disabledNodes over a node list already read.
+func disabledNodeSet(nodes []apiv1.Node) map[string]struct{} {
 	out := make(map[string]struct{}, len(nodes))
 
 	for i := range nodes {
@@ -1457,7 +1512,7 @@ func (p *Placer) disabledNodes(ctx context.Context) (map[string]struct{}, error)
 		}
 	}
 
-	return out, nil
+	return out
 }
 
 // autoplaceExcludedNodes returns the set of nodes that may not host a
