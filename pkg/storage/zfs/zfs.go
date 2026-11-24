@@ -72,11 +72,6 @@ func (p *Provider) Kind() string {
 func (*Provider) ResizeZeroFills() bool { return true }
 
 // Pool returns the underlying ZFS pool name (`zpool list` identifier).
-// The satellite Reconciler's FlushBackingDevices uses this to issue
-// `zpool sync <pool>` between drbdadm suspend-io and `zfs snapshot`
-// — without that TXG-commit barrier the snapshot captures a
-// pre-commit dataset state and misses up to one TXG (default 5s)
-// worth of writes (P0 stale-snapshot bug, 2026-05-23).
 func (p *Provider) Pool() string {
 	return p.cfg.Pool
 }
@@ -327,6 +322,11 @@ func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) er
 	}
 
 	return nil
+}
+
+// HasSnapshot reports whether this pool holds the snapshot.
+func (p *Provider) HasSnapshot(ctx context.Context, snap storage.Snapshot) (bool, error) {
+	return p.datasetExists(ctx, p.snapshotDataset(snap)), nil
 }
 
 // DeleteSnapshot removes the snapshot, with upstream LINSTOR's
@@ -902,7 +902,7 @@ func (p *Provider) snapshotDataset(snap storage.Snapshot) string {
 }
 
 const (
-	stateNotProvisioned = "NOT_PROVISIONED"
+	stateNotProvisioned = storage.StateNotProvisioned
 	mibPerKib           = 1024
 	bytesPerKib         = 1024
 	zfsListCols         = 3

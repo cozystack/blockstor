@@ -245,6 +245,15 @@ const SnapshotStatusFlagFailedDisconnect = "FAILED_DISCONNECT"
 // satellite-unreachable) alongside the terminal Flags marker.
 const SnapshotStatusConditionType = "SnapshotComplete"
 
+// SnapshotIOSuspendedConditionType is the Status.Conditions[] type the
+// controller-side SnapshotReconciler keeps in step with the per-node
+// suspendIOAcked bits: True, naming the nodes, while any replica's
+// kernel still holds I/O suspended for this snapshot, and False once
+// none does. A satellite clears its bit only after the kernel reports
+// the resource resumed, so this is the place to read whether an
+// aborted snapshot really let I/O go, not the abort message.
+const SnapshotIOSuspendedConditionType = "IOSuspended"
+
 // SnapshotStatus is the observed state of a Snapshot.
 type SnapshotStatus struct {
 	// nodeStatus reports per-node readiness from the satellites.
@@ -262,6 +271,23 @@ type SnapshotStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// deleteFailures records, per node, why the satellite's last
+	// attempt to delete its copy of a deleting snapshot failed. The
+	// delete call answers with it at once, as LINSTOR answers with the
+	// error its satellite returned, instead of waiting on a node that
+	// is alive but keeps failing.
+	// +listType=map
+	// +listMapKey=nodeName
+	// +optional
+	DeleteFailures []SnapshotDeleteFailure `json:"deleteFailures,omitempty"`
+}
+
+// SnapshotDeleteFailure is the error one satellite hit deleting its
+// copy of the snapshot.
+type SnapshotDeleteFailure struct {
+	NodeName string `json:"nodeName"`
+	Message  string `json:"message"`
 }
 
 // SnapshotPerNodeStatus is the satellite-reported state of one
@@ -293,6 +319,14 @@ type SnapshotPerNodeStatus struct {
 	// Snapshot's Status.Flags with FAILED. Bug 351.
 	// +optional
 	Failed bool `json:"failed,omitempty"`
+
+	// storagePool is the pool that holds this node's copy: the pool of
+	// the replica it was taken from. The local satellite records it once
+	// its copy exists, because the copy outlives the replica and a
+	// restore has to be placed in the same pool, the way LINSTOR keeps
+	// the pool on each snapshot volume.
+	// +optional
+	StoragePool string `json:"storagePool,omitempty"`
 }
 
 // +kubebuilder:object:root=true

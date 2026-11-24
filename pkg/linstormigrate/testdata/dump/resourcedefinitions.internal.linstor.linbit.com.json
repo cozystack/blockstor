@@ -44,7 +44,7 @@
 "spec": {
 "layer_stack": "[\"DRBD\",\"STORAGE\"]",
 "resource_dsp_name": "pvc-vol4",
-"resource_flags": 2,
+"resource_flags": 1,
 "resource_group_name": "SC-REPLICATED",
 "resource_name": "PVC-VOL4",
 "snapshot_dsp_name": "",

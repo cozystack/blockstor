@@ -188,7 +188,10 @@ func TestTieBreakerFlagsRequireDiskless(t *testing.T) {
 
 // TestAdoptionSafetyLatches pins the two fields that make adopting
 // LINSTOR volumes data-safe: every RD arrives Initialized and every
-// replica arrives with the day0 skip disabled.
+// replica arrives with the day0 skip disabled. The satellite also reads
+// skipInitialSync=false as "not created empty here", which is what
+// keeps it from promoting an adopted Filesystem-mode volume to format
+// it (issue #265).
 func TestAdoptionSafetyLatches(t *testing.T) {
 	res := convertFixture(t)
 

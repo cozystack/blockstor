@@ -86,6 +86,15 @@ type Server struct {
 	// reader, so the passphrase rotation also lists definitions through it.
 	SecretReader client.Reader
 
+	// StateReader reads the ControllerConfig and the Secrets the
+	// encryption state of the resource view is derived from. The view is
+	// polled, by linstor-csi among others, so production wires a
+	// passphrase.WatchedReader and an idle cluster costs no request per
+	// view. Nil is SecretReader. The passphrase endpoints keep reading
+	// through SecretReader: an operator who has just entered a passphrase
+	// is told the state the API server holds, not one a watch trails.
+	StateReader client.Reader
+
 	// TLS, when non-nil, makes Start also bring up a mutual-TLS
 	// listener on TLSAddr alongside the plain-HTTP debug listener on
 	// Addr. The in-cluster Service exposes ONLY TLSAddr; the plain
@@ -124,6 +133,10 @@ type Server struct {
 	// from the passphrase and keyring Secrets, so every apiserver
 	// replica answers alike.
 	encryption encryption
+
+	// snapshotDeleteBudget overrides snapshotDeleteWaitBudget when
+	// positive, so tests can outlast the budget without waiting 10s.
+	snapshotDeleteBudget time.Duration
 
 	// resolveHost is the DNS-lookup seam used by handleNodeCreate
 	// (scenario 4.W01) when the POST body omits a NetInterface

@@ -1,7 +1,9 @@
 converted: 3 nodes, 4 storage pools, 3 resource groups, 6 resource definitions, 9 resources, 1 snapshots
+warning: node node-b: DrbdOptions/Net/sndbuf-size carried onto the object, but blockstor does not resolve DRBD options at this level — the adopted resources render without them; set them on the resource group, definition or controller instead
 warning: volume definition pvc-vol1/0: unhandled flags bitmask 32 dropped
 warning: resource definition pvc-vol3: 2 LUKS volume passwords migrated, wrapped under the blockstor master key
 warning: resource definition pvc-vol4: marked DELETE in the source cluster — skipped
+warning: resource definition pvc-vol5: LINSTOR rendered no peer authentication for it (no DrbdOptions/auto-verify-alg resolves), so the DRBD shared secret is not carried and adoption leaves the connections as they are — to authenticate peers after the cutover set DrbdOptions/Net/shared-secret and DrbdOptions/Net/cram-hmac-alg together; each satellite applies them on its own, and a connection that re-establishes before both of its peers have does not come up until they have
 warning: resource definition pvc-vol6: resource group "SC-GHOST" was not migrated — reference cleared
 warning: resource definition pvc-vol7: every replica spans multiple storage pools and is skipped, so the definition arrives with no replicas at all — Initialized stays latched because the data exists, but resolve the divergence or replicas placed later sit Inconsistent
 warning: resource pvc-vol1.node-b: unhandled flags bits 128 dropped (of 128)
@@ -15,3 +17,7 @@ warning: resource pvc-vol7.node-a: volumes span multiple storage pools (data, fa
 warning: snapshot pvc-vol1.snap-good: captured 2 volumes but blockstor addresses only volume 0 (<pool>/<rd>_00000@<snap>) — restore/delete of the other volumes will not find a dataset
 warning: snapshot pvc-vol1.snap-bad: FAILED_DEPLOYMENT in the source cluster — skipped
 warning: linstor remote offsite-dr (linstor://dr.example.test): backup-shipping remotes have no blockstor equivalent — not migrated
+warning: LINSTOR props /CTRL: not migrated, no blockstor object carries them: Cluster/LocalID, NetCom/SslConnector/Port, encrypted/masterhash, encrypted/masterkey, encrypted/passphrasesalt, encryptedMasterKey
+warning: LINSTOR props /SNAP_DFNS_RSC_DFN/PVC-VOL1/SNAP-GOOD: not migrated, no blockstor object carries them: Aux/csi.storage.k8s.io/pvc/name
+warning: LINSTOR props /STLT: not migrated, no blockstor object carries them: Cluster/LocalID
+warning: LINSTOR props /VLMS/NODE-A/PVC-VOL1/0: not migrated, no blockstor object carries them: StorPoolName

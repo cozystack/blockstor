@@ -27,6 +27,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -35,6 +36,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/satellite/stream"
+	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // reconcileTriggerBuffer bounds the observer → reconciler trigger
@@ -109,6 +111,14 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 		return nil, errors.Wrap(err, "create manager")
 	}
 
+	// Every pass looks up which spellings of its definition the cached
+	// replicas carry (storek8s.ReplicasOf). Without the index that is a
+	// copy of every Resource in the cache, per pass.
+	err = storek8s.RegisterReplicaKeyIndex(mgr.GetFieldIndexer())
+	if err != nil {
+		return nil, errors.Wrap(err, "index cached replicas by definition")
+	}
+
 	// Inject the manager's APIReader so reconcilers can bypass
 	// the informer cache for late-stage finalizer re-reads (Bug
 	// 65). Falls back gracefully in tests where the field is
@@ -130,29 +140,9 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 	// the field nil to short-circuit both ends.
 	ensureWiredDefaults(cfg)
 
-	err = (&ResourceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	err = setupReconcilers(mgr, cfg)
 	if err != nil {
-		return nil, errors.Wrap(err, "setup ResourceReconciler")
-	}
-
-	err = (&ResourceDefinitionReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "setup ResourceDefinitionReconciler")
-	}
-
-	err = (&SnapshotReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "setup SnapshotReconciler")
-	}
-
-	err = (&StoragePoolReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "setup StoragePoolReconciler")
-	}
-
-	err = (&PhysicalDeviceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "setup PhysicalDeviceReconciler")
+		return nil, err
 	}
 
 	err = addBackgroundRunnables(mgr, cfg)
@@ -165,6 +155,37 @@ func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
 	wireConditionStampers(mgr, cfg)
 
 	return mgr, nil
+}
+
+// setupReconcilers registers the satellite's reconcilers on mgr, each
+// with its own copy of cfg. Kept out of NewManager for its funlen budget.
+func setupReconcilers(mgr manager.Manager, cfg *Config) error {
+	err := (&ResourceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup ResourceReconciler")
+	}
+
+	err = (&ResourceDefinitionReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup ResourceDefinitionReconciler")
+	}
+
+	err = (&SnapshotReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup SnapshotReconciler")
+	}
+
+	err = (&StoragePoolReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup StoragePoolReconciler")
+	}
+
+	err = (&PhysicalDeviceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "setup PhysicalDeviceReconciler")
+	}
+
+	return nil
 }
 
 // validateConfig sanity-checks the NewManager input — keeps the
@@ -209,10 +230,15 @@ func wireConditionStampers(mgr manager.Manager, cfg *Config) {
 // queue as the primary For watch. Unit tests that supply their own
 // channel keep it; tests that leave it nil opt both producer and
 // consumer out (the observer no-ops on a nil channel and
-// SetupWithManager skips the raw-source registration).
+// SetupWithManager skips the raw-source registration). It also gives
+// the reconciler and the startup backfill one shared ApplyLocks.
 func ensureWiredDefaults(cfg *Config) {
 	if cfg.ReconcileTrigger == nil {
 		cfg.ReconcileTrigger = make(chan event.GenericEvent, reconcileTriggerBuffer)
+	}
+
+	if cfg.ApplyLocks == nil {
+		cfg.ApplyLocks = &ResourceLocks{}
 	}
 }
 
@@ -227,7 +253,16 @@ func addBackgroundRunnables(mgr manager.Manager, cfg *Config) error {
 		return errors.Wrap(err, "add ObserverRunnable")
 	}
 
-	err = (&HeartbeatRunnable{Client: mgr.GetClient(), NodeName: cfg.NodeName}).RegisterWithManager(mgr)
+	hbClient, resetHB, err := NewHeartbeatClient(mgr.GetConfig(), mgr.GetScheme(), mgr.GetRESTMapper())
+	if err != nil {
+		return err
+	}
+
+	err = (&HeartbeatRunnable{
+		Client:           hbClient,
+		NodeName:         cfg.NodeName,
+		ResetConnections: resetHB,
+	}).RegisterWithManager(mgr)
 	if err != nil {
 		return errors.Wrap(err, "register HeartbeatRunnable")
 	}
@@ -288,17 +323,25 @@ func addBackgroundRunnables(mgr manager.Manager, cfg *Config) error {
 // to keep that function under the funlen budget — the bookkeeping
 // for one more runnable nudges it over the limit.
 func registerMetadataCreatedBackfill(mgr manager.Manager, cfg *Config) error {
-	err := (&MetadataCreatedBackfillRunnable{
-		Client:   mgr.GetClient(),
-		Adm:      drbd.NewAdm(cfg.Exec),
-		Stamper:  &MetadataCreatedStamper{Client: mgr.GetClient()},
-		NodeName: cfg.NodeName,
-	}).RegisterWithManager(mgr)
+	err := newMetadataCreatedBackfillFromConfig(mgr.GetClient(), cfg).RegisterWithManager(mgr)
 	if err != nil {
 		return errors.Wrap(err, "register MetadataCreatedBackfillRunnable")
 	}
 
 	return nil
+}
+
+// newMetadataCreatedBackfillFromConfig builds the backfill on the
+// ApplyLocks the ResourceReconciler holds, so a test can check the
+// two share them: without that the lock guards nothing.
+func newMetadataCreatedBackfillFromConfig(cli client.Client, cfg *Config) *MetadataCreatedBackfillRunnable {
+	return &MetadataCreatedBackfillRunnable{
+		Client:   cli,
+		Adm:      drbd.NewAdm(cfg.Exec),
+		Stamper:  &MetadataCreatedStamper{Client: cli},
+		NodeName: cfg.NodeName,
+		Locks:    cfg.ApplyLocks,
+	}
 }
 
 // wireCrossNodeFetcher injects the SnapshotFetcher into the Apply

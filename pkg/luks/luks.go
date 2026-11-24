@@ -128,6 +128,45 @@ func (c *Cryptsetup) IsActive(ctx context.Context, dmName string) bool {
 	return err == nil && strings.TrimSpace(string(out)) != ""
 }
 
+// MapsDevice reports whether dmName is an active dm-crypt mapping whose
+// one target encrypts device itself. It is how the satellite recognises
+// a mapping another stack opened over one of its volumes, so it answers
+// yes only on evidence: the live table must hold exactly one crypt
+// target, and that target's device number must be device's. Anything
+// else, a probe that fails included, is no.
+//
+// The table is read without --showkeys, so the volume key never leaves
+// the kernel; the key field is not looked at.
+func (c *Cryptsetup) MapsDevice(ctx context.Context, dmName, device string) bool {
+	out, err := c.exec.Run(ctx, "dmsetup", "table", dmName)
+	if err != nil {
+		return false
+	}
+
+	// <start> <length> crypt <cipher> <key> <iv_offset> <major:minor> <offset> [<opts>]
+	const (
+		targetField = 2
+		deviceField = 6
+	)
+
+	table := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(table) != 1 {
+		return false
+	}
+
+	fields := strings.Fields(table[0])
+	if len(fields) <= deviceField || fields[targetField] != "crypt" {
+		return false
+	}
+
+	number, err := c.exec.Run(ctx, "lsblk", "--nodeps", "--noheadings", "--output", "MAJ:MIN", device)
+	if err != nil {
+		return false
+	}
+
+	return strings.TrimSpace(string(number)) == fields[deviceField]
+}
+
 // EnsureEmpty returns nil only for a block device blkid finds no
 // signature on, and ErrDeviceHoldsData for one that carries any. It is
 // the probe Format runs, for a caller that must commit to formatting,

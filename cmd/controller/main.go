@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	k8srest "k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -41,6 +42,8 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/internal/controller"
+	"github.com/cozystack/blockstor/pkg/apihealth"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/rest"
 	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 	// +kubebuilder:scaffold:imports
@@ -167,7 +170,7 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, st, err := storek8s.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mgr, st, err := storek8s.NewManager(mustLoadRESTConfig(), ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
@@ -291,11 +294,8 @@ func main() {
 		setupLog.Error(err, "Failed to register runnable", "runnable", "auto-evict")
 		os.Exit(1)
 	}
-	if err := (&controller.MasterKeyRunnable{
-		Client:    mgr.GetClient(),
-		Reader:    mgr.GetAPIReader(),
-		Namespace: controllerNamespace,
-	}).RegisterWithManager(mgr); err != nil {
+	encryptionWatches, err := registerMasterKey(mgr, controllerNamespace)
+	if err != nil {
 		setupLog.Error(err, "Failed to register runnable", "runnable", "master-key")
 		os.Exit(1)
 	}
@@ -339,6 +339,7 @@ func main() {
 			Namespace: controllerNamespace,
 			// As in cmd/apiserver: the passphrase Secret is read past the cache.
 			SecretReader: mgr.GetAPIReader(),
+			StateReader:  encryptionWatches,
 			OnReady:      ready.MarkBound,
 		}); err != nil {
 			setupLog.Error(err, "Failed to register REST API server")
@@ -389,4 +390,42 @@ func resolveControllerNamespace(flagValue string) string {
 	}
 
 	return "blockstor-system"
+}
+
+// registerMasterKey adds the master-key runnable and the watches it, and
+// the resource view, derive the encryption state from: both derive it
+// over and over, and the watches keep that off the API server while
+// nothing changes.
+func registerMasterKey(mgr ctrl.Manager, namespace string) (*passphrase.WatchedReader, error) {
+	watches, err := passphrase.AddWatchedReader(mgr, namespace)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // AddWatchedReader says what it added
+	}
+
+	err = (&controller.MasterKeyRunnable{
+		Client:    mgr.GetClient(),
+		Reader:    watches,
+		Direct:    mgr.GetAPIReader(),
+		Namespace: namespace,
+	}).RegisterWithManager(mgr)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // RegisterWithManager says what it added
+	}
+
+	return watches, nil
+}
+
+// mustLoadRESTConfig loads the API config with the shortened HTTP/2
+// health check, or ends the process. The watchdog judges heartbeats
+// from this process's cache, so a connection left on a silently dead
+// API server for client-go's 45 s would freeze that cache long enough
+// to call every node OFFLINE.
+func mustLoadRESTConfig() *k8srest.Config {
+	cfg, err := apihealth.GetConfig()
+	if err != nil {
+		setupLog.Error(err, "Failed to load Kubernetes config")
+		os.Exit(1)
+	}
+
+	return cfg
 }

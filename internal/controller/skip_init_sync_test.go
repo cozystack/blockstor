@@ -527,3 +527,167 @@ func TestSkipInitSyncLatchRequiresObservedGI(t *testing.T) {
 		t.Fatal("RD must latch initialized=true once the peer's real (past-day0) CurrentGI is observed")
 	}
 }
+
+// A restored RD ends its restore set the first time one of its replicas is
+// Primary: the volume is in use from then on, a new clone of the snapshot
+// would be stale, and the satellite only seeds a clone UpToDate on its own
+// while the RD is not Initialized. A Primary connected to all its peers
+// stays at the day0 GI it was restored with, so the GI scan never latches
+// it.
+func TestSkipInitSyncRestoredRDInUseLatchesAndNewReplicaSyncs(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+
+	const (
+		rdName  = "restored-rd"
+		oldNode = "n1"
+		oldRes  = rdName + "." + oldNode
+		newNode = "n2"
+		newRes  = rdName + "." + newNode
+	)
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			Props: map[string]string{"BlockstorRestoreFromSnapshot": "pvc-gone:snap"},
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024},
+			},
+		},
+	}
+
+	primary := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: oldRes},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: rdName,
+			NodeName:               oldNode,
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{
+			Role: string(drbd.RolePrimary),
+			Volumes: []blockstoriov1alpha1.ResourceVolumeStatus{{
+				VolumeNumber: 0,
+				DiskState:    string(drbd.DiskStateUpToDate),
+				CurrentGI:    drbd.Day0GIFor(rdName, 0),
+			}},
+		},
+	}
+
+	added := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: newRes},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: rdName,
+			NodeName:               newNode,
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(
+			&blockstoriov1alpha1.Resource{},
+			&blockstoriov1alpha1.ResourceDefinition{},
+		).
+		WithObjects(rd, primary, added).
+		Build()
+
+	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}
+
+	reconcileToSteadyState(t, ctx, rec, oldRes)
+	reconcileToSteadyState(t, ctx, rec, newRes)
+
+	gotRD := &blockstoriov1alpha1.ResourceDefinition{}
+	if err := cli.Get(ctx, client.ObjectKey{Name: rdName}, gotRD); err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	if gotRD.Spec.Initialized == nil || !*gotRD.Spec.Initialized {
+		t.Fatalf("restored RD with a Primary replica must latch initialized, got %v", gotRD.Spec.Initialized)
+	}
+
+	gotAdded := &blockstoriov1alpha1.Resource{}
+	if err := cli.Get(ctx, client.ObjectKey{Name: newRes}, gotAdded); err != nil {
+		t.Fatalf("get added: %v", err)
+	}
+
+	if gotAdded.Spec.SkipInitialSync == nil || *gotAdded.Spec.SkipInitialSync {
+		t.Errorf("replica added after a restored RD went Primary must get SkipInitialSync=false, got %v",
+			gotAdded.Spec.SkipInitialSync)
+	}
+}
+
+// Until a replica of a restored RD is Primary the restore set is open: the
+// replicas autoplace adds right after the restore still skip the initial
+// sync. A plain RD's Primary at day0 is not latched either; the GI scan
+// stays the only latch there.
+func TestSkipInitSyncRestoredRDNotInUseStaysFresh(t *testing.T) {
+	t.Parallel()
+
+	for name, props := range map[string]map[string]string{
+		"restored, secondary": {"BlockstorRestoreFromSnapshot": "pvc-gone:snap"},
+		"plain, primary":      nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			scheme := newScheme(t)
+
+			const (
+				rdName = "rd-1"
+				resA   = rdName + ".n1"
+			)
+
+			role := string(drbd.RoleSecondary)
+			if props == nil {
+				role = string(drbd.RolePrimary)
+			}
+
+			rd := &blockstoriov1alpha1.ResourceDefinition{
+				ObjectMeta: metav1.ObjectMeta{Name: rdName},
+				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+					Props: props,
+					VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+						{VolumeNumber: 0, SizeKib: 1024},
+					},
+				},
+			}
+
+			res := &blockstoriov1alpha1.Resource{
+				ObjectMeta: metav1.ObjectMeta{Name: resA},
+				Spec: blockstoriov1alpha1.ResourceSpec{
+					ResourceDefinitionName: rdName,
+					NodeName:               "n1",
+				},
+				Status: blockstoriov1alpha1.ResourceStatus{
+					Role: role,
+					Volumes: []blockstoriov1alpha1.ResourceVolumeStatus{{
+						VolumeNumber: 0,
+						DiskState:    string(drbd.DiskStateUpToDate),
+						CurrentGI:    drbd.Day0GIFor(rdName, 0),
+					}},
+				},
+			}
+
+			cli := fake.NewClientBuilder().WithScheme(scheme).
+				WithStatusSubresource(
+					&blockstoriov1alpha1.Resource{},
+					&blockstoriov1alpha1.ResourceDefinition{},
+				).
+				WithObjects(rd, res).
+				Build()
+
+			rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}
+
+			reconcileToSteadyState(t, ctx, rec, resA)
+
+			gotRD := &blockstoriov1alpha1.ResourceDefinition{}
+			if err := cli.Get(ctx, client.ObjectKey{Name: rdName}, gotRD); err != nil {
+				t.Fatalf("get rd: %v", err)
+			}
+
+			if gotRD.Spec.Initialized != nil && *gotRD.Spec.Initialized {
+				t.Errorf("RD latched initialized with no restored replica in use")
+			}
+		})
+	}
+}
