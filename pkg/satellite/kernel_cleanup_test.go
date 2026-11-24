@@ -333,32 +333,50 @@ func TestPruneStaleKernelSlots_NilAdmIsNoop(t *testing.T) {
 	}
 }
 
-// TestPruneStaleKernelSlots_Pass1ForgetPeerSkippedWithoutDevice:
-// Pass-1 del-peer must still fire for an unexpected peer when no
-// device path is known (DISKLESS local case), but forget-peer is
-// per-volume and must be skipped — there's no metadata block to
-// clean. The kernel-side connection leak is the loud half; metadata
-// slot leak is the slow half and per-RD recoverable.
-func TestPruneStaleKernelSlots_Pass1ForgetPeerSkippedWithoutDevice(t *testing.T) {
+// TestPruneStaleKernelSlots_Pass1ForgetsWithoutDeviceMap: the resource
+// controller prunes before it knows any device path and passes nil.
+// A peer Pass 1 tears down was deleted, so its metadata slot must be
+// forgotten as well: its node-id is free again, and a diskless replica
+// given it next would inherit the departed diskful one's flags and
+// wedge adjust with "Can not drop the bitmap when both sides have a
+// disk".
+func TestPruneStaleKernelSlots_Pass1ForgetsWithoutDeviceMap(t *testing.T) {
 	r, fx := newKernelCleanupReconciler(t)
 
 	err := r.PruneStaleKernelSlots(t.Context(), "pvc-1",
 		expectPeers("worker-1"),
 		[]int32{0},
-		nil) // no devices map
+		nil) // what the resource controller passes
+	if err != nil {
+		t.Fatalf("PruneStaleKernelSlots: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	del := slices.Index(cmds, "drbdadm del-peer worker-2:pvc-1")
+	forget := slices.Index(cmds, "drbdsetup forget-peer pvc-1 2")
+
+	if del < 0 || forget < del {
+		t.Fatalf("want del-peer, then forget-peer of node-id 2; got %v", cmds)
+	}
+}
+
+// TestPruneStaleKernelSlots_Pass1KnownDisklessForgetsNothing: a caller
+// that knows the local replica has no disk spares the forget-peer.
+func TestPruneStaleKernelSlots_Pass1KnownDisklessForgetsNothing(t *testing.T) {
+	r, fx := newKernelCleanupReconciler(t)
+
+	err := r.PruneStaleKernelSlots(t.Context(), "pvc-1",
+		expectPeers("worker-1"),
+		[]int32{0},
+		map[int32]string{0: ""})
 	if err != nil {
 		t.Fatalf("PruneStaleKernelSlots: %v", err)
 	}
 
 	cmds := fx.CommandLines()
 	mustContain(t, cmds, "drbdadm del-peer worker-2:pvc-1")
-
-	// No forget-peer because devices map is nil.
-	for _, c := range cmds {
-		if len(c) >= len("drbdmeta") && c[:len("drbdmeta")] == "drbdmeta" {
-			t.Errorf("forget-peer must be skipped without device path; got: %s", c)
-		}
-	}
+	mustNotContain(t, cmds, "drbdsetup forget-peer pvc-1 2")
 }
 
 // TestStuckSlotGrace_EnvOverride: BSTOR_ZOMBIE_GRACE_S=N flips the

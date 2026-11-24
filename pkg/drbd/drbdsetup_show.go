@@ -75,6 +75,13 @@ type KernelSlot struct {
 	// slot with NO peer-device registered for any volume — that's
 	// the Bug 342 signature.
 	PeerDevicesByVolNum map[int32]struct{}
+
+	// PeerDiskStates is the peer's disk state per volume as this node's
+	// kernel sees it (`peer-disk-state`). A connection that is not
+	// established keeps only Inconsistent or Outdated here (DRBD drops
+	// anything else to DUnknown), and a new-peer reads Outdated from
+	// the node-id's metadata slot.
+	PeerDiskStates map[int32]string
 }
 
 // IsConnectingOrStandalone reports whether the slot is in a state
@@ -329,8 +336,11 @@ func parseShowJSON(out []byte) map[string]KernelSlot {
 		}
 
 		pdv := make(map[int32]struct{}, len(c.PeerDevices))
+		pds := make(map[int32]string, len(c.PeerDevices))
+
 		for j := range c.PeerDevices {
 			pdv[c.PeerDevices[j].VolumeNumber] = struct{}{}
+			pds[c.PeerDevices[j].VolumeNumber] = c.PeerDevices[j].PeerDiskState
 		}
 
 		slots[c.PeerName] = KernelSlot{
@@ -338,6 +348,7 @@ func parseShowJSON(out []byte) map[string]KernelSlot {
 			NodeID:              c.PeerNodeID,
 			ConnectionState:     c.ConnectionStr,
 			PeerDevicesByVolNum: pdv,
+			PeerDiskStates:      pds,
 		}
 	}
 

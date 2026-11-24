@@ -7174,117 +7174,340 @@ func TestApplyFallsBackToUpOnAdjust158(t *testing.T) {
 	}
 }
 
-// TestRecoverFromBitmapBothDisks pins the tiebreaker-relocate
-// StandAlone wedge recovery contract: the recovery helper called
-// from runAdjust when adjust fails with the (162) "Can not drop
-// the bitmap when both sides have a disk" signature MUST issue
-// `drbdadm down` → `drbdadm up` → retry `drbdadm adjust` in that
-// order, so the kernel re-reads peer-disk from a fresh handshake
-// (DUnknown) rather than from the stale-default metadata
-// (Outdated) on the second adjust pass.
-//
-// Without this recovery the first failed adjust leaves the slot
-// StandAlone with kernel-registered peer-device entries (new-peer
-// runs before peer-device-options fails), at which point
-// shouldSkipNetOnAdjust permanently latches `--skip-net` for that
-// slot — the slot stays StandAlone forever.
-//
-// We drive the helper directly via the export_test re-export
-// rather than through Apply because the package's FakeExec map
-// is keyed on the full command line and not sequence-aware —
-// staging two distinct responses for the same `drbdadm adjust`
-// invocation isn't possible. The end-to-end coverage lives in
-// tests/e2e/tiebreaker-r-d-r-c-other-node.sh.
-func TestRecoverFromBitmapBothDisks(t *testing.T) {
+// TestApplyRecoversBitmapBothDisksWithoutDown drives the refusal
+// through Apply on a Primary whose filesystem is mounted: adjust fails
+// with "Can not drop the bitmap when both sides have a disk" for
+// node-id 2, a peer that is not connected. The reconciler forgets that
+// peer's slot and adjusts again; it must not run `drbdadm down`, which
+// would demote the Primary (refused while the device is held open, and
+// carried out on an idle one).
+func TestApplyRecoversBitmapBothDisksWithoutDown(t *testing.T) {
+	dir := t.TempDir()
 	fx := storage.NewFakeExec()
 
-	// Stage all three recovery commands as plain successes. The
-	// helper itself doesn't trigger the failing adjust — that
-	// branch lives in runAdjust above the call site — so we only
-	// care that down + up + retry-adjust fire in order.
-	fx.Expect("drbdadm down pvc-tb-relocate", storage.FakeResponse{})
-	fx.Expect("drbdadm up pvc-tb-relocate", storage.FakeResponse{})
-	fx.Expect("drbdadm adjust pvc-tb-relocate", storage.FakeResponse{})
+	lvName := "lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-tb-relocate_00000"
 
+	fx.Expect(lvName, storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	dr := []*intent.DesiredResource{
+		{
+			Name:     "pvc-tb-relocate",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	}
+
+	results, err := rec.Apply(t.Context(), dr)
+	if err != nil || len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("Apply (first activation): err=%v results=%+v", err, results)
+	}
+
+	fx.Reset()
+	fx.Expect(lvName, storage.FakeResponse{Stdout: []byte("pvc-tb-relocate_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-tb-relocate_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-tb-relocate_00000|1048576\n")})
+	fx.Expect("drbdsetup status pvc-tb-relocate", storage.FakeResponse{
+		Stdout: []byte("pvc-tb-relocate role:Primary\n  volume:0 disk:UpToDate open:yes\n"),
+	})
+	fx.Expect("drbdsetup status -j pvc-tb-relocate", storage.FakeResponse{Stdout: bitmapBothDisksStatus("Connecting")})
+	fx.ExpectSequence("drbdadm adjust pvc-tb-relocate",
+		storage.FakeResponse{Err: errDrbdadmAdjust162BitmapBothDisks},
+		storage.FakeResponse{})
+	fx.Expect("drbdadm down pvc-tb-relocate", storage.FakeResponse{Err: errDrbdadmPrimaryStateChange})
+
+	results, err = rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (refusal): %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	for _, line := range cmds {
+		if strings.Contains(line, "down pvc-tb-relocate") {
+			t.Errorf("the recovery must not take a Primary down; saw %q in %v", line, cmds)
+		}
+	}
+
+	mustContainLine(t, cmds, "drbdsetup del-peer pvc-tb-relocate 2")
+	mustContainLine(t, cmds, "drbdsetup forget-peer pvc-tb-relocate 2")
+
+	if len(results) != 1 || !results[0].GetOk() {
+		t.Errorf("expected Ok=true after forgetting the slot; got results=%+v", results)
+	}
+}
+
+// staleDisklessPeerStatus is `drbdsetup status -j pvc-tb-relocate`
+// after an earlier pass hit the refusal and its recovery did not
+// finish: node-id 2 (n3), which the .res names diskless, sits
+// StandAlone with its peer device registered and the peer disk read as
+// peerDisk from the stale metadata slot.
+func staleDisklessPeerStatus(peerDisk string) []byte {
+	return []byte(`[{"name":"pvc-tb-relocate","connections":[
+  {"peer-node-id":1,"name":"n2","connection-state":"Connected","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]},
+  {"peer-node-id":2,"name":"n3","connection-state":"StandAlone","peer_devices":[{"volume":0,"peer-disk-state":"` + peerDisk + `"}]}
+]}]`)
+}
+
+// applyOverStandAlonePeer runs Apply on n1, whose kernel shows n3 as
+// statusJSON describes, and returns the commands it issued. n3 is
+// diskless in the intent. The first plain adjust is refused for
+// node-id 2 and the next succeeds; an adjust --skip-net succeeds.
+func applyOverStandAlonePeer(t *testing.T, statusJSON []byte) []string {
+	t.Helper()
+
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	lvName := "lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-tb-relocate_00000"
+
+	fx.Expect(lvName, storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	dr := []*intent.DesiredResource{
+		{
+			Name:     "pvc-tb-relocate",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+				"peer.n3.diskless": "true",
+			},
+		},
+	}
+
+	results, err := rec.Apply(t.Context(), dr)
+	if err != nil || len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("Apply (first activation): err=%v results=%+v", err, results)
+	}
+
+	fx.Reset()
+	fx.Expect(lvName, storage.FakeResponse{Stdout: []byte("pvc-tb-relocate_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-tb-relocate_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-tb-relocate_00000|1048576\n")})
+	fx.Expect("drbdsetup status pvc-tb-relocate", storage.FakeResponse{
+		Stdout: []byte("pvc-tb-relocate role:Primary\n  volume:0 disk:UpToDate open:yes\n"),
+	})
+	fx.Expect("drbdsetup status -j pvc-tb-relocate", storage.FakeResponse{Stdout: statusJSON})
+	fx.ExpectSequence("drbdadm adjust pvc-tb-relocate",
+		storage.FakeResponse{Err: errDrbdadmAdjust162BitmapBothDisks},
+		storage.FakeResponse{})
+	fx.Expect("drbdadm adjust --skip-net pvc-tb-relocate", storage.FakeResponse{})
+
+	_, err = rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (StandAlone peer): %v", err)
+	}
+
+	return fx.CommandLines()
+}
+
+// TestApplyDoesNotLatchSkipNetOnAStaleDisklessPeer: a pass that hit the
+// bitmap refusal and did not finish its recovery (a failed del-peer or
+// adjust, a satellite restart) leaves the diskless peer StandAlone with
+// its peer device registered, the way an operator's disconnect does.
+// The next pass must still run a full adjust, so the refusal and the
+// recovery fire again, instead of adjusting with --skip-net and leaving
+// the peer cut off for good.
+func TestApplyDoesNotLatchSkipNetOnAStaleDisklessPeer(t *testing.T) {
+	cmds := applyOverStandAlonePeer(t, staleDisklessPeerStatus("Outdated"))
+
+	for _, line := range cmds {
+		if strings.Contains(line, "--skip-net") {
+			t.Errorf("adjusted with --skip-net over the stale slot: %q in %v", line, cmds)
+		}
+	}
+
+	mustContainLine(t, cmds, "drbdsetup del-peer pvc-tb-relocate 2")
+	mustContainLine(t, cmds, "drbdsetup forget-peer pvc-tb-relocate 2")
+}
+
+// TestApplyKeepsSkipNetForADisconnectedDisklessPeer: an operator who
+// disconnected a diskless peer leaves it StandAlone with its peer disk
+// DUnknown. That disconnect is still honoured with --skip-net and the
+// peer is neither dropped nor forgotten.
+func TestApplyKeepsSkipNetForADisconnectedDisklessPeer(t *testing.T) {
+	cmds := applyOverStandAlonePeer(t, staleDisklessPeerStatus("DUnknown"))
+
+	mustContainLine(t, cmds, "drbdadm adjust --skip-net pvc-tb-relocate")
+
+	for _, line := range cmds {
+		if strings.Contains(line, "del-peer") || strings.Contains(line, "forget-peer") {
+			t.Errorf("an operator's disconnect was undone: %q in %v", line, cmds)
+		}
+	}
+}
+
+// mustContainLine fails t unless want is one of the command lines.
+func mustContainLine(t *testing.T, cmds []string, want string) {
+	t.Helper()
+
+	if !slices.Contains(cmds, want) {
+		t.Errorf("missing %q in %v", want, cmds)
+	}
+}
+
+// bitmapBothDisksStatus is `drbdsetup status -j pvc-tb-relocate` on
+// the diskful replica that hit the refusal: node-id 1 is a working
+// peer, node-id 3 a diskful one that is away for now, and node-id 2 the
+// returning diskless one whose new-peer ran before peer-device-options
+// failed, so it is StandAlone with its peer device registered.
+func bitmapBothDisksStatus(stateOfTwo string) []byte {
+	return []byte(`[{"name":"pvc-tb-relocate","connections":[
+  {"peer-node-id":1,"name":"n2","connection-state":"Connected","peer_devices":[{"volume":0}]},
+  {"peer-node-id":3,"name":"n4","connection-state":"Connecting","peer_devices":[{"volume":0}]},
+  {"peer-node-id":2,"name":"n3","connection-state":"` + stateOfTwo + `","peer_devices":[{"volume":0}]}
+]}]`)
+}
+
+// newBitmapBothDisksReconciler wires a Reconciler to fx for the
+// recovery tests.
+func newBitmapBothDisksReconciler(t *testing.T, fx *storage.FakeExec) *satellite.Reconciler {
+	t.Helper()
+
+	return satellite.NewReconciler(satellite.ReconcilerConfig{
 		Adm:      drbd.NewAdm(fx),
 		StateDir: t.TempDir(),
 		NodeName: "n1",
 	})
+}
 
-	dr := &intent.DesiredResource{
-		Name:     "pvc-tb-relocate",
-		NodeName: "n1",
-	}
+// TestRecoverFromBitmapBothDisksForgetsTheStaleSlot pins the recovery
+// from the tiebreaker-relocate wedge: the kernel refused to drop the
+// bitmap of node-id 2 because the metadata slot still describes the
+// diskful replica that had that node-id before. The recovery drops and
+// forgets that one connection, as LINSTOR's satellite does for a
+// deleted peer, and adjusts again. It never runs `drbdadm down`: the
+// local replica may be a Primary with a mounted filesystem, or hold the
+// only UpToDate copy, and the working peer on node-id 1 is left alone.
+func TestRecoverFromBitmapBothDisksForgetsTheStaleSlot(t *testing.T) {
+	fx := storage.NewFakeExec()
 
-	err := rec.RecoverFromBitmapBothDisksForTest(t.Context(), dr, false, false)
+	// Before the drop the slot is there; after it, gone.
+	fx.ExpectSequence("drbdsetup status -j pvc-tb-relocate",
+		storage.FakeResponse{Stdout: bitmapBothDisksStatus("StandAlone")},
+		storage.FakeResponse{Stdout: []byte(`[{"name":"pvc-tb-relocate","connections":[
+  {"peer-node-id":1,"name":"n2","connection-state":"Connected","peer_devices":[{"volume":0}]},
+  {"peer-node-id":3,"name":"n4","connection-state":"Connecting","peer_devices":[{"volume":0}]}]}]`)})
+
+	rec := newBitmapBothDisksReconciler(t, fx)
+	dr := &intent.DesiredResource{Name: "pvc-tb-relocate", NodeName: "n1"}
+
+	err := rec.RecoverFromBitmapBothDisksForTest(t.Context(), dr, false, errDrbdadmAdjust162BitmapBothDisks)
 	if err != nil {
 		t.Fatalf("recovery returned error: %v", err)
 	}
 
 	cmds := fx.CommandLines()
 
-	downIdx, upIdx, adjustIdx := -1, -1, -1
+	delIdx, forgetIdx, adjustIdx := -1, -1, -1
 
 	for i, line := range cmds {
 		switch {
-		case strings.Contains(line, "drbdadm down pvc-tb-relocate"):
-			downIdx = i
-		case strings.Contains(line, "drbdadm up pvc-tb-relocate"):
-			upIdx = i
-		case strings.Contains(line, "drbdadm adjust pvc-tb-relocate"):
+		case strings.Contains(line, "drbdadm down"), strings.Contains(line, "drbdadm up"),
+			strings.Contains(line, "drbdsetup down"), strings.Contains(line, "detach"),
+			strings.Contains(line, "secondary"):
+			t.Errorf("recovery must not take the resource down, detach or demote it; saw %q", line)
+		case (strings.Contains(line, "del-peer") || strings.Contains(line, "forget-peer")) && !strings.HasSuffix(line, " 2"):
+			t.Errorf("recovery must drop and forget only node-id 2; saw %q", line)
+		case line == "drbdsetup del-peer pvc-tb-relocate 2":
+			delIdx = i
+		case line == "drbdsetup forget-peer pvc-tb-relocate 2":
+			forgetIdx = i
+		case strings.HasPrefix(line, "drbdadm") && strings.Contains(line, "adjust pvc-tb-relocate"):
 			adjustIdx = i
 		}
 	}
 
-	if downIdx == -1 || upIdx == -1 || adjustIdx == -1 {
-		t.Fatalf("expected recovery to issue down + up + adjust; got %v", cmds)
+	if delIdx == -1 || forgetIdx == -1 || adjustIdx == -1 {
+		t.Fatalf("expected del-peer + forget-peer of node-id 2, then adjust; got %v", cmds)
 	}
 
-	if downIdx >= upIdx || upIdx >= adjustIdx {
-		t.Errorf("recovery sequence out of order: down=%d up=%d adjust=%d; got %v",
-			downIdx, upIdx, adjustIdx, cmds)
+	if delIdx >= forgetIdx || forgetIdx >= adjustIdx {
+		t.Errorf("recovery out of order: del-peer=%d forget-peer=%d adjust=%d; got %v",
+			delIdx, forgetIdx, adjustIdx, cmds)
+	}
+
+	if strings.Contains(cmds[adjustIdx], "--skip-net") {
+		t.Errorf("the adjust after the drop must re-add the peer, got %q", cmds[adjustIdx])
 	}
 }
 
-// TestRecoverFromBitmapBothDisksBubblesDownErr pins the
-// fail-loud contract on the recovery's first step: if
-// `drbdadm down` itself fails the recovery surfaces the error
-// (rather than charging into `drbdadm up` against unknown
-// kernel state).
-func TestRecoverFromBitmapBothDisksBubblesDownErr(t *testing.T) {
+// TestRecoverFromBitmapBothDisksLeavesAConnectedPeer: when the peer the
+// refusal names is Connected, its disk state is the live one (it has
+// not detached yet), not the slot's. Nothing is dropped, the resource
+// is not touched, and the adjust error goes back to the retry loop.
+func TestRecoverFromBitmapBothDisksLeavesAConnectedPeer(t *testing.T) {
 	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status -j pvc-tb-relocate", storage.FakeResponse{Stdout: bitmapBothDisksStatus("Connected")})
 
-	fx.Expect("drbdadm down pvc-tb-relocate", storage.FakeResponse{
-		Err: errDrbdadmDownNotInConfig,
-	})
+	rec := newBitmapBothDisksReconciler(t, fx)
+	dr := &intent.DesiredResource{Name: "pvc-tb-relocate", NodeName: "n1"}
 
-	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
-		Adm:      drbd.NewAdm(fx),
-		StateDir: t.TempDir(),
-		NodeName: "n1",
-	})
-
-	dr := &intent.DesiredResource{
-		Name:     "pvc-tb-relocate",
-		NodeName: "n1",
+	err := rec.RecoverFromBitmapBothDisksForTest(t.Context(), dr, false, errDrbdadmAdjust162BitmapBothDisks)
+	if err == nil || !strings.Contains(err.Error(), "Can not drop the bitmap") {
+		t.Fatalf("expected the adjust error back, got %v", err)
 	}
 
-	err := rec.RecoverFromBitmapBothDisksForTest(t.Context(), dr, false, false)
-	if err == nil {
-		t.Fatal("expected recovery to bubble drbdadm down failure; got nil")
-	}
-
-	// Up + adjust must NOT fire after a failed down — they
-	// would race a half-torn kernel state and the next
-	// reconcile would loop on the same wedge signature.
 	for _, line := range fx.CommandLines() {
-		if strings.Contains(line, "drbdadm up pvc-tb-relocate") ||
-			strings.Contains(line, "drbdadm adjust pvc-tb-relocate") {
-			t.Errorf("recovery must stop after a failed down; saw %q", line)
+		if line != "drbdsetup status -j pvc-tb-relocate" {
+			t.Errorf("recovery must only read the kernel for a Connected peer; saw %q", line)
 		}
 	}
 }
+
+// TestRecoverFromBitmapBothDisksBubblesDelPeerErr: a del-peer that
+// fails while the connection is still there stops the recovery before
+// the second adjust, which would hit the same refusal.
+func TestRecoverFromBitmapBothDisksBubblesDelPeerErr(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status -j pvc-tb-relocate", storage.FakeResponse{Stdout: bitmapBothDisksStatus("StandAlone")})
+	fx.Expect("drbdsetup del-peer pvc-tb-relocate 2", storage.FakeResponse{Err: errDelPeerFailed})
+	fx.Expect("drbdsetup forget-peer pvc-tb-relocate 2", storage.FakeResponse{Err: errForgetPeerConnected})
+
+	rec := newBitmapBothDisksReconciler(t, fx)
+	dr := &intent.DesiredResource{Name: "pvc-tb-relocate", NodeName: "n1"}
+
+	err := rec.RecoverFromBitmapBothDisksForTest(t.Context(), dr, false, errDrbdadmAdjust162BitmapBothDisks)
+	if err == nil {
+		t.Fatal("expected the recovery to fail when the connection cannot be dropped")
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "adjust") || strings.Contains(line, "down") {
+			t.Errorf("recovery must stop after a failed drop; saw %q", line)
+		}
+	}
+}
+
+// Failures of the drop in TestRecoverFromBitmapBothDisksBubblesDelPeerErr.
+var (
+	errDelPeerFailed       = errors.New("del-peer failed")
+	errForgetPeerConnected = errors.New("Failure: (102) Device has a net-config (use disconnect first)")
+)
 
 // TestIsBitmapDropBothDisksErr pins the predicate that drives the
 // reactive recovery in runAdjust. The (162) code alone is not
