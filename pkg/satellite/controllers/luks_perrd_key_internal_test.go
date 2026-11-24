@@ -228,3 +228,49 @@ func TestPerRDPassphraseEmptySecretNameStampsNothing(t *testing.T) {
 		t.Errorf("unexpected Condition for an empty secret name: %+v", cond)
 	}
 }
+
+// TestPerRDPassphraseConditionFollowsARenamedSecret pins that the
+// Condition names the Secret the RD points at now. Comparing only the
+// status would keep it True with the first Secret's name after the RD
+// is repointed, and the operator would chase the wrong object.
+func TestPerRDPassphraseConditionFollowsARenamedSecret(t *testing.T) {
+	t.Parallel()
+
+	rd := withPerRDKey(luksRD(), "first-key")
+	res := perRDKeyResource(rd.Name)
+	r := newPassphraseTestReconciler(t, rd, res)
+
+	_, err := r.buildDesiredFromCRD(t.Context(), res, rd, nil)
+	if err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+
+	first := readKeyIgnoredCondition(t, r, res.Name)
+	if first == nil || first.Status != metav1.ConditionTrue {
+		t.Fatalf("precondition: want the Condition True after the first pass, got %+v", first)
+	}
+
+	var live blockstoriov1alpha1.Resource
+	if err := r.Get(t.Context(), client.ObjectKey{Name: res.Name}, &live); err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+
+	rd = withPerRDKey(rd, "second-key")
+
+	_, err = r.buildDesiredFromCRD(t.Context(), &live, rd, nil)
+	if err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+
+	cond := readKeyIgnoredCondition(t, r, res.Name)
+	if cond == nil || !strings.Contains(cond.Message, "second-key") {
+		t.Fatalf("Condition does not name the Secret the RD points at now: %+v", cond)
+	}
+
+	// Same status, so the transition time stays where the status last
+	// changed, as meta.SetStatusCondition keeps it.
+	if !cond.LastTransitionTime.Equal(&first.LastTransitionTime) {
+		t.Errorf("LastTransitionTime moved on a message-only change: %v -> %v",
+			first.LastTransitionTime, cond.LastTransitionTime)
+	}
+}
