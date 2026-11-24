@@ -91,6 +91,33 @@ func CascadeDeleteResources(ctx context.Context, st Store, rdName string) error 
 	return nil
 }
 
+// MarkDefinitionDeleting flags the definition DELETE before its replicas
+// are walked, the way LINSTOR flags a definition it is deleting. The two
+// `rd d` doors call it ahead of CascadeDeleteResources; a clone rollback
+// does not, because it may keep the definition it cascades.
+//
+// The flag is what tells everything else the definition is going as a
+// whole: the RD reconciler stops creating and removing tiebreakers on it,
+// so a witness does not land between two replica deletes only to be reaped
+// by the next pass, and validate.DefinitionBeingDeleted lifts the mid-sync
+// delete guard, which protects a volume that stays. A definition that is
+// already gone has nothing to mark.
+func MarkDefinitionDeleting(ctx context.Context, st Store, rdName string) error {
+	err := st.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName,
+		func(rd *apiv1.ResourceDefinition) error {
+			if !slices.Contains(rd.Flags, apiv1.ResourceFlagDelete) {
+				rd.Flags = append(rd.Flags, apiv1.ResourceFlagDelete)
+			}
+
+			return nil
+		})
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("mark %s for deletion: %w", rdName, err)
+	}
+
+	return nil
+}
+
 // ReplicasOnNode is the node-scoped replica read a node's fate is decided on,
 // asked in every spelling the node's objects can carry. ReferencesOnNode and
 // CascadeOrphansForLostNode ask the storage pools the same way.
