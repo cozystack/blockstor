@@ -92,7 +92,7 @@ func TestKernelStatusReadsTheWorkaroundShapes(t *testing.T) {
 
 	want := drbd.ResyncDependency{
 		Volume: 0, Active: "n1", Paused: "n2", PercentInSync: 42.17,
-		OutOfSync: 14592, Received: 113448, Outstanding: 542,
+		OutOfSync: 14592, Received: 113448, Outstanding: 542, PausedOutstanding: 70,
 	}
 	if !ok || dep != want {
 		t.Errorf("ResyncDependency = %+v, %v; want %+v", dep, ok, want)

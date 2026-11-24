@@ -526,11 +526,14 @@ func (*DRBDWorkaroundsRunnable) failed(logger logr.Logger, err error, resource, 
 // active peer does not hold the only UpToDate copy, as it does in an
 // initial sync, and a paused peer it disconnected is connected again only
 // while a Primary is ruled out on every other link (reconnectOwed). The
-// one action it takes with a Primary in sight is the reconnect of the
-// active peer, from a Secondary whose volumes are all Inconsistent
-// (drbd.KernelResource.InconsistentSecondary): such a node can only be
-// the target of the resync the handshake starts, never the source of a
-// Secondary, and the status is read again right before the connect.
+// one action it takes with a Primary in sight is the disconnect of the
+// paused peer, from a Secondary whose volumes are all Inconsistent
+// (drbd.KernelResource.InconsistentSecondary): a disconnect starts no
+// handshake, and the connect that would stays owed until no Primary is
+// in sight. On alpha.19, with the Primary the active peer, a reconnect
+// of the active peer restarted the resync and it stalled again at once,
+// the requests sent to the paused peer still unanswered; the disconnect
+// of the paused peer let it finish within the second.
 //
 // A pass counts as stalled when, since the previous pass, the out-of-sync
 // count toward the active peer fell by less than StalledResyncMinRate,
@@ -656,19 +659,16 @@ func (w *DRBDWorkaroundsRunnable) checkStalledResync(
 	stalls[res.Name] = progress
 
 	stuck := fmt.Sprintf("resync of volume %d from %s stalled for %d passes at %.2f%% "+
-		"(out-of-sync %d KiB, %d requests outstanding) while %s waits on it",
-		dep.Volume, dep.Active, w.Config.StalledResyncPasses, dep.PercentInSync, dep.OutOfSync, dep.Outstanding, dep.Paused)
+		"(out-of-sync %d KiB, %d requests outstanding) while %s waits on it (%d requests outstanding)",
+		dep.Volume, dep.Active, w.Config.StalledResyncPasses, dep.PercentInSync, dep.OutOfSync, dep.Outstanding,
+		dep.Paused, dep.PausedOutstanding)
 
-	// With a Primary in sight, dropping the paused peer is the hazard:
-	// this node turns UpToDate meanwhile, and its reconnect to that peer
-	// can make it the SyncSource of a Secondary. Reconnecting the active
-	// peer while every volume here is Inconsistent cannot.
-	paused := progress.PausedTried != dep.Active && (res.PrimaryRuledOut() || !res.InconsistentSecondary())
+	paused := progress.PausedTried != dep.Active
 
 	if refusal := w.stalledResyncRefusal(res, &dep, paused); refusal != "" {
 		w.acted(logger, replica, res.Name, "DRBDResyncStalled", fmt.Sprintf(
 			"%s: not acting, %s; by hand on %s: %s (LINBIT/drbd#149)",
-			stuck, refusal, w.NodeName, stalledResyncCommand(res.Name, &dep, paused)))
+			stuck, refusal, w.NodeName, stalledResyncCommand(res.Name, &dep, paused, res.PrimaryRuledOut())))
 
 		return
 	}
@@ -689,13 +689,17 @@ func (w *DRBDWorkaroundsRunnable) checkStalledResync(
 // disconnect of the paused peer rather than the reconnect of the active
 // one. The reasons that make the action unsafe come first, so the report
 // also tells an operator what to weigh before running the command by
-// hand. A Primary in sight rules out every action but the reconnect of
-// the active peer from a node whose volumes are all Inconsistent.
+// hand. A Primary in sight rules out every action but the disconnect of
+// the paused peer from a node whose volumes are all Inconsistent: a
+// disconnect starts no handshake, and the connect that would is left to
+// the gate of reconnectOwed. That gate cannot read the role of the
+// StandAlone peer it connects, so a paused peer that is the Primary
+// itself is left to an operator.
 func (w *DRBDWorkaroundsRunnable) stalledResyncRefusal(res *drbd.KernelResource, dep *drbd.ResyncDependency, paused bool) string {
 	switch {
 	case dep.ActiveOnlyCopy:
 		return dep.Active + " holds the only UpToDate copy in sight, as in an initial sync"
-	case !res.PrimaryRuledOut() && (paused || !res.InconsistentSecondary()):
+	case !res.PrimaryRuledOut() && (!paused || !res.InconsistentSecondary() || res.PeerPrimary(dep.Paused)):
 		return "a Primary is in sight or not ruled out, and a reconnect between two Secondaries of a Primary " +
 			"can make a Secondary the SyncSource while the Primary writes, leaving them diverged (LINBIT/drbd#153)"
 	case !w.Config.StalledResyncAct:
@@ -707,14 +711,22 @@ func (w *DRBDWorkaroundsRunnable) stalledResyncRefusal(res *drbd.KernelResource,
 
 // stalledResyncCommand is what an operator runs on this node to do by
 // hand what the check would do: drop the paused peer and connect it again
-// once the active resync is done, or reconnect the active peer.
-func stalledResyncCommand(name string, dep *drbd.ResyncDependency, paused bool) string {
-	if paused {
+// once the active resync is done, or reconnect the active peer. With a
+// Primary in sight (primaryRuledOut false) the connect of the paused
+// peer waits until none is: by then this node is UpToDate and may hold
+// stale bits toward that peer, and the handshake can make it the
+// SyncSource of a Secondary while the Primary writes.
+func stalledResyncCommand(name string, dep *drbd.ResyncDependency, paused, primaryRuledOut bool) string {
+	switch {
+	case paused && primaryRuledOut:
 		return fmt.Sprintf("`drbdadm disconnect %s:%s`, then once the resync from %s is done `drbdadm connect %s:%s`",
 			name, dep.Paused, dep.Active, name, dep.Paused)
+	case paused:
+		return fmt.Sprintf("`drbdadm disconnect %s:%s`, and `drbdadm connect %s:%s` only once no Primary is in sight "+
+			"(LINBIT/drbd#153)", name, dep.Paused, name, dep.Paused)
+	default:
+		return fmt.Sprintf("`drbdadm disconnect %s:%s && drbdadm connect %s:%s`", name, dep.Active, name, dep.Active)
 	}
-
-	return fmt.Sprintf("`drbdadm disconnect %s:%s && drbdadm connect %s:%s`", name, dep.Active, name, dep.Active)
 }
 
 // disconnectPausedPeer drops this node's connection to the peer whose
@@ -764,21 +776,10 @@ func (w *DRBDWorkaroundsRunnable) reconnectActivePeer(
 	w.oweReconnect(logger, res.Name, dep.Active)
 
 	err := w.Adm.DisconnectPeer(ctx, res.Name, dep.Active)
-	if err != nil {
-		w.failed(logger, err, res.Name, "reconnect the peer a resync stalled on")
-
-		return
+	if err == nil {
+		err = w.Adm.ConnectPeer(ctx, res.Name, dep.Active)
 	}
 
-	// With a Primary in sight the connect is safe only while every volume
-	// here is still Inconsistent; a resync from another peer may have
-	// finished since the status was read. Otherwise the connect stays
-	// owed, behind the gate of reconnectOwed.
-	if !res.PrimaryRuledOut() && !w.stillInconsistentSecondary(ctx, logger, res.Name) {
-		return
-	}
-
-	err = w.Adm.ConnectPeer(ctx, res.Name, dep.Active)
 	if err != nil {
 		w.failed(logger, err, res.Name, "reconnect the peer a resync stalled on")
 
@@ -786,21 +787,6 @@ func (w *DRBDWorkaroundsRunnable) reconnectActivePeer(
 	}
 
 	w.settleReconnect(logger, res.Name, dep.Active)
-}
-
-// stillInconsistentSecondary reads the kernel status of name again and
-// reports whether it is still an InconsistentSecondary.
-func (w *DRBDWorkaroundsRunnable) stillInconsistentSecondary(ctx context.Context, logger logr.Logger, name string) bool {
-	resources, err := w.Adm.KernelStatus(ctx)
-	if err != nil {
-		logger.Error(err, "read the DRBD kernel status again before a reconnect", "resource", name)
-
-		return false
-	}
-
-	i := slices.IndexFunc(resources, func(r drbd.KernelResource) bool { return r.Name == name })
-
-	return i >= 0 && resources[i].InconsistentSecondary()
 }
 
 // reconnectPendingPerm is the mode of an owed-reconnect record, the

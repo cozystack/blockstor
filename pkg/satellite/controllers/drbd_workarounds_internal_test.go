@@ -384,19 +384,18 @@ func TestStalledResyncReportsOnlyByDefault(t *testing.T) {
 // alpha.17 reboot test: the paused peer A was a Secondary and the active
 // one the Primary; after the disconnect of A and the reconnect, the
 // returning node became A's SyncSource while the Primary wrote, and A
-// ended up UpToDate with different data. With a Primary at either end,
-// or a peer that is not connected and could be one, the check never
-// drops the paused peer, even opted in. It reconnects the active peer
-// instead: every volume here is Inconsistent, so the handshake can only
-// make this node a SyncTarget.
-func TestStalledResyncWithAPrimaryInSightOnlyReconnectsTheActivePeer(t *testing.T) {
+// ended up UpToDate with different data. The disconnect was not the
+// hazard, the reconnect was. With the active peer Primary, or a peer
+// that is not connected and could be one, the check drops the paused
+// peer from this node, whose volumes are all Inconsistent, and keeps it
+// dropped; it never falls back to the active peer.
+func TestStalledResyncWithAPrimaryInSightOnlyDisconnectsThePausedPeer(t *testing.T) {
 	t.Parallel()
 
 	stall := frozen(1)[0]
 
 	for name, status := range map[string]string{
 		"active Primary":     stallShape{n1Role: "Primary", n2Role: "Secondary", n2Disk: "UpToDate"}.status(stall),
-		"paused Primary":     resyncStatus(stall, "Primary"),
 		"peer not connected": strings.TrimSuffix(resyncStatus(stall, "Secondary"), "]}]") + notConnectedPeer,
 	} {
 		adm := &fakeWorkaroundAdm{status: status}
@@ -406,14 +405,13 @@ func TestStalledResyncWithAPrimaryInSightOnlyReconnectsTheActivePeer(t *testing.
 			w.pass(t.Context(), logr.Discard())
 		}
 
-		want := []string{"disconnect pvc-stall:n1", "connect pvc-stall:n1", "disconnect pvc-stall:n1", "connect pvc-stall:n1"}
-		if !slices.Equal(adm.actions, want) {
+		if want := []string{"disconnect pvc-stall:n2"}; !slices.Equal(adm.actions, want) {
 			t.Errorf("%s: actions = %v, want %v", name, adm.actions, want)
 		}
 
 		evs := drainEvents(recorder)
-		if len(evs) != 2 || !strings.Contains(evs[0], "disconnecting and connecting n1") {
-			t.Errorf("%s: events = %v, want the reconnect of n1 reported on each count", name, evs)
+		if len(evs) == 0 || !strings.Contains(evs[0], "disconnecting n2") {
+			t.Errorf("%s: events = %v, want the disconnect of n2 reported", name, evs)
 		}
 	}
 }
@@ -424,15 +422,17 @@ const notConnectedPeer = `,{"name":"n4","connection-state":"Connecting","peer-ro
    "replication-state":"Off","peer-disk-state":"DUnknown","resync-suspended":"no"}]}]}]`
 
 // A node that is Primary itself, or holds an UpToDate volume of the
-// resource the handshake could make it the SyncSource of, takes no
-// action with a Primary in sight; the report names the hazard.
+// resource, takes no action with a Primary in sight, nor does one whose
+// paused peer is the Primary: the gate of the owed connect cannot read
+// the role of a StandAlone peer. The report names the hazard.
 func TestStalledResyncNeverActsWithAPrimaryInSightFromAConsistentNode(t *testing.T) {
 	t.Parallel()
 
 	active := stallShape{n1Role: "Primary", n2Role: "Secondary", n2Disk: "UpToDate"}.status(frozen(1)[0])
 
 	for name, status := range map[string]string{
-		"local Primary": strings.Replace(resyncStatus(frozen(1)[0], "Secondary"), `"role":"Secondary"`, `"role":"Primary"`, 1),
+		"local Primary":  strings.Replace(resyncStatus(frozen(1)[0], "Secondary"), `"role":"Secondary"`, `"role":"Primary"`, 1),
+		"paused Primary": resyncStatus(frozen(1)[0], "Primary"),
 		"volume UpToDate here": strings.Replace(active, `"devices":[`,
 			`"devices":[{"volume":1,"disk-state":"UpToDate","open":false},`, 1),
 	} {
@@ -456,80 +456,92 @@ func TestStalledResyncNeverActsWithAPrimaryInSightFromAConsistentNode(t *testing
 }
 
 // The paused peer was already tried with no Primary in sight; when the
-// stall shows again with a Primary at the active end and a volume
-// UpToDate here, the fallback reconnect of the active peer is refused
-// too.
-func TestStalledResyncFallbackWaitsForAPrimaryFromAConsistentNode(t *testing.T) {
+// stall shows again with a Primary at the active end, the fallback
+// reconnect of the active peer is refused: on alpha.19 it restarted the
+// resync only for it to stall again at once. That holds whether the
+// volumes here are all Inconsistent or one is UpToDate.
+func TestStalledResyncFallbackWaitsForAPrimary(t *testing.T) {
 	t.Parallel()
 
-	adm := &fakeWorkaroundAdm{}
-	w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
-
-	if got := runResync(t, w, adm, "Secondary", frozen(5)...); !slices.Equal(got, []string{"disconnect pvc-stall:n2"}) {
-		t.Fatalf("actions = %v, want n2 disconnected", got)
-	}
-
-	// n2 is connected back while no Primary is in sight.
-	if got := runResync(t, w, adm, "Secondary", frozen(1)...); !slices.Equal(got, []string{"disconnect pvc-stall:n2", "connect pvc-stall:n2"}) {
-		t.Fatalf("actions = %v, want n2 connected back", got)
-	}
-
-	adm.actions = nil
-	drainEvents(recorder)
-
 	active := stallShape{n1Role: "Primary", n2Role: "Secondary", n2Disk: "UpToDate"}.status(frozen(1)[0])
-	adm.status = strings.Replace(active, `"devices":[`, `"devices":[{"volume":1,"disk-state":"UpToDate","open":false},`, 1)
 
-	for range 4 {
-		w.pass(t.Context(), logr.Discard())
-	}
+	for name, status := range map[string]string{
+		"all Inconsistent": active,
+		"volume UpToDate":  strings.Replace(active, `"devices":[`, `"devices":[{"volume":1,"disk-state":"UpToDate","open":false},`, 1),
+	} {
+		adm := &fakeWorkaroundAdm{}
+		w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
 
-	if len(adm.actions) != 0 {
-		t.Errorf("actions = %v, want none", adm.actions)
-	}
+		if got := runResync(t, w, adm, "Secondary", frozen(5)...); !slices.Equal(got, []string{"disconnect pvc-stall:n2"}) {
+			t.Fatalf("%s: actions = %v, want n2 disconnected", name, got)
+		}
 
-	evs := drainEvents(recorder)
-	if len(evs) != 1 || !strings.Contains(evs[0], "not acting, a Primary is in sight") ||
-		!strings.Contains(evs[0], "`drbdadm disconnect pvc-stall:n1 && drbdadm connect pvc-stall:n1`") {
-		t.Errorf("events = %v, want the fallback refused with the hazard", evs)
+		// n2 is connected back while no Primary is in sight.
+		if got := runResync(t, w, adm, "Secondary", frozen(1)...); !slices.Equal(got, []string{"disconnect pvc-stall:n2", "connect pvc-stall:n2"}) {
+			t.Fatalf("%s: actions = %v, want n2 connected back", name, got)
+		}
+
+		adm.actions = nil
+		drainEvents(recorder)
+
+		adm.status = status
+
+		for range 4 {
+			w.pass(t.Context(), logr.Discard())
+		}
+
+		if len(adm.actions) != 0 {
+			t.Errorf("%s: actions = %v, want none", name, adm.actions)
+		}
+
+		evs := drainEvents(recorder)
+		if len(evs) != 1 || !strings.Contains(evs[0], "not acting, a Primary is in sight") ||
+			!strings.Contains(evs[0], "`drbdadm disconnect pvc-stall:n1 && drbdadm connect pvc-stall:n1`") {
+			t.Errorf("%s: events = %v, want the fallback refused with the hazard", name, evs)
+		}
 	}
 }
 
-// The reconnect of the active peer with a Primary in sight reads the
-// status again before the connect: a resync from another peer that
-// finished in between leaves this node UpToDate, and the connect is left
-// owed to the gate that waits for a Primary to be ruled out.
-func TestStalledResyncWithAPrimaryInSightRereadsTheStatusBeforeConnecting(t *testing.T) {
+// alpha.19 recovery: the disconnect of the paused peer let the resync
+// from the Primary finish at once, and this node came back UpToDate with
+// stale bits toward that peer. The connect of the paused peer waits
+// while the Primary is in sight, and follows once it is gone.
+func TestStalledResyncWithAPrimaryInSightKeepsThePausedPeerDropped(t *testing.T) {
 	t.Parallel()
 
-	shape := stallShape{n1Role: "Secondary", n2Role: "Primary", n2Disk: "UpToDate"}
-	stalled := shape.status(frozen(1)[0])
-	synced := strings.Replace(stalled, `"disk-state":"Inconsistent"`, `"disk-state":"UpToDate"`, 1)
-
-	adm := &fakeWorkaroundAdm{status: stalled}
+	adm := &fakeWorkaroundAdm{status: stallShape{n1Role: "Primary", n2Role: "Secondary", n2Disk: "UpToDate"}.status(frozen(1)[0])}
 	w, recorder := newTestWorkarounds(t, adm, stallConfig(), "pvc-stall")
 
-	for range 4 {
+	for range 5 {
 		w.pass(t.Context(), logr.Discard())
 	}
 
-	adm.next = []string{stalled, synced}
-	w.pass(t.Context(), logr.Discard())
-
-	if want := []string{"disconnect pvc-stall:n1"}; !slices.Equal(adm.actions, want) {
-		t.Fatalf("actions = %v, want n1 disconnected and not connected", adm.actions)
+	if want := []string{"disconnect pvc-stall:n2"}; !slices.Equal(adm.actions, want) {
+		t.Fatalf("actions = %v, want n2 disconnected", adm.actions)
 	}
+
+	drainEvents(recorder)
 
 	adm.actions = nil
-	w.pass(t.Context(), logr.Discard())
+	adm.status = afterStall(`"connection-state":"Connected","peer-role":"Primary"`)
 
-	if len(adm.actions) != 0 {
-		t.Errorf("connected n1 to an UpToDate node with the Primary n2 in sight: %v", adm.actions)
+	for range 3 {
+		w.pass(t.Context(), logr.Discard())
 	}
 
-	evs := drainEvents(recorder)
-	if len(evs) != 2 || !strings.Contains(evs[1], "not connecting again n1") {
-		t.Errorf("events = %v, want the reconnect and then the wait reported", evs)
+	if len(adm.actions) != 0 {
+		t.Errorf("connected n2 with the Primary n1 in sight: %v", adm.actions)
+	}
+
+	if evs := drainEvents(recorder); len(evs) != 1 || !strings.Contains(evs[0], "not connecting again n2") {
+		t.Errorf("events = %v, want the wait reported", evs)
+	}
+
+	adm.status = afterStall(n1Secondary)
+	w.pass(t.Context(), logr.Discard())
+
+	if want := []string{"connect pvc-stall:n2"}; !slices.Equal(adm.actions, want) {
+		t.Errorf("actions once n1 is Secondary = %v, want %v", adm.actions, want)
 	}
 }
 
@@ -866,8 +878,9 @@ func TestStalledResyncLeavesAGrowingOutOfSyncAlone(t *testing.T) {
 // replies held, received and the outstanding count fixed, while the
 // guest kept writing a little: every pass grew out-of-sync. That is a
 // stall, and the report names the one command that is safe with a
-// Primary in sight, the reconnect of the active peer from this
-// Inconsistent node, not the disconnect of the paused peer.
+// Primary in sight, the disconnect of the paused peer from this
+// Inconsistent node, with its connect held off while a Primary is in
+// sight.
 func TestStalledResyncCatchesAStallThePrimaryWritesInto(t *testing.T) {
 	t.Parallel()
 
@@ -893,8 +906,10 @@ func TestStalledResyncCatchesAStallThePrimaryWritesInto(t *testing.T) {
 	evs := drainEvents(recorder)
 	if len(evs) != 1 || !strings.Contains(evs[0], "Warning DRBDResyncStalled") ||
 		!strings.Contains(evs[0], "report-only") ||
-		!strings.Contains(evs[0], "by hand on n3: `drbdadm disconnect pvc-stall:n1 && drbdadm connect pvc-stall:n1`") {
-		t.Errorf("events = %v, want one report-only Warning with the reconnect of n1", evs)
+		!strings.Contains(evs[0], "while n2 waits on it (70 requests outstanding)") ||
+		!strings.Contains(evs[0], "by hand on n3: `drbdadm disconnect pvc-stall:n2`, "+
+			"and `drbdadm connect pvc-stall:n2` only once no Primary is in sight") {
+		t.Errorf("events = %v, want one report-only Warning with the disconnect of n2", evs)
 	}
 }
 

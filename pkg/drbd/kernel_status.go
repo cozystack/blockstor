@@ -167,15 +167,23 @@ func (r *KernelResource) Inconsistent() bool {
 }
 
 // InconsistentSecondary reports whether the resource is Secondary here
-// and every local volume is Inconsistent. Such a node cannot be the
-// SyncSource of a handshake it makes, a resync only ever takes an
-// Inconsistent disk as its target, so a reconnect it runs cannot make it
-// the source of a Secondary while a Primary writes (LINBIT/drbd#153).
+// and every local volume is Inconsistent: no Primary's I/O runs through
+// this node, and it holds nothing a resync could take as its source, a
+// resync only ever targets an Inconsistent disk (LINBIT/drbd#153).
 func (r *KernelResource) InconsistentSecondary() bool {
 	return r.Role == string(RoleSecondary) && len(r.Devices) > 0 &&
 		!slices.ContainsFunc(r.Devices, func(d KernelDevice) bool {
 			return d.DiskState != string(DiskStateInconsistent)
 		})
+}
+
+// PeerPrimary reports whether this node's connection to peer is
+// Connected to a Primary.
+func (r *KernelResource) PeerPrimary(peer string) bool {
+	return slices.ContainsFunc(r.Connections, func(c KernelConnection) bool {
+		return c.Name == peer && c.ConnectionState == string(ConnectionStateConnected) &&
+			c.PeerRole == string(RolePrimary)
+	})
 }
 
 // ResyncDependency is the shape of a resync that can stall on another
@@ -210,6 +218,7 @@ func (r *KernelResource) ResyncDependency() (ResyncDependency, bool) {
 					}
 				case dep.Paused == "" && slices.Contains(strings.Split(peerDevice.ResyncSuspended, ","), "dependency"):
 					dep.Paused = conn.Name
+					dep.PausedOutstanding = peerDevice.Pending + peerDevice.Unacked
 				}
 			}
 		}
@@ -228,18 +237,22 @@ func (r *KernelResource) ResyncDependency() (ResyncDependency, bool) {
 // from Paused waits on it, with how far the resync from Active got.
 // OutOfSync and Received are in KiB; Outstanding is the resync requests
 // and replies of the Active link not completed yet (pending + unacked).
+// PausedOutstanding is the same count on the Paused link: resync
+// requests sent to that peer before it was paused that it never
+// answered, the ones the active resync's replies can defer to.
 // ActiveOnlyCopy is whether Active holds the only UpToDate disk of the
 // volume this node sees, the Paused peer lacking the data too: the shape
 // of an initial sync, where the data exists on its source alone.
 type ResyncDependency struct {
-	Volume         int32
-	Active         string
-	Paused         string
-	PercentInSync  float64
-	OutOfSync      int64
-	Received       int64
-	Outstanding    int64
-	ActiveOnlyCopy bool
+	Volume            int32
+	Active            string
+	Paused            string
+	PercentInSync     float64
+	OutOfSync         int64
+	Received          int64
+	Outstanding       int64
+	PausedOutstanding int64
+	ActiveOnlyCopy    bool
 }
 
 // PrimaryRuledOut reports whether this node can tell that no replica of
