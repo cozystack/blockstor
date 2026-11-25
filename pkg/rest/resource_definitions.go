@@ -1402,12 +1402,19 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// is not refused over them (waitForOnlineReplicasDrained).
 	converged := s.waitForRDTeardown(r.Context(), name)
 
+	writeJSON(w, http.StatusOK, s.rdDeletedAnswer(r.Context(), name, converged, reaped))
+}
+
+// rdDeletedAnswer is the answer of a definition delete that went through:
+// replicas still tearing down when the wait gave up, and the clone
+// snapshot it reaped, follow the success entry.
+func (s *Server) rdDeletedAnswer(ctx context.Context, name string, converged bool, reaped *apiv1.APICallRc) []apiv1.APICallRc {
 	answer := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource definition deleted: " + name,
 	}}
 	if !converged {
-		if pending := s.replicasStillDeleting(r.Context(), name); len(pending) > 0 {
+		if pending := s.replicasStillDeleting(ctx, name); len(pending) > 0 {
 			answer = append(answer, deleteInProgress(name, pending))
 		}
 	}
@@ -1416,7 +1423,7 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 		answer = append(answer, *reaped)
 	}
 
-	writeJSON(w, http.StatusOK, answer)
+	return answer
 }
 
 // rdHasNoSnapshots is handleRDDelete's pre-walk: it refuses, and answers

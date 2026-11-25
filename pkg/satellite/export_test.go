@@ -20,6 +20,7 @@ package satellite
 
 import (
 	"context"
+	"time"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/satellite/intent"
@@ -55,6 +56,14 @@ func (r *Reconciler) RecoverFromBitmapBothDisksForTest(ctx context.Context, dr *
 // replica does.
 func (r *Reconciler) RememberPoolForTest(resourceName, pool string) {
 	r.rememberPool(resourceName, pool)
+}
+
+// SetDemoteRetryForTest replaces the waits of the demote owed after an
+// auto-promote: backoff between the tries right after mkfs, and every,
+// the pacing of later applies' retries (zero retries on every apply).
+func (r *Reconciler) SetDemoteRetryForTest(backoff []time.Duration, every time.Duration) {
+	r.demotes.backoff = backoff
+	r.demotes.every = every
 }
 
 // DrbdGrossKibForTest re-exports the backing size a grow gives a DRBD

@@ -201,13 +201,14 @@ func run() int {
 	ready := newReadyState()
 
 	agent := satellite.NewAgent(satellite.Config{
-		NodeName:               nodeName,
-		StateDir:               stateDir,
-		Providers:              providers,
-		LocalAddress:           localAddress,
-		Logger:                 logger,
-		RESTConfig:             restCfg,
-		ManagerFactory:         mgrFactory(ready, logger, ueventListener, controllerNamespace, streamTLS, opts.resourceWorkers),
+		NodeName:     nodeName,
+		StateDir:     stateDir,
+		Providers:    providers,
+		LocalAddress: localAddress,
+		Logger:       logger,
+		RESTConfig:   restCfg,
+		ManagerFactory: mgrFactory(ready, logger, ueventListener, controllerNamespace, streamTLS,
+			opts.resourceWorkers, opts.workarounds),
 		HealthProbeBindAddress: probeAddr,
 		StreamTLS:              streamTLS,
 		OnCacheSynced: func() {
@@ -255,6 +256,7 @@ func loadRESTConfig() (*rest.Config, error) {
 func mgrFactory(
 	ready *readyState, logger *slog.Logger, ueventListener controllers.UeventNotifier,
 	controllerNamespace string, streamTLS stream.TLSFiles, resourceWorkers int,
+	workarounds controllers.WorkaroundsConfig,
 ) satellite.ManagerFactory {
 	return func(restCfg *rest.Config, nodeName, probeAddr string, rec *satellite.Reconciler) (manager.Manager, error) {
 		mgr, err := controllers.NewManager(restCfg, &controllers.Config{
@@ -273,6 +275,9 @@ func mgrFactory(
 			UeventListener:  ueventListener,
 			StreamTLS:       streamTLS,
 			ResourceWorkers: resourceWorkers,
+			// The DRBD workarounds the LINSTOR-mode plunger sidecar
+			// runs, on by default; see drbd_workarounds.go.
+			Workarounds: workarounds,
 		})
 		if err != nil {
 			return nil, err //nolint:wrapcheck // controllers.NewManager already wraps
