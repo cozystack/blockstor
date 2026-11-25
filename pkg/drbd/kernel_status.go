@@ -93,7 +93,7 @@ func (b *yesNo) UnmarshalJSON(raw []byte) error {
 // KernelStatus reads every DRBD resource the kernel holds in one
 // `drbdsetup status --json` call. A kernel with none reads as empty.
 func (a *Adm) KernelStatus(ctx context.Context) ([]KernelResource, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", "--json")
+	out, err := a.status(ctx, "--json")
 	if err != nil {
 		if isResourceNotLoadedErr(err, out) {
 			return nil, nil
