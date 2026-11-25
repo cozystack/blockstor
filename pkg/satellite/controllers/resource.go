@@ -2256,6 +2256,11 @@ func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov
 
 	r.deleteRetries.reset(res.Name)
 
+	return r.stripSatelliteFinalizer(ctx, res.Name)
+}
+
+// stripSatelliteFinalizer releases the Resource once its storage is gone.
+func (r *ResourceReconciler) stripSatelliteFinalizer(ctx context.Context, name string) (ctrl.Result, error) {
 	// Re-fetch via APIReader (uncached) so we strip ours off the
 	// freshest finalizer list. Falls back to the cached client
 	// when APIReader is nil (unit-test path).
@@ -2263,12 +2268,12 @@ func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov
 
 	var latest blockstoriov1alpha1.Resource
 
-	err = reader.Get(ctx, client.ObjectKey{Name: res.Name}, &latest)
+	err := reader.Get(ctx, client.ObjectKey{Name: name}, &latest)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// Someone else (force-strip from the controller, the
 			// sweeper after a hung apply) finished the delete
-			// already — DeleteResource above was the idempotent
+			// already — the DeleteResource before this was the idempotent
 			// no-op re-issue, nothing more to do.
 			return ctrl.Result{}, nil
 		}
