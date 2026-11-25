@@ -24,7 +24,7 @@ where it's the network leg).
 |-----------------------------|---------------------------------------------------------------------|
 | `["DRBD","STORAGE"]`        | Default. Replicated PVC, the cozystack production case.             |
 | `["LUKS","STORAGE"]`        | Single-replica encrypted PVC. No DRBD overhead.                     |
-| `["DRBD","LUKS","STORAGE"]` | Encrypted at-rest + replicated. Per-volume cipher.                  |
+| `["DRBD","LUKS","STORAGE"]` | Encrypted at-rest + replicated. Per-replica key.                    |
 | `["STORAGE"]`               | Single-replica local mode. Ephemeral cache, scratch, ZFS dataset.   |
 
 The default is `["DRBD","STORAGE"]`, used when neither the RD nor its resource group sets a stack.
@@ -34,7 +34,7 @@ An RD's stack is fixed once and then read only from `RD.Spec.LayerStack`. The RE
 - An RD that holds no data yet gets the group's stack.
 - An RD that already holds data (a replica reported DRBD metadata or a device, or `spec.initialized` is set) keeps `["DRBD","STORAGE"]`, the stack its storage was built with. When that is missing a layer the group asks for, the group's stack is recorded in the `blockstor.org/unapplied-group-layer-stack` annotation and a `LayerStackNotInherited` warning Event is emitted on the RD. Such a volume is not what its group promises (for example, a plaintext volume in a LUKS group); move its data to a new volume to get the group's stack. The controller re-checks every RD with a decided stack each time it reconciles it: the annotation names the group's current stack whenever the RD's stack lacks a layer of it, set by hand or pinned, and goes once the group no longer asks for a missing layer or is deleted. A newly flagged RD gets the same warning Event.
 
-Clones and restores copy bytes, so the RD they create takes the stack those bytes were written under: the source's own, or the default when neither the source nor its group sets one. A source still waiting for the controller to pin its stack is answered 503 (the CLI exits with an error) until it is pinned, and a prepared restore target in the same state is refused the same way before anything is written to it. A copy whose stack is short of what its own group asks for carries the `blockstor.org/unapplied-group-layer-stack` annotation. A clone of a volume-less RD copies no bytes: it takes the source's stack, unless that is the default stack and the source carries the annotation, which is how a stack pinned over data looks. Such a clone, and one of a source with no stack, is left for the controller to pin from its own group.
+Clones and restores copy bytes, so the RD they create takes the stack those bytes were written under: the source's own, or the default when neither the source nor its group sets one. A source still waiting for the controller to pin its stack is answered 503 (the CLI exits with an error) until it is pinned. A prepared restore target (the definition linstor-csi creates in the target class's group before restoring into it) takes the source's stack together with the restore marker, whatever stack it was created with and whether or not its group's stack is decided yet: nothing is on it, and the copy has to be read back through the layers that wrote it. This is how LINSTOR builds the restored resource too, from the snapshot's layer data; unlike LINSTOR, blockstor records that stack on the definition (`docs/cli-parity-known-deltas.md` row 103). A copy whose stack is short of what its own group asks for carries the `blockstor.org/unapplied-group-layer-stack` annotation. A clone of a volume-less RD copies no bytes: it takes the source's stack, unless that is the default stack and the source carries the annotation, which is how a stack pinned over data looks. Such a clone, and one of a source with no stack, is left for the controller to pin from its own group.
 
 Changing a group's stack later never reshapes RDs that already carry one, as in upstream LINSTOR, where the stack is decided when a resource is created.
 
@@ -100,6 +100,18 @@ spec:
     - {volumeNumber: 0, sizeKib: 1048576}
 ```
 
+## What LUKS in this stack actually protects
+
+**At rest, on each node. Not the replication link.**
+
+In `["DRBD","LUKS","STORAGE"]` the satellite hands DRBD the dm-crypt mapper as its lower disk (`maybeLUKS` rewrites the device map before `applyDRBD`, `pkg/satellite/reconciler.go`; `tests/e2e/drbd-luks-stack.sh` asserts the `.res` `disk` line points at `/dev/mapper/<rd>-<vol>-luks`). The mapper is the *plaintext* side of the crypt device. So:
+
+- the pod writes plaintext into `/dev/drbdN`;
+- DRBD replicates **plaintext** to its peers;
+- each node encrypts independently on the way to its own LV/zvol, and only the backing device holds ciphertext.
+
+Anyone who needs the replication traffic protected has to secure it separately; the layer stack does not do it.
+
 ## LUKS specifics
 
 The design is [encryption-keys.md](encryption-keys.md).
@@ -126,6 +138,16 @@ Before this release every LUKS volume was formatted with the one cluster passphr
   with LUKS-over-DRBD instead of DRBD-over-LUKS) aren't yet validated
   or rendered.
 - **Changing a volume's own password**: `linstor vd modify-passphrase` answers 400; a volume keeps the password it was formatted with. Re-keying a header (`luksChangeKey`) is a follow-up.
+- **Per-RD key Secrets**: `ResourceDefinition.spec.encryption.passphraseSecretRef` exists in the CRD but is **not implemented**: nothing reads it, and the RD's replicas get their own passwords wrapped under the cluster master key like those of every other RD. A LUKS-layered RD that sets it gets an `EncryptionKeyIgnored` Condition on each of its Resources saying so:
+
+  ```bash
+  kubectl get resources.blockstor.org -o json \
+    | jq -r '.items[] | select(.status.conditions[]?
+        | select(.type=="EncryptionKeyIgnored" and .status=="True"))
+        | .metadata.name'
+  ```
+
+  It is a Condition and not a refusal on purpose: the field has always been inert, so a live cluster may carry RDs that set it and run fine. Failing their applies would move working volumes to broken ones. Clear the field to silence the Condition.
 - **Mid-stack changes**: editing `layerStack` after a Resource is
   active doesn't re-encrypt or unwrap existing data. Treat it as
   set-once-per-RD until migration support lands.

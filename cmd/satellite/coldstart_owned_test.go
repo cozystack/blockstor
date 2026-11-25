@@ -12,10 +12,13 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 )
@@ -187,5 +190,85 @@ func TestColdStartOwnsAResourceRegisteredInMixedCase(t *testing.T) {
 	orphans, foreign := selectOrphans([]string{"pvc-x"}, map[string]struct{}{}, owned)
 	if !slices.Equal(orphans, []string{"pvc-x"}) || len(foreign) != 0 {
 		t.Errorf("orphans %v, foreign %v; want pvc-x taken down as blockstor's", orphans, foreign)
+	}
+}
+
+var errServiceUnreachable = errors.New("dial tcp 10.96.0.1:443: i/o timeout")
+
+// On a node that has just booted the satellite often starts before the node
+// can reach the API server. The owned list is read again until it answers,
+// instead of giving up on the first failure and leaving the kernel's orphans
+// in place.
+func TestColdStartWaitsForTheAPIServer(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+
+	var failures int
+
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(&blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-a.srv1"},
+			Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-a", NodeName: "srv1"},
+		}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if failures < 2 {
+					failures++
+
+					return errServiceUnreachable
+				}
+
+				return c.List(ctx, list, opts...)
+			},
+		}).
+		Build()
+
+	retry := ownedRetry{attempt: time.Second, first: time.Millisecond, longest: 2 * time.Millisecond}
+
+	owned, err := waitOwnedOnNode(t.Context(), slog.New(slog.DiscardHandler), c, "srv1", retry)
+	if err != nil {
+		t.Fatalf("waitOwnedOnNode: %v", err)
+	}
+
+	if _, ok := owned["pvc-a"]; !ok || len(owned) != 1 {
+		t.Errorf("owned = %v, want [pvc-a] once the API server answers", slices.Sorted(maps.Keys(owned)))
+	}
+
+	if failures != 2 {
+		t.Errorf("%d failed reads before the answer, want 2", failures)
+	}
+}
+
+// A shutdown while the API server is still out of reach ends the wait, and
+// then nothing is known to be blockstor's.
+func TestColdStartStopsWaitingOnShutdown(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+				cancel()
+
+				return errServiceUnreachable
+			},
+		}).
+		Build()
+
+	retry := ownedRetry{attempt: time.Second, first: time.Hour, longest: time.Hour}
+
+	owned, err := waitOwnedOnNode(ctx, slog.New(slog.DiscardHandler), c, "srv1", retry)
+	if err == nil || owned != nil {
+		t.Errorf("waitOwnedOnNode after shutdown = %v, %v; want no list and an error", owned, err)
 	}
 }

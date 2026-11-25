@@ -32,6 +32,11 @@ import (
 type inMemoryResourceDefinitions struct {
 	mu sync.RWMutex
 	m  map[string]apiv1.ResourceDefinition
+
+	// replicas is read before a create: a name whose replicas of an
+	// earlier definition are still being deleted is refused
+	// (RefuseOverDrainingReplicas).
+	replicas *inMemoryResources
 }
 
 // ListUncached has nothing to bypass here: this store is the API server.
@@ -70,9 +75,21 @@ func (s *inMemoryResourceDefinitions) GetUncached(ctx context.Context, name stri
 	return s.Get(ctx, name)
 }
 
-func (s *inMemoryResourceDefinitions) Create(_ context.Context, rd *apiv1.ResourceDefinition) error {
+func (s *inMemoryResourceDefinitions) Create(ctx context.Context, rd *apiv1.ResourceDefinition) error {
 	if rd == nil {
 		return errors.New("nil ResourceDefinition")
+	}
+
+	if s.replicas != nil {
+		replicas, err := s.replicas.ListByDefinition(ctx, rd.Name)
+		if err != nil {
+			return err
+		}
+
+		err = RefuseOverDrainingReplicas(rd.Name, replicas)
+		if err != nil {
+			return err
+		}
 	}
 
 	s.mu.Lock()

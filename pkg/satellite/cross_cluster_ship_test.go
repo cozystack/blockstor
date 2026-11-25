@@ -104,7 +104,7 @@ func (*crossClusterFakeProvider) SendSnapshot(_ context.Context, _ storage.Snaps
 	return io.NopCloser(strings.NewReader("")), nil
 }
 
-func (f *crossClusterFakeProvider) RecvSnapshot(_ context.Context, _ storage.Volume, src io.Reader) error {
+func (f *crossClusterFakeProvider) RecvSnapshot(_ context.Context, _ storage.Volume, _ storage.Snapshot, src io.Reader) error {
 	_, _ = io.ReadAll(src)
 
 	f.mu.Lock()

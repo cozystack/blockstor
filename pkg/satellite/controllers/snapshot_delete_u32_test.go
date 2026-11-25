@@ -59,7 +59,7 @@ func TestU32_SnapshotDeleteIdempotentRetryUntilBackingGone(t *testing.T) {
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "ccu3-u32.snap",
-			Finalizers:        []string{controllers.SatelliteSnapshotFinalizer},
+			Finalizers:        []string{controllers.SnapshotNodeFinalizer("n1")},
 			DeletionTimestamp: &now,
 		},
 		Spec: blockstoriov1alpha1.SnapshotSpec{
@@ -120,7 +120,7 @@ func TestU32_SnapshotDeleteIdempotentRetryUntilBackingGone(t *testing.T) {
 	// the backend tear-down actually succeeds — never reaped with the LV
 	// still on disk.
 	got := getSnapU32(t, cli, "ccu3-u32.snap")
-	if !slices.Contains(got.Finalizers, controllers.SatelliteSnapshotFinalizer) {
+	if !slices.Contains(got.Finalizers, controllers.SnapshotNodeFinalizer("n1")) {
 		t.Fatalf("U32: finalizer stripped on a FAILED delete — CRD would vanish "+
 			"with the backing LV still present; finalizers=%v", got.Finalizers)
 	}
@@ -146,7 +146,7 @@ func TestU32_SnapshotDeleteIdempotentRetryUntilBackingGone(t *testing.T) {
 	// Finalizer MUST now be stripped — the backend object is gone, so the
 	// apiserver can finalise the CRD and the snapshot name is reusable.
 	got = getSnapU32(t, cli, "ccu3-u32.snap")
-	if got != nil && slices.Contains(got.Finalizers, controllers.SatelliteSnapshotFinalizer) {
+	if got != nil && slices.Contains(got.Finalizers, controllers.SnapshotNodeFinalizer("n1")) {
 		t.Errorf("U32: finalizer still present after the backing was freed — "+
 			"name not reusable; finalizers=%v", got.Finalizers)
 	}

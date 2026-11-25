@@ -70,7 +70,7 @@ func TestAResourceGroupEditReachesTheLocalReplicasOfItsDefinitions(t *testing.T)
 		Config: Config{NodeName: "node-1"},
 	}
 
-	reqs := r.enqueueResourcesForRG(t.Context(), rg)
+	reqs := r.enqueueLocalForGroup(t.Context(), rg)
 
 	names := make([]string, 0, len(reqs))
 	for _, req := range reqs {

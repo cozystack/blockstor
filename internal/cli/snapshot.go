@@ -449,6 +449,12 @@ func restoreIntoExistingTarget(
 ) error {
 	rdName := args.toResource
 
+	// No definition to restore into: its predecessor is still draining
+	// replicas, and the refusal names their nodes.
+	if store.IsReplicasDraining(createErr) {
+		return fmt.Errorf("restore %s onto %s: %w", snap.Name, rdName, createErr)
+	}
+
 	existing, err := run.Store.ResourceDefinitions().Get(ctx, rdName)
 	if err != nil {
 		return fmt.Errorf("get resource definition %s: %w", rdName, err)
@@ -467,8 +473,8 @@ func restoreIntoExistingTarget(
 		return finishRestoreLeftover(ctx, run, existing.Name, snap, progress)
 	}
 
-	// A layer stack that is not the source's, or replicas still being
-	// deleted, refuse here, before the marker goes on a definition that is
+	// Replicas still being deleted, or a source whose stack is not decided
+	// yet, refuse here, before the marker goes on a definition that is
 	// the operator's; see store.PreparedRestoreTarget.
 	prepared, err := store.PreparedRestoreTarget(ctx, run.Store, &existing, snap)
 	if err != nil {

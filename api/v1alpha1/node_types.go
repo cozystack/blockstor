@@ -130,6 +130,14 @@ type NodeStatus struct {
 	// +optional
 	LastHeartbeatTime *metav1.Time `json:"lastHeartbeatTime,omitempty"`
 
+	// satelliteIncarnation identifies the satellite process now running
+	// on this node; every satellite start picks a new one. A Resource
+	// whose status.satelliteIncarnation differs was last reported by an
+	// earlier process, so its state predates the restart and is not
+	// shown. Written by the satellite heartbeat; do not hand-set.
+	// +optional
+	SatelliteIncarnation string `json:"satelliteIncarnation,omitempty"`
+
 	// conditions represents the current state of the Node resource.
 	// The well-known `Ready` condition (status=True when the satellite
 	// is healthy, Unknown when its heartbeat is stale, False when the

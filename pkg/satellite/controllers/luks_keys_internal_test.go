@@ -342,7 +342,7 @@ func TestLUKSRefusalsAreWarningEvents(t *testing.T) {
 		r := &ResourceReconciler{Config: Config{Recorder: recorder}}
 
 		message := errors.Wrap(tc.err, "luks volume 0").Error()
-		r.recordPerResourceFailures(res, []*intent.ResourceApplyResult{{Name: "pvc-1", Message: message}}, logr.Discard())
+		_, _ = r.recordPerResourceFailures(res, []*intent.ResourceApplyResult{{Name: "pvc-1", Message: message}}, logr.Discard())
 
 		select {
 		case ev := <-recorder.Events:

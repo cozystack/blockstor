@@ -141,6 +141,14 @@ const warnStoragePoolNotFound = maskWarn | int64(2055)
 // filters can match the whole class with `(ret_code & 0xFFFE) >= 2048`.
 const warnSnapshotNotFound = maskWarn | int64(2056)
 
+// warnDeleteInProgress is the second entry of a replica or definition
+// delete answer when a replica is still there once the answer is due: its
+// satellite has not confirmed yet that the replica's storage is gone, and the
+// replica stays, flagged DELETE, until it does. LINSTOR's answer to the same
+// situation is a warning too; nothing is removed early to make the answer
+// look finished.
+const warnDeleteInProgress = maskWarn | int64(2061)
+
 // warnNoSatelliteConnection is emitted as a SECOND envelope entry on
 // `POST /v1/nodes` when the node was created in the controller's view
 // of the cluster but no satellite has registered itself for the named
@@ -206,6 +214,18 @@ const warnNodeAlreadyGone = maskWarn | int64(2060)
 // already cluster together. The MASK_ERROR bit is OR'd in by the
 // envelope wrapper at the call site.
 const apiCallRcFailSnapshotFinalizerStuck int64 = 998
+
+// apiCallRcFailUnknownError mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_UNKNOWN_ERROR` (`998 | MASK_ERROR`), the code its REST
+// layer gives an error the flux carries without one of its own, as a
+// snapshot take aborted on a timeout or a disconnected satellite does. A
+// snapshot create answers a failed take with it.
+const apiCallRcFailUnknownError int64 = 998
+
+// apiCallRcFailSnapshotNotUpToDate mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_SNAPSHOT_NOT_UPTODATE` (`979 | MASK_ERROR`), the code a
+// snapshot create ends with when a targeted replica is not UpToDate.
+const apiCallRcFailSnapshotNotUpToDate int64 = 979
 
 // apiCallRcFailSnapshotsNotSupported mirrors upstream LINSTOR's
 // `ApiConsts.FAIL_SNAPSHOTS_NOT_SUPPORTED` (`994 | MASK_ERROR`).

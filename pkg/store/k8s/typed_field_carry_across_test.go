@@ -248,10 +248,14 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 		// copied by the store at Create (snapshots.go::sourceLUKSKeys)
 		// with no wire counterpart; Update carries them across, and the
 		// CRD refuses to change them once set.
+		// AbortReason is the controller's record of an aborted take,
+		// with no wire counterpart; dropping it would let the
+		// orchestration freeze I/O again for a take that is over.
 		mustCarryAcross: map[string]bool{
 			"SuspendIO":    true,
 			"TakeSnapshot": true,
 			"LUKSKeys":     true,
+			"AbortReason":  true,
 		},
 	},
 	"PhysicalDeviceSpec": {
