@@ -305,7 +305,7 @@ func onNoQuorum(show *drbdsetupShowResource) string {
 // quorumStatus reads `drbdsetup status <res> --json`; nil when the kernel
 // does not have the resource.
 func (a *Adm) quorumStatus(ctx context.Context, resource string) (*drbdsetupStatusResource, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		if isResourceNotLoadedErr(err, out) {
 			return nil, nil //nolint:nilnil // a resource the kernel does not have has nothing to recheck
