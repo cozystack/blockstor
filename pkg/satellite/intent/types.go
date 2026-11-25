@@ -434,6 +434,14 @@ type DesiredVolume struct {
 	// volume, where they override the resource-scope disk section.
 	DiskOptions map[string]string
 
+	// DeviceSizeKib is the largest DRBD device size, in KiB, any replica
+	// of the definition reports for this volume; 0 when none reports
+	// one. A new lower disk must hold at least this much: the kernel
+	// refuses to attach a disk smaller than the device the resource
+	// already exposes, and a volume adopted from LINSTOR exposes a few
+	// KiB more than its definition.
+	DeviceSizeKib int64
+
 	// AppliedSizeKib is the size this replica last finished applying
 	// (Resource status), 0 when none was reported. While it is below
 	// SizeKib a grow is still pending here: the satellite grows the
@@ -451,6 +459,16 @@ func (x *DesiredVolume) GetDiskOptions() map[string]string {
 	}
 
 	return x.DiskOptions
+}
+
+// GetDeviceSizeKib returns the largest DRBD device size any replica
+// reports for this volume, or 0.
+func (x *DesiredVolume) GetDeviceSizeKib() int64 {
+	if x == nil {
+		return 0
+	}
+
+	return x.DeviceSizeKib
 }
 
 // GetAppliedSizeKib returns the size last applied on this replica, or 0.

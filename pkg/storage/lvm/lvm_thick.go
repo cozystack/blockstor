@@ -21,7 +21,6 @@ package lvm
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -96,7 +95,7 @@ func (t *Thick) CreateVolume(ctx context.Context, vol storage.Volume) error {
 		}
 	}
 
-	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
+	size := storage.SizeArg(vol.SizeKib)
 
 	// Skip the optional zero-on-create step (-Wn -Zn) — the satellite
 	// container has no udev daemon, and the wipe trips on the missing
@@ -106,7 +105,7 @@ func (t *Thick) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	// `--config activation{…}` would be a repeated `--config`, which
 	// the LVM CLI rejects.
 	_, err = t.exec.Run(ctx, "lvcreate",
-		ArgsUdevless("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
+		ArgsUdevless("--size", size,
 			"--name", fresh,
 			"-Wn", "-Zn",
 			t.cfg.VolumeGroup)...)
@@ -150,10 +149,10 @@ func freshLVName(final string) string {
 // which the LVM CLI rejects ("Option --config may not be repeated."),
 // so lvextend never ran and the resize hot-looped forever.
 func (t *Thick) ResizeVolume(ctx context.Context, vol storage.Volume) error {
-	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
+	size := storage.SizeArg(vol.SizeKib)
 
 	_, err := t.exec.Run(ctx, "lvextend",
-		ArgsUdevless("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
+		ArgsUdevless("--size", size,
 			t.cfg.VolumeGroup+"/"+volumeLVName(vol))...)
 	if err != nil {
 		return errors.Wrapf(err, "lvextend %s", volumeLVName(vol))
@@ -374,7 +373,7 @@ func (t *Thick) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Vo
 		return errors.Wrapf(err, "lvs %s for restore-size lookup", srcName)
 	}
 
-	sizeMiB := max(srcStatus.UsableKib/mibPerKib, 1)
+	size := storage.SizeArg(srcStatus.UsableKib)
 
 	// lvcreate carries `--addtag` inline (Bug 257): the sentinel is set
 	// in the same LVM transaction that allocates the LV, so a crash
@@ -383,7 +382,7 @@ func (t *Thick) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Vo
 	// Same udev-less satellite workaround as CreateVolume; Bug 305:
 	// ArgsUdevless folds it into the single device-filter `--config`.
 	_, err = t.exec.Run(ctx, "lvcreate",
-		ArgsUdevless("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
+		ArgsUdevless("--size", size,
 			"--name", tgtName,
 			"--addtag", RestoreIncompleteTag,
 			"-Wn", "-Zn",

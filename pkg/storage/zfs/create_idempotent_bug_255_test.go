@@ -70,7 +70,7 @@ func TestThickCreateIdempotentSkipStillEnsuresRefreservation(t *testing.T) {
 
 	// `zfs create` MUST NOT be issued on the idempotent-skip path.
 	for _, line := range fx.CommandLines() {
-		if strings.HasPrefix(line, "zfs create ") {
+		if strings.HasPrefix(line, "zfs create ") && !strings.Contains(line, " -n ") {
 			t.Errorf("idempotent skip must NOT re-issue `zfs create`; got %q", line)
 		}
 	}

@@ -43,9 +43,10 @@ const (
 var errNoDeviceSize = errors.New("no size")
 
 // growGrossKib is the backing a grow to growPendingNewKib extends to:
-// the size plus DRBD's internal metadata, in whole MiB.
+// the size plus DRBD's internal metadata, which the provider rounds up
+// to its allocation unit.
 func growGrossKib() int64 {
-	return (satellite.DrbdGrossKibForTest(growPendingNewKib) + 1023) / 1024 * 1024
+	return satellite.DrbdGrossKibForTest(growPendingNewKib)
 }
 
 // growFixture is one replica of a 2 GiB volume whose LV holds lvKib,
@@ -164,7 +165,7 @@ func TestApplyGrowsBackingThatHeldOnlyTheNetSize(t *testing.T) {
 	lines, _ := gf.pass(t)
 
 	want := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size " +
-		strconv.FormatInt(growGrossKib()/1024, 10) + "MiB vg/" + growPendingRD + "_00000"
+		strconv.FormatInt(growGrossKib(), 10) + "k vg/" + growPendingRD + "_00000"
 	if got := linesWithPrefix(lines, "lvextend "); !slices.Equal(got, []string{want}) {
 		t.Fatalf("lvextend calls: %v, want %q", got, want)
 	}

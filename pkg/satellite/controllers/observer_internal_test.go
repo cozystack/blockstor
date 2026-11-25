@@ -2769,3 +2769,48 @@ func TestObserverSyncSourceStampDoesNotDowngradeRealFrame(t *testing.T) {
 			syncSourceEv.Volumes)
 	}
 }
+
+// TestObserverPublishesDeviceSize: the `size:` token of a device frame
+// (KiB, printed under --statistics --full) lands on Status.Volumes as
+// deviceSizeKib, a later frame without it keeps the cached size, and a
+// device with no size yet (neither attached nor connected) reports
+// nothing. The controller sizes a replica's new lower disk from the
+// largest size any replica publishes, so a diskless replica of a volume
+// adopted from LINSTOR must report the 20971528 KiB its peers agreed on.
+func TestObserverPublishesDeviceSize(t *testing.T) {
+	obs, ok := translateDeviceEvent(drbd.Event{
+		Action: "exists",
+		Kind:   eventKindDevice,
+		Fields: map[string]string{
+			"name": "pvc-s", "volume": "0", "minor": "1047",
+			"disk": "Diskless", "client": "no", "quorum": "yes",
+			"size": "20971528", "read": "0", "written": "0",
+		},
+	})
+	if !ok || len(obs.Volumes) != 1 || obs.Volumes[0].DeviceSizeKib != 20971528 {
+		t.Fatalf("device frame with size:20971528: got %+v", obs.Volumes)
+	}
+
+	unsized, _ := translateDeviceEvent(drbd.Event{
+		Action: "exists",
+		Kind:   eventKindDevice,
+		Fields: map[string]string{"name": "pvc-s", "volume": "0", "disk": "Diskless", "size": "0"},
+	})
+	if unsized.Volumes[0].DeviceSizeKib != 0 {
+		t.Fatalf("size:0 must not be published; got %d", unsized.Volumes[0].DeviceSizeKib)
+	}
+
+	o := &ObserverRunnable{}
+	o.mergeVolumes(&obs)
+
+	frame := observation{
+		ResourceName: "pvc-s",
+		Volumes:      []volumeObservation{{VolumeNumber: 0, DiskState: "Inconsistent"}},
+	}
+	o.mergeVolumes(&frame)
+
+	status := buildObserverVolumeStatus(&frame, "data")
+	if len(status) != 1 || status[0].DeviceSizeKib != 20971528 {
+		t.Fatalf("status after a frame without size: got %+v, want deviceSizeKib 20971528", status)
+	}
+}
