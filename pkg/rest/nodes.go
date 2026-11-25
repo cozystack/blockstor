@@ -32,6 +32,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -1559,6 +1560,20 @@ func storeErrorRc(err error, kind storeResourceKind) (int, apiv1.APICallRc) {
 	case errors.Is(err, store.ErrNotFound):
 		return http.StatusNotFound, apiv1.APICallRc{
 			RetCode: apiCallRcError | notFoundSubCodeForKind(kind),
+			Message: scrubImplDetails(err.Error()),
+		}
+	case errors.Is(err, drbd.ErrInsufficientPeerSlots):
+		// LINSTOR refuses the replica with FAIL_INSUFFICIENT_PEER_SLOTS
+		// instead of letting DRBD fail on a peer it has no bitmap for.
+		return http.StatusBadRequest, apiv1.APICallRc{
+			RetCode: apiCallRcError | apiCallRcFailInsufficientPeerSlots,
+			Message: scrubImplDetails(err.Error()),
+			Cause:   "a replica keeps one bitmap per DRBD peer slot, and every peer with a disk takes one",
+			Correc:  "Configure a higher peer slot count on the resource definition or controller",
+		}
+	case errors.Is(err, drbd.ErrInvalidPeerSlots):
+		return http.StatusBadRequest, apiv1.APICallRc{
+			RetCode: apiCallRcError,
 			Message: scrubImplDetails(err.Error()),
 		}
 	case errors.Is(err, store.ErrLayerStackUndecided):

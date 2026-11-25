@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/propwhitelist"
@@ -184,6 +185,10 @@ func (s *Server) handleRDGet(w http.ResponseWriter, r *http.Request) {
 // pre-existing RDs created before the inheritance fix, and the CLI
 // would still render an empty cell for them otherwise.
 //
+// The DRBD entry carries the definition's peer slots in its `data`, where
+// LINSTOR reports them (`DrbdResourceDefinitionLayer.peer_slots`); a
+// definition without a recorded count has 15.
+//
 // Idempotent: a non-nil rd.LayerData (e.g. populated by a future
 // satellite-side enrichment) is left untouched.
 func stampRDLayerDataFromStack(rd *apiv1.ResourceDefinition) {
@@ -202,10 +207,25 @@ func stampRDLayerDataFromStack(rd *apiv1.ResourceDefinition) {
 
 	out := make([]apiv1.ResourceLayer, 0, len(stack))
 	for _, kind := range stack {
-		out = append(out, apiv1.ResourceLayer{Type: kind})
+		layer := apiv1.ResourceLayer{Type: kind}
+		if kind == apiv1.LayerKindDRBD {
+			layer.Data = map[string]any{"peer_slots": rdPeerSlots(rd)}
+		}
+
+		out = append(out, layer)
 	}
 
 	rd.LayerData = out
+}
+
+// rdPeerSlots is the peer-slot count new replicas of rd get: the recorded
+// one, or the 15 a definition without one was created with.
+func rdPeerSlots(rd *apiv1.ResourceDefinition) int {
+	if rd.PeerSlots > 0 {
+		return int(rd.PeerSlots)
+	}
+
+	return drbd.LegacyPeerSlots
 }
 
 // stampRDEffectiveProps populates rd.EffectiveProps with the merged
@@ -342,6 +362,15 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 	// handleRDCreate), so a single seed covers RG-spawn, rd-create,
 	// and the linstor-csi CreateVolume hot path.
 	seedAutoQuorumDefaults(&rd)
+
+	// The peer slots the definition's replicas get, resolved now as
+	// LINSTOR resolves them when it creates the definition's DRBD layer.
+	err = store.ResolvePeerSlots(r.Context(), s.Store, &rd, body.DrbdPeerSlots)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
 
 	err = s.Store.ResourceDefinitions().Create(r.Context(), &rd)
 	if err != nil {
@@ -1077,6 +1106,10 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.refuseRDPeerSlotsModify(w, r, name, patch.DrbdPeerSlots) {
+		return
+	}
+
 	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), name,
 		func(rd *apiv1.ResourceDefinition) error { return applyRDModify(rd, &patch, rgChange) })
 	if errors.Is(err, store.ErrRollbackStepMarkKept) {
@@ -1189,7 +1222,54 @@ func applyRDModify(rd *apiv1.ResourceDefinition, patch *resourceDefinitionModify
 		rd.ResourceGroupName = rgChange
 	}
 
+	// The count new replicas get; the replicas already there keep the
+	// one their metadata was created with, as in LINSTOR.
+	if patch.DrbdPeerSlots > 0 {
+		rd.PeerSlots = patch.DrbdPeerSlots
+	}
+
 	return nil
+}
+
+// refuseRDPeerSlotsModify answers an `rd modify --peer-slots` LINSTOR
+// refuses: a count no superblock holds, or one too low for the replicas
+// with a disk the definition already has, keeping a slot for one more
+// (drbd.CheckPeerSlotCount). True means the caller may go on.
+func (s *Server) refuseRDPeerSlotsModify(w http.ResponseWriter, r *http.Request, name string, peerSlots int32) bool {
+	if peerSlots == 0 {
+		return true
+	}
+
+	err := drbd.ValidatePeerSlots(int64(peerSlots))
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	replicas, err := s.Store.Resources().ListByDefinition(r.Context(), name)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	diskful := 0
+
+	for i := range replicas {
+		if !isDisklessReplica(&replicas[i]) {
+			diskful++
+		}
+	}
+
+	err = drbd.CheckPeerSlotCount(int(peerSlots), diskful)
+	if err != nil {
+		writeStoreError(w, errors.Wrapf(err, "resource definition %q", name))
+
+		return false
+	}
+
+	return true
 }
 
 // markAndCascadeRDDelete flags the definition DELETE and stamps the

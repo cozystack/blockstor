@@ -326,7 +326,12 @@ func spawnDefinition(ctx context.Context, run *runContext, group *apiv1.Resource
 		def.Props = store.TravellingProps(group.Props)
 	}
 
-	err := run.Store.ResourceDefinitions().Create(ctx, def)
+	err := resolvePeerSlots(ctx, run, def)
+	if err != nil {
+		return err
+	}
+
+	err = run.Store.ResourceDefinitions().Create(ctx, def)
 	if err != nil {
 		return fmt.Errorf("create resource definition %s: %w", rdName, err)
 	}

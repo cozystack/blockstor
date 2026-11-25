@@ -42,7 +42,7 @@ func roundUp(kib, unit int64) int64 {
 func TestInternalMetadataSizesMatchAdoptedLinstorVolume(t *testing.T) {
 	t.Parallel()
 
-	geometry := drbd.DefaultGeometry().WithMaxPeers(linstorPeerSlots)
+	geometry := drbd.GeometryForPeerSlots(linstorPeerSlots)
 
 	gross := drbd.InternalMetadataGrossKiB(gib20KiB, geometry)
 	if gross != 20976040 {
@@ -66,7 +66,7 @@ func TestInternalMetadataSizesMatchAdoptedLinstorVolume(t *testing.T) {
 func TestInternalMetadataNetMatchesKernelOnBareVolume(t *testing.T) {
 	t.Parallel()
 
-	net := drbd.InternalMetadataNetKiB(gib20KiB, drbd.DefaultGeometry())
+	net := drbd.InternalMetadataNetKiB(gib20KiB, drbd.GeometryForPeerSlots(drbd.LegacyPeerSlots))
 	if net*sectorsPerKiB != 41923768 {
 		t.Fatalf("data area of a 20 GiB disk with 15 peer slots: got %d sectors, want 41923768",
 			net*sectorsPerKiB)
@@ -82,7 +82,7 @@ func TestInternalMetadataGrossHoldsItsNet(t *testing.T) {
 	sizes := []int64{4, 64, 1000, 1024, 4093, 32768, 1 << 20, 1<<20 + 4, gib20KiB, gib20KiB + 8, 1 << 30, 3<<30 + 12}
 
 	for peers := 1; peers <= drbd.MetadataMaxPeerSlots; peers++ {
-		geometry := drbd.DefaultGeometry().WithMaxPeers(peers)
+		geometry := drbd.GeometryForPeerSlots(peers)
 
 		for _, net := range sizes {
 			gross := drbd.InternalMetadataGrossKiB(net, geometry)
@@ -100,7 +100,7 @@ func TestInternalMetadataGrossHoldsItsNet(t *testing.T) {
 func TestInternalMetadataActivityLog(t *testing.T) {
 	t.Parallel()
 
-	base := drbd.DefaultGeometry()
+	base := drbd.GeometryForPeerSlots(drbd.LegacyPeerSlots)
 	wide := base
 	wide.ALStripes = 4
 

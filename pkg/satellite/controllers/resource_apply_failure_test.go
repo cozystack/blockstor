@@ -19,6 +19,7 @@ limitations under the License.
 package controllers
 
 import (
+	"strconv"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -115,5 +116,69 @@ func TestGrowPendingRequeues(t *testing.T) {
 
 	if !growPending([]*intent.ResourceApplyResult{{Ok: true}, {Ok: true, GrowPending: true}}) {
 		t.Error("a pass that left a grow short of its device was not repeated")
+	}
+}
+
+// TestRecordMetadataPeerSlots: the count a pass read from the replica's
+// superblock is published once for the controller to record; a pass
+// that read nothing leaves the status alone, and a count already there
+// is not rewritten.
+func TestRecordMetadataPeerSlots(t *testing.T) {
+	t.Parallel()
+
+	const (
+		node   = "n-slots"
+		rdName = "pvc-slots"
+	)
+
+	res := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName + "." + node},
+		Spec:       blockstoriov1alpha1.ResourceSpec{NodeName: node, ResourceDefinitionName: rdName},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(newToggleDiskTestScheme(t)).
+		WithObjects(res).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		Build()
+
+	reconciler := &ResourceReconciler{Client: cli, Config: Config{NodeName: node}}
+
+	read := func() *blockstoriov1alpha1.Resource {
+		t.Helper()
+
+		var got blockstoriov1alpha1.Resource
+
+		err := cli.Get(t.Context(), client.ObjectKey{Name: res.Name}, &got)
+		if err != nil {
+			t.Fatalf("get Resource: %v", err)
+		}
+
+		return &got
+	}
+
+	for _, pass := range []struct {
+		read int32
+		want string
+	}{
+		{0, "unset"},
+		{7, "7"},
+		{15, "7"},
+	} {
+		err := reconciler.recordMetadataPeerSlots(t.Context(), read(), []*intent.ResourceApplyResult{
+			{Name: rdName, NodeName: node, Ok: true, MetadataPeerSlots: pass.read},
+		})
+		if err != nil {
+			t.Fatalf("record: %v", err)
+		}
+
+		got := "unset"
+		if v := read().Status.MetadataPeerSlots; v != nil {
+			got = strconv.Itoa(int(*v))
+		}
+
+		if got != pass.want {
+			t.Errorf("after a pass that read %d: got %s, want %s", pass.read, got, pass.want)
+		}
 	}
 }
