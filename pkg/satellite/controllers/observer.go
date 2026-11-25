@@ -2860,6 +2860,16 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 		changed = true
 	}
 
+	mergeHelperFieldsInto(&merged, incoming)
+
+	cache[incoming.VolumeNumber] = merged
+
+	return changed
+}
+
+// mergeHelperFieldsInto carries the fields the cache keeps for its own
+// readers rather than for Status, so they never mark the volume changed.
+func mergeHelperFieldsInto(merged, incoming *volumeObservation) {
 	// BackingDev is carried in the cache (so the snapshot the backfill
 	// reads has the lower-disk path) but never marks the volume
 	// `changed` on its own — it is an internal helper field, not a
@@ -2874,10 +2884,6 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 	if incoming.Open != "" {
 		merged.Open = incoming.Open
 	}
-
-	cache[incoming.VolumeNumber] = merged
-
-	return changed
 }
 
 // mergeDeviceSizeInto takes the device size a frame carried; a frame
