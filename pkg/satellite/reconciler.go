@@ -3377,7 +3377,7 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 	// view catches up for free via the connection handshake once a
 	// diskful peer resizes; it does NOT need a local `drbdadm resize`.
 	// Pinned by TestApplyDisklessReplicaSkipsResizeFanout.
-	if resized {
+	if resized && r.deviceShortOfDefinition(ctx, dr) {
 		// Bug 395 (P1, data integrity): gate `--assume-clean` on whether
 		// the backing provider zero-fills the grown region. For thick
 		// `LVM` (non-zero-fill) we MUST omit `--assume-clean` so DRBD
