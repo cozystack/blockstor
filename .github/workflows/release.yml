@@ -143,9 +143,12 @@ jobs:
           # the multi-arch image index as annotations.
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
+          # VERSION is spelt as the cli job spells it, so the binaries
+          # of one release log the same version.
           build-args: |
             GIT_HASH=${{ steps.stamp.outputs.git_hash }}
             BUILD_TIME=${{ steps.stamp.outputs.build_time }}
+            VERSION=${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
           provenance: false
 
       - name: Export digest

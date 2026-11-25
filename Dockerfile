@@ -40,13 +40,19 @@ COPY . .
 # tarball build).
 ARG GIT_HASH=sha-build-arg-missing
 ARG BUILD_TIME
+# VERSION is the release the image is built for, logged by every binary
+# at start-up (`blockstor_version`). The release workflow passes the tag;
+# a dev build keeps version.go's `0.0.0-dev`.
+ARG VERSION=0.0.0-dev
 ENV LDFLAGS="-X github.com/cozystack/blockstor/pkg/version.LinstorGitHash=${GIT_HASH} \
              -X github.com/cozystack/blockstor/pkg/version.GitCommit=${GIT_HASH} \
+             -X github.com/cozystack/blockstor/pkg/version.Version=${VERSION} \
              -X github.com/cozystack/blockstor/pkg/version.LinstorBuildTime=${BUILD_TIME}"
 RUN if [ -d .git ]; then GIT_HASH=$(git rev-parse HEAD 2>/dev/null || echo "${GIT_HASH}"); fi; \
     BUILD_TIME=${BUILD_TIME:-$(date -u +%FT%TZ)}; \
     LDFLAGS="-X github.com/cozystack/blockstor/pkg/version.LinstorGitHash=${GIT_HASH} \
              -X github.com/cozystack/blockstor/pkg/version.GitCommit=${GIT_HASH} \
+             -X github.com/cozystack/blockstor/pkg/version.Version=${VERSION} \
              -X github.com/cozystack/blockstor/pkg/version.LinstorBuildTime=${BUILD_TIME}"; \
     CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -ldflags "${LDFLAGS}" -o controller ./cmd/controller && \
     CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -ldflags "${LDFLAGS}" -o apiserver  ./cmd/apiserver && \
