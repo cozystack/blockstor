@@ -4,6 +4,418 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0-alpha.22 — 2026-11-25
+
+Pre-release for testing the LINSTOR adoption. It is built from main, which carries the same pull requests as for alpha.21, and from the open pull requests #273, #314, #315, #325, #326, #327, #328 and #329 that are not merged into main yet, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.21; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.21
+
+- **Every `drbdsetup status` call is bounded (#327).** A status read that gets no answer within 30 s fails with `ErrStatusTimeout` naming the command, so a resource whose receivers deadlock on its bitmap lock no longer stalls the satellite's passes over every other resource; mutating commands stay unbounded.
+- **A peer DRBD refuses for its smaller disk is reported (#328).** When a replica holds data on a device larger than a diskful peer's and the connection is not up, the pass fails with a `PeerDiskTooSmall` Warning Event and `status.applyFailure` naming each peer, the volume and both sizes, and is retried with the usual back-off.
+- **A port handover is a wait, not a failure (#329).** A refusal over a DRBD address whose previous owner has no live replica on the node is retried on the short timer with no ApplyFailed Warning unless it lasts more than a minute.
+- **A clean satellite shutdown logs no error (#329).** The snapshot stream server's `http.ErrServerClosed` is treated as a clean stop.
+- **A new replica is sized with the peer slots it is stamped (#325).** The satellite applies the whole Resource it re-reads uncached instead of only its DRBD ids, so the lower disk and the metadata are sized from the same count and the device no longer comes out larger than the definition.
+- **A restore into a larger definition grows its clone for the slots it gets (#325).** The grow sizes the metadata for the replica's own count while create-md has not run yet, so the restored replica matches its blank peer instead of being 64 KiB larger on 256 MiB and refused by DRBD.
+- **The superblock's peer slots are read only for metadata the satellite did not create (#325).** A count the satellite created metadata with or read is kept per volume and reported instead of reading the disk again on every pass.
+- **The definition delete and the satellite apply are back under the lint limits (#326).** No behaviour change.
+- **The volume removal's quorum recheck and the kernel-wide status read are bounded too (integration of #273 and #314 with #327).**
+- **An absent `suspended-user` flag reads as not suspended in the volume removal's quorum recheck (integration of #273 with main).**
+- **The Resource CRD matches its Go types again (integration of #315 with main).** The descriptions of `mayPromote` and `promotionScore` are regenerated.
+
+## v0.4.0-alpha.21 — 2026-11-24
+
+Pre-release for testing the LINSTOR adoption. It is built from main, which now carries #192, #271, #275, #278, #286, #287, #291, #292, #293, #295, #298, #299, #301, #302, #305, #310, #313, #316, #319, #321, #322, #323 and #324, and from the open pull requests #273, #314, #315 and #325 that are not merged into main yet, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.20; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.20
+
+- **A per-definition key Secret that is not read is flagged (#192).** A ResourceDefinition that sets `spec.encryption.passphraseSecretRef` gets an `EncryptionKeyIgnored` Condition on its Resources naming the Secret and the key actually in use, since its volumes are still encrypted with the cluster passphrase; the Condition follows the Secret the definition names now.
+- **`vd set-passphrase` no longer stores a key nothing reads (#192).** The per-volume key used to be written in cleartext into the definition's props and never used; the door now answers 501 and stores nothing. Keys earlier releases wrote stay until purged with the recipe in `docs/layer-stack.md`.
+- **The cluster passphrase cannot be rotated while LUKS volumes exist (#192).** `PUT /v1/encryption/passphrase` answers 409 naming the volumes, since the headers stay locked with the old key and the volumes would stop opening at the next reboot, re-attach or resize.
+- **A new volume rounds up to its pool's allocation unit (#321).** A zvol is created at the pool's volblocksize and an LV is given its size in KiB for LVM to round to the extent, as LINSTOR does, instead of to whole MiB, so a replica blockstor creates matches the size of LINSTOR's replicas of the same volume.
+- **A placement the peer slots cannot hold is refused whole (#325).** Autoplace, spawn and a multi-node resource create check every replica of the request together, as LINSTOR does in one transaction, so replicas that could never attach are no longer created.
+- **An adopted replica's peer slots are read from its superblock (#325).** A replica adopted by a linstor-migrate that predates the count reports the slots its DRBD metadata was created with instead of 15, and a replica that had a node id before counts were recorded is stamped with the 15 it was made with.
+- **toggle-disk checks the replica's own peer slots (#325).** A witness stamped with fewer slots than its definition now has is checked against its own count, and the node is matched by key.
+- **A grow keeps the device at its definition's size (#325).** The satellite sizes the metadata of a grow for the slots the superblock holds, never below 15 for a replica whose count is not recorded, so a 7-slot volume no longer grows past its definition.
+- **A volume definition modify answers once the cache shows it (#315).** The answer waits, within the delete paths' budget, until this replica's cache holds the props and size the modify wrote, so linstor-csi no longer reads back props it just removed.
+- **A resource group delete counts its definitions from the API server (#315).** linstor-csi deletes a storage class's group right after its last volume, and the informer cache could still list the definition just removed, which left the group behind for good.
+- **make-available waits at most 45 s in all (#315).** The dual-Primary wait now ends no later than the build and ready waits, so a call that creates the migration target stays inside the minute csi-attacher gives it.
+- **The stall breaker flag help says it disconnects with a Primary in sight, and the idle-Primary check says it demotes a forced Primary (#314).**
+- **A replica records the peer slots its superblock holds and retries the stamp if it fails (integration of #325 with main).** The satellite stamps `status.metadataPeerSlots` after an apply pass, and a stamp that did not land is retried like the other post-apply stamps.
+- **The Resource CRD matches its Go types again (integration of #315 with main).** The descriptions of `mayPromote` and `promotionScore` are regenerated.
+
+## v0.4.0-alpha.20 — 2026-11-24
+
+Pre-release for testing the LINSTOR adoption. It is built from main, which now carries #283 next to the pull requests merged before alpha.19, and from the open pull requests #271 to #325 that are not merged into main yet, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.19; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.19
+
+- **DRBD peer slots follow LINSTOR (#325).** A new definition resolves its peer-slot count the way LINSTOR does (the request, the group's `peer_slots`, `PeerSlotsNewResource` on the definition, group and controller, else 7), each replica copies it, metadata is created with `create-md --max-peers` of that count and the lower disk is sized for it; definitions and replicas created before keep reading as 15, so nothing already deployed changes.
+- **A replica the peer slots cannot hold is refused (#325).** Resource create, toggle-disk, migrate-disk, autoplace and the CLI answer `FAIL_INSUFFICIENT_PEER_SLOTS` instead of creating a replica DRBD cannot connect; diskless replicas take no slot, and node ids now run up to 31.
+- **`rd c --peer-slots`, `rg spawn --peer-slots` and `rg modify --peer-slots` are accepted (#325).** `rd modify --peer-slots` changes the count for replicas created afterwards and is refused when it is too low for the replicas with a disk already there.
+- **linstor-migrate carries the peer slots (#325).** Each definition keeps the count of its DRBD layer, each replica the count its metadata was created with, and each resource group its `--peer-slots`; a definition LINSTOR never created a DRBD layer for gets what LINSTOR would resolve for it.
+- **A departed peer's slot is forgotten by its kernel node-id (#323).** The stale-slot prune removes the connection with `drbdsetup del-peer <res> <node-id>` and then runs `forget-peer`, as LINSTOR's satellite does; drbdadm could not resolve a peer the `.res` no longer names, so the connection stayed, the slot was never forgotten and a replica later given that node-id inherited the departed one's flags.
+- **A stalled resync the Primary keeps writing into is reported (#314).** Out-of-sync that grows counts as a stall when the resync itself shows no traffic, so a resync stopped with its replies held no longer goes unreported while the guest writes.
+- **Under a Primary the stall breaker drops the paused peer (#314).** With a Primary in sight the one action, taken only from a Secondary whose volumes are all Inconsistent, is the disconnect of the paused peer; the connect stays owed until no Primary is in sight, a paused peer that is itself the Primary is left to the operator, and acting still needs `--drbd-workaround-stalled-resync-act`.
+- **A pool delete is refused only over the snapshot copies in that pool (#271).** A copy whose pool is recorded refuses only the delete of its own pool, as LINSTOR does, and a copy with no pool recorded yet still counts for every diskful pool of the node.
+- **A retried pass of a replica runs at normal priority (#298).** Only a replica's first pass keeps the bring-up rank, also when that pass ended in a recovered panic.
+- **`rd d` on the REST door names the replicas still deleting only while the cache lags (integration of #310 with main).** The teardown wait passes on whether the cache caught up, as in alpha.19.
+
+## v0.4.0-alpha.19 — 2026-11-24
+
+Pre-release for testing the LINSTOR adoption. It is built from main, which now carries #280, #281, #282, #297, #311 and #312 next to the pull requests merged before alpha.18, and from the open pull requests #271 to #324 that are not merged into main yet, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.18; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.18
+
+- **A bitmap refusal never takes a resource down (#323).** When `drbdadm adjust` fails with `Can not drop the bitmap when both sides have a disk`, the satellite drops and forgets only the stale slots of the node-ids the error names, and only for a connection that is not Connected, then adjusts again; it no longer runs `drbdadm down` and `up`, which could demote an in-use Primary or detach the last UpToDate copy.
+- **A deleted peer's metadata slot is forgotten (#323).** The kernel-slot prune runs `forget-peer` after `del-peer`, as LINSTOR's satellite does, so a witness that inherits the node-id of a deleted diskful replica no longer starts as Outdated.
+- **A recovery left half way is retried (#323).** A diskless peer the kernel still reads as Inconsistent or Outdated after a refused adjust is no longer taken for an operator's disconnect, so the next adjust is a full one and runs the recovery again.
+- **`r c` takes over a witness on the node (#323).** The CLI turns a diskless or TIE_BREAKER replica into the requested one, as the REST door does, waits for a witness being deleted within the REST door's bound, and still refuses over a diskful replica.
+- **A definition is not created over the replicas of a deleted one (#310).** While a replica of the same name is still being deleted, REST `rd c`, spawn, clone and restore answer 409 with FAIL_EXISTS_RSC_DFN naming the nodes still draining, and the CLI create and restore fail the same way, as LINSTOR keeps a definition flagged DELETE until its satellites confirm.
+- **`rd d` on the REST door answers once the reachable replicas are torn down (#310).** The wait is read past the cache and bounded at twenty seconds, and replicas on an offline node are not waited for.
+- **The controller neither elects nor seeds from a replica being deleted (#310).** A replica with a deletion timestamp or the DELETE flag is left out of the initial UpToDate election and of the seed generation pick.
+- **A device grows only when its definition grows (#321).** A replica added to a volume whose lower disks are exactly the definition gets a larger lower disk but no `drbdadm resize`, so it no longer fails with `Resize not allowed during resync` or grows the volume.
+- **A lower disk the kernel refuses to attach is grown before the attach (#321).** A replica an older satellite created at the definition's size grows its lower disk, and under LUKS its mapper, while the kernel holds it Diskless, without resizing the device; the LUKS data offset is read from the header.
+- **A snapshot abort orders its resume even when a status stamp fails (#324, #292).** A failed IOSuspended stamp no longer stops the pass before the abort, and a failure of the pass itself is reported ahead of the stamp error.
+- **A take that already ended gets no suspend window (#292).** A satellite opens no window for a snapshot whose take carries an abort record or an outcome flag, and closes one it still holds.
+- **A lost snapshot stamp stays out of the error log (#316).** A snapshot status stamp that ran out of retries, and a delete-failure stamp that lost its race, are retried at V(1) like any other conflict.
+- **A resource group edit is counted once (integration of #275 with #295).** The satellite watches ResourceGroups once, so a group change reaches the local replicas as a configuration change.
+
+## v0.4.0-alpha.18 — 2026-11-23
+
+Pre-release for testing the LINSTOR adoption. It is built from main, which now carries #285, #290, #309, #317 and #318 next to the pull requests merged before alpha.17, and from the open pull requests #271 to #321 that are not merged into main yet, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.17; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.17
+
+- **A diskless attach stays diskless once the place count is met (#285).** A diskless replica in use is promoted to diskful only while the volume's live diskful replicas, on nodes that are neither EVICTED nor LOST, number fewer than its resource group's place count, so a pod or VM moving onto a node without a replica no longer copies the whole volume there.
+- **A definition held by a placement comes back when the hold runs out (#318).** The definition reconciler counts the latest live placement hold among its witness deadlines, so a placement that dies before it removes its hold no longer leaves two diskful replicas without a witness for good.
+- **A new lower disk is sized for DRBD metadata the way LINSTOR sizes it (#321).** The satellite creates a lower disk at the data area plus the internal metadata for 15 peer slots, the data area being the definition or the largest DRBD device any replica reports, so a replica added to a volume adopted from LINSTOR can attach its disk instead of failing with `Low.dev. smaller than requested DRBD-dev. size`.
+- **Every replica reports its DRBD device size (#321).** The observer publishes `size:` from events2 as `status.volumes[].deviceSizeKib`, and the dispatcher hands the largest one to the replica being applied.
+- **A LUKS layer gets room for its header (#321).** The storage volume under LUKS carries the 16 MiB LUKS2 header on top of what the layer above needs, as LINSTOR sizes it, so a LUKS volume without DRBD exposes the size requested and one under DRBD is no longer 16 MiB short.
+- **Volume sizes round up to whole MiB (#321).** The LVM and ZFS providers round a size up instead of truncating it, as LINSTOR rounds up to the allocation unit.
+- **A grow that stays inside a lower disk sized for metadata still resizes the device (#321 with #281).** The grow step also starts when the definition passes what the volume holds while the lower disk is larger than the definition, and grows the lower disk to hold the largest reported device.
+- **A replica that cannot attach its disk shows as faulty (#321).** `r l` counts a replica meant to have a disk that reports Diskless as faulty, and shows it as `AttachFailed` once the toggle-disk retry counter is above zero.
+- **Release images build each arch on a native runner (#309).** The merge job refuses to finish unless both linux/amd64 and linux/arm64 are in the index.
+- **The release attaches the blockstor CLI for linux, darwin and windows (#319).** Each release carries the six binaries and a `SHA256SUMS` file, with the tag stamped into the binary.
+- **A lost node is dropped from the snapshots it had a copy of (#271).** `node lost` removes the node from each Snapshot's node list and per-node status and deletes a Snapshot whose only copy was there, so a Snapshot no longer stays terminating for good during a rolling upgrade.
+- **A resize no longer waits on a replica cut off from a diskful peer (#281).** DRBD caps such a grow at the last agreed size, so the wait skips the replica and names it in a `WARN_NOT_CONNECTED` entry, as for an offline satellite; peers are matched by node key.
+- **Only a later snapshot waits for an earlier one on a node (#282).** A snapshot refused because a later one holds the resource fails on that node instead of waiting, unless the later one is already taking, so two snapshots of one resource can no longer freeze I/O on two nodes until both abort.
+- **A block size release that loses a race is retried quietly (#287).** A 409 Conflict requeues the definition at V(1) instead of logging `Reconciler error` at ERROR, the sweep goes on past it, the tenth lost race in a row is logged at the default level, and the count of a deleted definition is dropped.
+- **Group, config, node and pool changes reach replicas already up (#295).** With the periodic re-check gone, the satellite watches ResourceGroups, the ControllerConfig, Nodes, corev1 InternalIPs and StoragePools and passes the local replicas that render them, so `linstor rg drbd-options` and `linstor controller drbd-options` reach the `.res` again.
+- **A replica whose kernel resource is gone answers with no state (#302).** A replica destroyed on a node that stays up reads Unknown with a blank Usage and is listed by `--faulty` and `?faulty=true`, as linstor-client shows it against LINSTOR, also when the node list cannot be read.
+- **A stale KernelLoaded=False no longer hides a healthy replica (#302).** The condition counts as a departure only while the stored status has no disk state and no peer link left.
+- **A stalled resync is reported, not acted on, unless asked (#314).** The check now emits the drbdadm commands an operator would run; `--drbd-workaround-stalled-resync-act` turns the action back on, and it then connects again only the peer it dropped, with `drbdadm connect <res>:<peer>`, and only while this node is Secondary and every other link is Connected to a Secondary.
+- **A reconnect the workaround owes survives a failed connect and a restart (#314).** The debt is recorded before either disconnect, names its peers, is kept in a `.reconnect-pending` file in the state dir and is removed with the resource.
+- **make-available takes over a witness placed during the call (#315).** A create that finds a replica already on the node reads it again and runs the update path, as LINSTOR decides under its lock, instead of answering 409.
+- **Every reconciler retries a lost race quietly (#316).** The satellite StoragePool and PhysicalDevice reconcilers and the controller migration, snapshot, node, node heartbeat, node label sync, state projection release, auto-diskful, resource group and rebalance reconcilers now requeue a 409 Conflict at V(1) as well.
+- **A pool probe finds a deleted volume's snapshot on ZFS (integration of #271 with main).** The probe that records which pool holds a node's snapshot copy now looks under the zvol a delete renamed too, so a restore after the source delete is not refused for want of a pool.
+- **A snapshot abort orders its resume even when a status stamp fails, and a satellite opens no suspend window for a take that already ended (integration of #282 with #292).**
+
+## v0.4.0-alpha.17 — 2026-11-23
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #316 except #285 and #309, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.16; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.16
+
+- **A stalled resync is broken on the paused peer first (#314).** After the configured stalled passes the satellite disconnects the peer that `resync-suspended:dependency` paused, which releases the resync requests the active peer's replies defer to, and `drbdadm adjust` connects it again on the next pass; the plunger's reconnect of the active peer follows only if the same stall comes back.
+- **Slow and growing stalls count as stalled (#314).** A pass is stalled when out-of-sync fell by less than the floor, or when the active link holds exactly as many outstanding requests as before with almost nothing received; `--drbd-workaround-stalled-resync-min-rate` sets the floor (200 KiB/s), and a thin or `csums-alg` resync is left alone.
+- **Breaking a stall keeps a Primary's data and quorum (#314).** No link is dropped that would leave a Primary without an UpToDate disk, or while another configured connection of the node is down, and the active-peer fallback skips a late-added volume next to a Primary.
+- **The satellite says at start which DRBD workarounds run (#314).** One INFO line lists the interval and every check, or says why they are disabled, and a pass logs whether it read the kernel status only when that changes.
+- **blockstor serves linstor-csi v1.13 and advertises REST API 1.29.0 (#315).** Truncate, `delete_empty_resource_definition`, `auto_manage_dual_primary`, `unmake-available`, regular expressions in name filters, `props` filters and the REST 1.28 toggle-disk body are served; database export, API tokens, the drbd-reactorctl passthrough, DRBD client replicas and clone `volume_sizes` answer 501. The reported LINSTOR version is 1.35.0 and golinstor moves to v0.65.4.
+- **A VM live migration gets its dual Primary from the controller (#315).** make-available with `auto_manage_dual_primary` opens `allow-two-primaries` and protocol C on the one connection between source and target and answers once both satellites applied it (10 s at most), and unmake-available puts it back and removes the diskless attachment; refusals carry LINSTOR's codes.
+- **Resource connections have props of their own (#315).** They live on the definition, the satellite renders their `DrbdOptions/Net/*` keys into that connection's `net` section, and `linstor resource-connection list`, `set-property` and `drbd-peer-options` work on them.
+- **A deleted volume with snapshots no longer leaves its definition behind (#315).** Truncate and snapshot delete with `delete_empty_resource_definition` remove a definition left with neither a replica nor a snapshot, also on a retry, and a snapshot delete limited to some nodes is refused with 501 instead of being widened.
+- **Node and resource lists honour their filters (#315).** The node list filters by name and props, so a volume is no longer accessible on every node and a topology segment no longer spans the cluster, and the resource view honours `storage_pools`.
+- **A local pool's `free_space_mgr_name` is LINSTOR's `node;pool` (#315).** linstor-csi v1.13 took every pool for shared storage before.
+- **Every failure code is LINSTOR's (#315).** Codes that carried blockstor's own numbers, among them duplicate creates that carried none, now match golinstor's, which linstor-csi relies on to tell a lost create race from a failure.
+- **The DRBD layer carries a promotion score (#315 with #278).** The resource view always sends `promotion_score` and `may_promote`, derived from the reported disk states until a satellite has reported the kernel's, so linstor-csi's volume health no longer reports every volume unhealthy.
+- **A new volume reports its device path and counts against its pool from the start (#315 with #278 and #291).** A volume read waits up to 10 s for the satellite to report the device path before it answers without one, and the STORAGE layer carries the volume's size, so `overProvision` no longer offers a pool's full size again for each volume.
+- **A clone, snapshot or restore does not carry a live migration (#315).** What the migration wrote on the source is reverted on the copy, and the controller no longer turns a migration target's diskless attachment into a diskful replica.
+- **A write that lost an optimistic-concurrency race is retried quietly (#316).** The satellite Resource and Snapshot reconcilers and the controller Resource and ResourceDefinition reconcilers requeue a 409 Conflict at V(1) instead of logging `Reconciler error` at ERROR, and the tenth conflict in a row on one object is logged at the default level.
+- **A definition deleted mid-pass ends the pass quietly (#316).** A tiebreaker step that finds its definition gone or being deleted no longer logs an error.
+- **Device discovery no longer probes zvols (#316).** The zvol filter runs before the signature probes, so a zvol destroyed during a scan no longer fails `wipefs` with ENOENT and every scan runs four commands less per zvol.
+
+## v0.4.0-alpha.16 — 2026-11-23
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #314 except #285 and #309, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.15; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.15
+
+- **The satellite runs the DRBD workarounds the LINSTOR-mode plunger sidecar ran (#314).** It reconnects the peer a resync stalled on (LINBIT/drbd#149), demotes a Primary nobody uses, takes down and up a Secondary nobody uses that still fails I/O, and detaches loop devices whose backing file is gone; nothing on disk is touched.
+- **Each workaround has its own flag (#314).** `--drbd-workaround-stalled-resync`, `--drbd-workaround-idle-primary`, `--drbd-workaround-forced-io-failures` and `--drbd-workaround-stale-loop-devices` are on by default, `--drbd-workaround-stalled-resync-passes` sets how many unchanged passes make a stall, and `--drbd-workarounds-interval` (30 s) set to `0` turns all of them off.
+- **The workarounds cost an idle node no command (#314).** A pass reads `drbdsetup status --json` only when the events2 observer's cache shows a Primary with no volume open, an Inconsistent volume or a resource failing I/O; loop devices are read from sysfs and replicas from the informer cache.
+- **A workaround acts only on a replica blockstor owns and nothing else is changing (#314).** It skips a replica being deleted, a resource an apply or delete holds, a volume whose open state the kernel does not report, and a replica that is the only UpToDate disk a connected Primary peer reaches; an apply that starts meanwhile waits for the workaround to finish.
+- **Every workaround action is a Warning Event (#314).** `DRBDResyncStalled`, `DRBDIdlePrimary`, `DRBDForcedIOFailures` and `DRBDWorkaroundUpFailed` land on the replica's Resource and `StaleLoopDevice` on the Node; an up that fails after a down is retried by every pass until it goes through.
+- **A replica promoted for mkfs is demoted even when the first demote fails (#314).** The satellite records the demote it owes before the promote and drops the record only once a demote went through, also across a restart; a device held open for a moment is waited for, and later applies retry every 30 seconds without failing.
+- **The demote after a failed mkfs is owed the same way (#314 with #269).** A replica whose mkfs was refused or failed is demoted at once, and a demote that does not go through then is retried by a later apply instead of leaving the replica Primary.
+
+## v0.4.0-alpha.15 — 2026-11-22
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #313 except #285 and #309, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.14; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.14
+
+- **A `DrbdOptions/*` property LINSTOR's whitelist refuses is refused before it is stored (#313).** Every REST door that stores properties and the native CLI's `set-property` and `drbd-options` check the key against the object it is set on and the value against the key's rule, and answer LINSTOR's `FAIL_INVLD_PROP` with nothing stored; a typo such as `DrbdOptions/AutoSnapshot/Keep` no longer reaches every satellite's `.res`.
+- **blockstor's own DrbdOptions keys stay settable (#313).** `AutoAddQuorumTiebreaker` on the controller, definitions and groups, and `TcpPortRange` and `MinorNrRange` on nodes, are accepted with a value their reader can parse.
+- **An accepted boolean is stored the way LINSTOR stores it (#313).** `Yes` becomes `yes` for a yes/no option and `No` or `FALSE` becomes `false` for a true/false key, so a capitalised value no longer drops out of the `.res` or reads as unset.
+- **`drbd-options --after-resync-source` and `--disconnected` are gone (#313).** LINSTOR does not whitelist those handlers, so the flags could only fail.
+- **Upgrade note (#313).** A StorageClass parameter or a group property that linstor-csi sends with every provisioning and that the whitelist refuses fails each new PVC after the upgrade; check them before upgrading.
+- **The satellite leaves out of the `.res` every option drbdadm would refuse (#275).** A key under a section no `.res` block takes, or with a nested option name, is dropped, and net, resource options and peer-device options are now held against this node's `drbdsetup xml-help` like the disk sections; handlers are kept only if LINSTOR whitelists them.
+- **Each option left out is a Warning Event `DrbdOptionIgnored` on the Resource (#275).** The rest of the configuration keeps applying, instead of every replica of the definition reporting `ApplyFailed` until the key is deleted.
+- **A failed `drbdsetup xml-help` read is retried after a minute (#275).** A node whose drbdsetup cannot describe its options renders unchecked, as before, without running the failing calls on every render.
+- **The solo-promote forces primary only on a replica born as the only copy (#312).** A replica left `Inconsistent` and peerless while its definition is deleted during the initial sync, or after its sync source went, is no longer declared `UpToDate`; the satellite records a solo birth before `create-md` and spends it on the first promote, the way LINSTOR's `createPrimary` is a one-shot.
+- **The dispatcher tells a replica it is being deleted or is not alone (#312).** A deletion timestamp or DELETE flag on the replica or its definition, or a diskful replica on another node in any state, keeps the solo-promote from firing.
+
+## v0.4.0-alpha.14 — 2026-11-22
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #311 except #285 and #309, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.13; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.13
+
+- **A volume deleted during its initial sync can be deleted (#310).** linstor-csi's DeleteVolume removed the sync source first and the last complete copy was then refused for good; the mid-sync guard is now lifted when the definition carries DELETE, or when balancing is off on it and no replica is InUse, which is the state DeleteVolume waits for.
+- **The mid-sync guard still protects a volume that stays (#310).** A single `r d` of the last complete copy next to a syncing replica is still refused, a replica being deleted no longer counts as a source for the others, and a store error reading the definition refuses the delete instead of letting it through.
+- **`rd d` flags the definition DELETE before it deletes the replicas (#310).** The tiebreaker reconciler leaves a definition so flagged alone, so no witness is added and removed between replica deletes, the way LINSTOR does it.
+- **`r d` naming several nodes deletes the incomplete replicas first (#310).** Naming the sync source before the replica syncing from it is no longer refused over a peer the same command was about to delete.
+- **The encryption state is served from name-limited watches (#311).** The controller's master-key pass and every apiserver's resource view no longer read the ControllerConfig and the keyring and passphrase Secrets from the API server on an idle cluster; whatever decides a write still reads the API server.
+- **The controller and apiserver Secret Roles gain `list` and `watch` under the same `resourceNames` (#311).** A chart that renders these Roles itself needs the two verbs too; without them the reads fall back to one get per derivation, and the watches pick the verbs up within five minutes once granted.
+- **The controller no longer stores `Unknown` over an offline node's replicas (#302).** It used to claim `Status.DrbdState` with forced ownership, which conflicted with every write of a rebooted satellite and left replicas `Unknown` while the kernel had them UpToDate; it now only releases a claim an earlier version took, and reads answer such replicas with no state, as before.
+- **`sync-status` follows LINSTOR's rule (#302).** Diskless replicas and tiebreakers are skipped and a replica with no current state counts as synced, so a definition with a tiebreaker no longer answers `false` for good and piraeus-operator's evacuation is not stalled by it.
+- **The State column of `kubectl get resources.blockstor.org` shows the satellite's last report (#302).** It is not live for a node that is down; `linstor r l` and the REST reads give the live state.
+
+## v0.4.0-alpha.13 — 2026-11-22
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #308 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.12; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.12
+
+- **A placement of several diskful replicas gets no tiebreaker while it writes them (#303).** The placer stamps a per-placement hold on the definition before its first create and removes it when done, so the tiebreaker reconciler no longer reads the first two of three replicas as an even split and puts a witness on the node the third is for; a hold left by a process that died runs out after one minute.
+- **`linstor r c` of two or more diskful replicas holds the tiebreaker the same way (#303).** A single replica, or a diskful one next to a diskless one, writes no hold.
+- **The controller comes back for a definition when its placement hold runs out (#303, #308).** The witness deadline requeue also reads the placement hold, so a witness held back by a placement that never removed its stamp is added once the stamp expires.
+- **A StandAlone connection the kernel dropped over a peer's stale options is reconnected (#299).** Before adjusting with `--skip-net` the satellite reads the plan of a full adjust and keeps the peer disconnected only when the plan would do nothing but connect it, as for an operator's `drbdadm disconnect`; otherwise it runs the full adjust.
+- **A peer reconnected that way is reported (#299).** The satellite logs it and emits a Warning Event `StaleConnectionReconnected` on the Resource, and the troubleshooting page describes the case.
+- **An out-of-sync count that only drifts no longer causes a status write (#297).** On an UpToDate volume of a replica that is neither SyncSource nor SyncTarget, a change that keeps `outOfSyncKib` non-zero waits for the next write the replica needs or five minutes at the latest; a change to or from zero and every change during a resync is written at once.
+- **A volume's `outOfSyncKib` is the largest count over its peers (#297).** It used to be the count of whichever peer's frame came last, which flipped between zero and a count on every statistics frame of a replica in sync with one peer but not another.
+
+## v0.4.0-alpha.12 — 2026-11-22
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #308 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.11; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.11
+
+- **A scheduled rebalance no longer reads a settled definition past the cache (#280).** A definition whose diskful replicas already reach its group's place count is skipped from the cache, so an idle controller no longer sends kube-apiserver a burst of GETs and LISTs every five minutes; the reads past the cache stay for a definition that is short of its place count.
+- **A gated rebalance pass adds no diskless replicas to a definition that has its diskful ones (#280).** With `DisklessOnRemaining` on a group, the scheduled tick and RG events leave a full definition alone, as LINSTOR's balance task does.
+- **A diskful replica without a storage pool waits up to 30 seconds for one instead of failing its first apply (#299).** The wait leaves no `ApplyFailed` Warning and counts no failed attempt, so a fresh replica whose pool lands a moment later no longer fires an alert during normal provisioning.
+- **A diskful replica still without a pool after 30 seconds fails with a message that says how to fix it (#299).** It names `linstor r td <node> <rd> --storage-pool <pool>` and `StorPoolName` on the resource definition, and no volume of the replica is created while any of its volumes has no pool.
+
+## v0.4.0-alpha.11 — 2026-11-22
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #308 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.10; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.10
+
+- **A converged replica no longer gets a full satellite pass every 10 seconds (#295).** A replica waits for its next event, and a node-wide `drbdadm sh-list-adjustable` run every 30 seconds passes the replicas whose kernel state drifted from their configuration; with a drbdadm older than 9.32 the drift check is off, with an error in the log.
+- **Work a satellite pass puts off asks for a pass of its own (#295).** The stuck-slot grace, the late-add stall dwell, the recovery-promote throttle, a failed best-effort step and a failed status stamp after the apply bring the replica back when they are due, where they used to wait for the periodic re-check.
+- **A kernel wake-up the trigger channel has no room for is kept, not dropped (#295).** It waits in a set with one entry per replica, and a frame whose replica name could not be read wakes the replica on the next identical frame.
+- **A connected peer's role change wakes the local replica (#295).** The mkfs retry and the recovery and late-add promotes, which wait for a Primary peer to step down, now run as soon as it does.
+- **The satellite reads a volume's GI only while it can move (#305).** The resync skips the `drbdsetup get-gi` of a volume whose GI was read and has left day0, or is day0 with no Primary replica, so an idle node runs no drbdsetup for it.
+- **The controller no longer re-reads every resource definition every 5 seconds (#308).** A settled definition waits for its next event; a node that joins or changes its type or `AutoplaceTarget`, a group's creation or deletion, a witness deadline, a deferred witness create and a failed resize-pending stamp bring it back.
+- **A tiebreaker is re-added on a node only after the survivors dropped their connection to the replica deleted there (#307).** The survivors' `drbdadm adjust` no longer fails with `(174) Already exists` for 30 seconds after a replica is deleted from a three-node definition; the connections an OFFLINE survivor last reported do not count.
+- **A satellite removes a peer's old connection when the peer comes back under a new node-id (#307).** The old connection goes with `drbdsetup del-peer` by node-id before the adjust, unless it is Connected.
+- **A definition flagged DELETE gets no tiebreaker (#307).** Witness management stops for it, as for a definition with a deletion timestamp.
+- **A snapshot restore onto a node answers once the restored replica is built (#291).** The replay of a finished restore waits the same way, so linstor-csi's attach after CreateVolume finds the device path instead of backing off for about 30 seconds.
+- **A snapshot delete waits for slow satellites that are online, instead of answering 504 after 10 seconds (#306).** A satellite that fails to delete its copy records the error, and the delete answers it with HTTP 500; only a node that is offline or unknown still ends the wait with 504.
+- **Unclean metadata on a volume with no recorded GI is no longer re-created (#279).** When its superblock names this replica's node id the satellite applies the activity log and keeps it; otherwise the apply is refused with a Warning Event `UncleanMetadataRefused` that names `drbdadm apply-al` and `drbdadm wipe-md` as the ways out.
+- **Metadata repaired from an open activity log is left out of the GI seed of a first activation (#279).** The generation a replica went down with is no longer overwritten by a peer's GI or a skipped initial sync.
+
+## v0.4.0-alpha.10 — 2026-11-21
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #306 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.9; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.9
+
+- **The satellite reads a replica's GI from the kernel, not from its backing device (#305).** The observer's resync asks `drbdsetup get-gi`, which opens no device, so it no longer sets off a change uevent and a disk rescan per replica every 5 seconds; a replica without a peer, or whose kernel read fails, is still read with drbdmeta.
+- **A deleted volume's definition is removed even when its snapshot delete was retried (#306).** The per-definition snapshot list reads past the informer cache, and a retried snapshot delete that finds the snapshot gone answers once the local cache agrees.
+- **An events2 dump that never sends its end line no longer hides the node's replicas (#297).** Once the stream has been quiet for ten seconds the observer writes what the dump said, replays the changes held behind it and writes no replica as gone until the end line comes; later dump lines no longer override newer frames.
+- **The pass after a dump writes every replica's status before any KernelLoaded Condition (#297).** A restarted satellite shows its replicas again sooner, and the log says how long that pass took.
+- **A TieBreaker whose disk probe fails or whose slot is gone is not detached (#299).** Only a replica toggled from diskful, whose volume is still reclaimed from a pool, is detached after a probe that failed without saying why.
+
+## v0.4.0-alpha.9 — 2026-11-21
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #304 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.8; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.8
+
+- **A three-replica spawn no longer comes up with a TieBreaker in place of its third replica (#303).** The placer takes over a witness the tiebreaker reconciler grew on the target node during the placement, deciding on the live replica; a witness being deleted is not promoted and the placement reports one replica short.
+- **A wait for the controller's stamp is no longer a failed apply (#299).** A new replica held for its DRBD node id or `SkipInitialSync` stamp leaves no `ApplyFailed` Warning, does not grow the back-off and does not count as a toggle-disk attempt; a wait past a minute leaves one `WaitingForController` Warning.
+- **A replica without a disk is not detached (#299).** The apply detaches only a volume that shows an attached local disk, so a TieBreaker whose kernel resource was taken down no longer gets an `ApplyFailed` Warning.
+- **The DRBD identity allocator no longer holds its lock across the writes (#300).** It reads the definition before the lock, chooses and reserves values under it and writes after; a minor write that lost to another writer is retried on a fresh read instead of leaving the replica without a minor.
+- **The block size decision reads only the definition's replicas (#287).** It no longer lists every Resource past the cache for each new replica, and a replica being deleted no longer counts toward the size.
+- **A restarted satellite shows its replicas again within seconds (#302).** The observer writes every replica once after the initial events2 dump, eight at a time, so a node with about 110 replicas reads `Unknown` for about a second instead of tens of seconds.
+
+## v0.4.0-alpha.8 — 2026-11-21
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #304 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.7; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.7
+
+- **A healthy node stays ONLINE when one API server dies (#304).** The satellite heartbeat uses its own client with a one-period stamp timeout and redials after a stamp that got no answer, backing off instead after one the API server refused.
+- **Daemons drop a silently dead API connection within 15 s (#304).** The satellite, the controller and the apiserver shorten the HTTP/2 health check to 10 s read idle and 5 s ping, unless `HTTP2_READ_IDLE_TIMEOUT_SECONDS` or `HTTP2_PING_TIMEOUT_SECONDS` is set on the pod.
+- **The node monitor grace period is 50 s instead of 40 s (#304).** One API endpoint failover no longer makes a node OFFLINE; a node that really died is called OFFLINE about 10 s later than before.
+- **The controller and the satellites read only the replicas they need (#303).** The definition reconciler and every satellite pass list the definition's replicas by field selector instead of every Resource in the cluster, which removes most of the idle CPU load that slowed a provisioning burst.
+- **A recovered apply is reported on the Resource (#299).** An apply that goes through after failures records a Normal `ApplySucceeded` Event with the number of failed attempts, once.
+
+## v0.4.0-alpha.7 — 2026-11-20
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #302 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.6; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.6
+
+- **The satellite image ships drbd-utils 9.36.0 (#275).** Its drbdmeta keeps the bitmap provenance feature when `apply-al` rewrites the superblock after a crash, so a rejoining Secondary is no longer made a resync source, or refused by a Primary, for its activity log bits.
+- **A failed adjust or up is retried in full (#299).** A half-built connection is no longer mistaken for an operator's disconnect and kept with `--skip-net`, so a replica left `StandAlone` by a failed apply reconnects once the cause is gone.
+- **A failing apply backs off and is reported on the Resource (#299).** Retries start at five seconds and double up to five minutes, and every failure is a Warning Event, `ApplyFailed` unless it is a LUKS refusal.
+- **A burst of new volumes gets its DRBD identities in seconds (#300).** The allocator reads the taken node ids, ports and minors from the cache, a ledger reserves each one until the cache shows it, and the resource controller runs eight workers.
+- **`AutoSnapshot/RunEvery` takes one snapshot per interval (#301).** The schedule polls every ten seconds and books each snapshot at the slot that fell due, so `RunEvery 1` no longer takes one every two minutes; after downtime one snapshot is taken, not a catch-up burst.
+- **An offline or restarted node's replicas read as `Unknown` (#302).** REST and the CLI drop the stored state a satellite reported before it went away or restarted, so `r l --faulty` lists them; new optional `satelliteIncarnation` fields on Node and Resource status carry the check.
+- **Rebalance re-reads a definition around each placement (#280).** A pass that placed while linstor-csi switched balancing off or started a delete takes back the replicas it created, and the replica list of such a definition is read past the cache.
+- **Resource create waits keep the replicas they just wrote in view (#291).** A replica or volume the cache does not list yet is read from the API server, and the two placement calls of one CreateVolume share one build bound.
+- **A snapshot refused on a non-UpToDate replica is deleted (#292).** It goes once every node resumed I/O, and the create answers with LINSTOR's `FAIL_SNAPSHOT_NOT_UPTODATE` after the delete.
+
+## v0.4.0-alpha.6 — 2026-11-20
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #298 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.5; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.5
+
+- **A rebooted node brings every local replica up before it repeats passes (#298).** A Resource this satellite process has not had a first pass for is queued ahead of every other pass, so the kernel and peer events of replicas already up no longer hold the rest back; the rank ends when the first pass starts, whatever it ends with.
+- **Periodic re-checks run one at a time and yield to real work (#295).** A converged replica's ten second re-check waits for a single slot, is held while a pass an event asked for runs, and is deferred without holding a worker, so new replicas provision and attach on time with eight workers.
+- **The peer watch ignores status churn (#295).** A peer's Resource starts a local pass only when something the local apply reads from it changes.
+- **The satellite logs how many resource passes ran, and why, once a minute (#295).**
+- **`r l` no longer shows healthy replicas as `Unknown` (#297).** Every observer status write carries its whole cached view of the replica, so a connection or statistics frame no longer drops the disk state, GI and quorum through server-side apply.
+- **Resync progress keeps up with the kernel (#297).** The observer reads events2 apart from its status writes and skips writes the apiserver already holds, so the 5 s resync no longer exhausts the client rate limit.
+- **Replica states no longer freeze after a reboot (#297).** The observer restarts the events2 stream when it ends, reconciles its caches against the new dump, and clears a replica the kernel no longer has.
+- **The observer publishes no GI it could not read (#297).** A GI kept from an earlier read is dropped when a later read fails, the volume leaves the data-bearing states, or its backing device changes.
+- **A snapshot's suspend window holds only suspend, take and resume (#282).** The LUKS password check runs before the node suspends and only for a stack that can carry LUKS, and the resume follows the take at once.
+- **A suspend window that ends unused is resumed before its status is written, and a closing window's marker is kept from the sweep (#282).**
+
+## v0.4.0-alpha.5 — 2026-11-20
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #296 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.4; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.4
+
+- **A snapshot restores after its source volume is deleted (#294).** Each satellite records the pool that holds its copy in the Snapshot's new `status.nodeStatus[].storagePool`, in the write that marks the copy Ready; older copies are backfilled from the pools that hold them, including the snapshots ZFS keeps under a deleted zvol's renamed name.
+- **A restore takes each replica's pool from the snapshot (#294).** The REST restore and `s resource restore` read the pool recorded for the node, and a restore with no usable pool is refused with `FAIL_NOT_FOUND_STOR_POOL` before anything is written.
+- **Autoplace keeps a restored definition on the snapshot's backend after the source is gone (#294).** On a node holding a copy the new replica stays in that pool.
+- **Replicas cloned from the snapshot come up UpToDate on their own (#294).** The restore no longer depends on one elected replica coming up, and the restore set ends the first time a replica is Primary, so a replica added later syncs from a peer as in LINSTOR.
+- **`linstor-migrate` refuses a dump not read at the storage version (#293).** A plain `kubectl get` reads LINSTOR's CRDs at an old schema that silently drops each replica's `tcp_port_list`; the runbook now names the storage version, and the error points to that step.
+- **Each adopted replica takes its DRBD port from LINSTOR's database (#293).** A live port map is the cross-check: the kernel's port is kept and any disagreement is reported per replica.
+- **A resource group keeps its `peer_slots`, and a dropped `x_replicas_on_different` is reported (#293).**
+- **A rebooted node brings its resources up in parallel (#295).** The satellite's Resource controller runs eight workers by default, set with `--resource-workers`.
+- **A `.res` is replaced in one rename (#295).** A drbdadm for another resource never reads a half-written file, and deleting a resource also removes a candidate a crash left behind.
+- **The cold start waits for the API server and stays live (#295).** Ownership reads retry with back-off while the satellite answers `/healthz` itself, and a probe cut short by shutdown cleans nothing.
+- **A resyncing replica shows DRBD's own progress, as LINSTOR does (#296).** The satellite keeps `done` and the replication state per peer and volume, the REST view and the CLI render `SyncTarget(50.31%)`, and `Inconsistent(NN%)` is gone.
+- **`resource list` in the native CLI no longer reads volume definitions (#296).**
+- **`vd d` takes a volume out of DRBD without suspending the volumes that stay (#273).** On a Secondary whose other volumes hold quorum the satellite relaxes `on-no-quorum` for the removal, and the quorum recheck switches the policy and back instead of running `resume-io`, so a snapshot's suspension is never lifted.
+- **A pool-less replica lists its volumes with a pool its node has (#278).** The pool is resolved the way LINSTOR does, on the view and on every other volume listing, so the scheduler extender no longer panics on an empty list.
+- **A snapshot create answers once its take is over (#292).** Both REST mounts hold the answer, and a failed take is answered with its abort error.
+- **A cross-node ZFS restore removes the snapshot it received (#271).** A receive interrupted before its cleanup is finished on the next pass.
+
+## v0.4.0-alpha.4 — 2026-11-20
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #292 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.3; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.3
+
+- **A snapshot stays SUCCESSFUL after its source volume is deleted (#292).** The controller records `SUCCESSFUL` in the Snapshot's `status.flags` once every node took its snapshot and confirmed the resume, and the REST views serve that record instead of deriving it from the source's current replicas, so a linstor-csi restore from a VolumeSnapshot whose PVC is gone no longer times out.
+- **A failed group snapshot is FAILED on every sibling (#292).** None of them becomes SUCCESSFUL, not even once the failed one is deleted, as LINSTOR flags every snapshot of an aborted request.
+- **An aborted snapshot take is terminal (#292).** The controller records the abort in the new `spec.abortReason` in the same write that orders the resume, never suspends that snapshot again, and aborts a take that has not started by its deadline; the satellite opens no suspend window for a snapshot whose take is on record as ended.
+- **An abort's resume no longer waits on a status write (#292).** A failed `IOSuspended` condition stamp used to stop the pass before the abort could clear `spec.suspendIO`.
+- **Auto-snapshots are taken and orchestrated like any other snapshot (#292).** They target every node with an active diskful replica, carry the replicas' LUKS passwords, and are skipped for a tick while a replica's node is offline, when no replica holds data, when a pool cannot snapshot, or for a definition being deleted.
+- **The native CLI shows a snapshot Successful only when it is recorded so (#292).** Anything else without a failure reads Incomplete, as in the python client.
+- **`rg modify` places like LINSTOR's (#280, #289).** Any request that names a place count, raised, lowered or unchanged, places on every child below it whatever its layer stack and whatever `BalanceResourcesEnabled` says, counting every replica but tiebreakers; a modify that changes only a placement constraint gets the balance checks and places nothing with balancing off.
+- **The balance checks skip a definition without DRBD first (#289).** The scheduled pass, resource group events and a constraint-only `rg modify` leave storage-only definitions alone instead of logging a skip for each on every pass.
+- **A replica topped by STORAGE reports an empty state to linstor-csi (#283).** The REST reply always carries the state object, so the health monitor no longer raises `VolumeConditionAbnormal` on every healthy local volume.
+- **A diskless replica reports its DRBD device path (#291).** A remote attach through make-available no longer fails with "could not determine device path".
+- **Create, autoplace, spawn and make-available answer once the satellites built the replicas (#291).** The build wait fits inside the CSI sidecars' one minute timeout, a diskless replica counts as built once it has its device, and every replica on an unreachable satellite is named in the not-connected warning, as LINSTOR does.
+- **`vd d` rechecks quorum on the replicas that keep running (#273).** Once a deleted volume is out of DRBD, the satellite resumes a suspension that quorum alone held, also under `on-no-quorum io-error` and after an apply that fails past the removal; a suspension a snapshot, fencing or missing data also holds is left in place.
+
+## v0.4.0-alpha.3 — 2026-11-19
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #291 except #285, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.2; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.2
+
+- **`vd d` deletes the volume on every replica, as LINSTOR does (#273).** The definition is flagged `DELETE` until each replica confirms in `status.deletedVolumes` that it removed the volume from DRBD and deleted its storage; a satellite whose delete keeps failing raises a `VolumeDeleteFailed` Warning Event.
+- **The native CLI shows a replica without DRBD as `Created` (#283).** `r l`, `r lv` and `v l` read the layer stack off the definition, and the REST API leaves `in_use` unset for a replica topped by STORAGE.
+- **A created snapshot is in the next `s l` (#284).** The snapshot create answers once the local store lists the new snapshot, so csi-snapshotter's paging no longer ends early.
+- **A restore takes the snapshot's layer stack (#286).** A restore into a definition created with another stack, the Velero CSI data mover's storage-only backup class among them, is accepted instead of refused with a 409.
+- **New and restored volumes get LINSTOR's block size (#287).** The controller writes the pool's minimum I/O size as `DrbdOptions/Disk/block-size` before a replica's first attach, and a restore keeps its source's size; pools blockstor creates itself still record none and give 512.
+- **A CSI volume delete removes its resource definition (#288).** The tiebreaker is reaped inside the replica delete once fewer than two diskful replicas remain, and replicas being deleted no longer count towards a new one.
+- **A definition without DRBD gets no DRBD port, node id or minor (#289).** The scheduled rebalance and resource group events also leave such definitions alone; an explicit `rg modify` still places on them.
+- **A new replicated volume attaches without the long wait (#291).** The controller ignores Resource writes that change nothing, and a resource create or autoplace answers once the replicas it made are ready, as LINSTOR does.
+- **The startup `MetadataCreated` refresh probes the right resource (#290).** It asks drbdadm for the definition's own name, per volume, and no longer logs a failed probe for every replica on each start.
+
+## v0.4.0-alpha.2 — 2026-11-19
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268 to #282 except #273, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.1; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.1
+
+- **The satellite image ships drbd-utils 9.35 (#275).** It comes from LINBIT's repository instead of Debian's 9.22, whose drbdadm refused `block-size` in any section, and the LINBIT keyring is pinned by digest.
+- **Volume definition disk options are rendered (#275).** `DrbdOptions/Disk/*` on a volume definition or volume group, `block-size` among them, go into the volume's own `disk` section as LINSTOR renders them, and `linstor-migrate` no longer reports them as dropped.
+- **A new `.res` is checked before it is installed (#275).** The satellite runs `drbdadm sh-nop` on the candidate and keeps the live file if drbdadm refuses it, so one bad file no longer stops drbdadm for every resource on the node.
+- **Disk options the node's drbd-utils rejects are left out (#275).** Each one is logged instead of making the whole `.res` unparseable.
+- **LINSTOR's LUKS mapper is adopted (#276).** A LUKS replica LINSTOR had open keeps running on `Linstor-Crypt-<rd>_<vol>` once the device-mapper table shows it encrypts that replica's own volume, and moves to blockstor's mapper the next time blockstor takes the replica down.
+- **A new Resource is built within seconds on a busy node (#277).** New and changed Resources are queued ahead of the idle replicas' periodic re-checks, and peer status writes that change nothing no longer requeue local replicas.
+- **`MetadataCreated` reads `MetadataFound` on an adopted replica (#277).** `CreateMdSucceeded` now means create-md actually ran.
+- **The REST view answers linstor-csi and the scheduler extender as LINSTOR does (#277, #278).** A replica not built yet lists one volume per volume definition, and `promotion_score` and `may_promote` are published from the new optional Resource status fields `promotionScore` and `mayPromote`.
+- **A restore from a LINSTOR snapshot keeps its peer slots (#279).** Metadata that replaces a superblock is created in that superblock's layout instead of with 15 slots over the end of the data.
+- **A refused create-md is a `CreateMdRefused` Warning Event (#279).** It carries drbdmeta's reason and is retried every 5 minutes instead of every 5 seconds.
+- **A deleted volume with snapshots is not placed again (#280).** Rebalance, resource group events and `rg modify` without a replica count skip a definition with no UpToDate diskful replica, and `BalanceResourcesEnabled` is read on the definition and the group too.
+- **A resize is answered after every replica has grown (#281).** The volume definition PUT returns once each diskful replica on a connected node reports the new size on its device, recorded in `status.volumes[].appliedSizeKib`.
+- **A grow covers DRBD's metadata (#281).** The backing grows to the definition size plus internal metadata and the LUKS header, so the DRBD device reaches the requested size.
+- **A failed apply is recorded on the Resource (#281).** `status.applyFailure` holds the error and the sizes the pass was applying until a pass succeeds.
+- **Snapshots never run a global `sync` while I/O is suspended (#282).** The Primary's DRBD device is flushed before `suspend-io`, and nothing is flushed while it holds.
+- **Suspended I/O is always resumed (#282).** A watchdog on each satellite resumes at the deadline, on delete, on failure and after a satellite restart, and the `IOSuspended` condition names the nodes still suspended.
+- **`linstor-migrate` reads each table's own flag bits (#274).** A definition LINSTOR was deleting is skipped, one being restored is no longer dropped, and a snapshot whose delete had not finished is not adopted.
+
+## v0.4.0-alpha.1 — 2026-11-19
+
+Pre-release for testing the LINSTOR adoption. It is built from the pull requests #268, #269, #270, #271 and #272, which are still under review and not merged into main, so anything below can change before v0.4.0. Do not run it in production.
+
+### Breaking changes
+
+- **Storage is deleted only on request (#271).** The satellite's orphan-storage sweeper is removed: a volume that no replica claims is never deleted, whoever created it, and the `blockstor.org/skip-orphan-storage-sweeper` annotation has no effect. Storage goes only with the delete of the Resource or Snapshot it belongs to, done by that object's own satellite.
+- **ZFS deletes follow LINSTOR (#271).** A zvol without snapshots is destroyed with a plain `zfs destroy`, never a recursive one. A zvol that still has snapshots is marked `linstor:marked_for_deletion=true` and renamed to `_deleted_<name>_<time>`, its snapshots stay usable, and it is destroyed once the delete of its last snapshot or clone empties it.
+- **`StorDriver/Zfs/DeleteStrategy` is honoured (#271).** With `DELETE`, a replica or volume-definition delete is refused with `FAIL_EXISTS_SNAPSHOT` (409) while the definition has snapshots, and `force` does not bypass it. `RENAME` and the default `DYNAMIC` let it through. A resource-definition delete is still refused while it has snapshots, as before.
+- **A thick LVM volume with snapshots is not removed (#271).** Its delete stays pending until the snapshots are deleted, since removing the origin would remove its copy-on-write snapshots.
+- **Pool and node deletes are refused while a snapshot has a copy on the node (#271).** The refusal names the snapshots, and `--force` overrides it.
+- **`node lost` and `node delete --force` leave the node's storage on disk (#271).** The node's replicas are marked abandoned and released, its pools are released and its holds on snapshots are dropped, as in LINSTOR.
+- **Snapshots are held per node (#271).** Each satellite holds its own Snapshot finalizer, so a Snapshot goes only once every node has deleted its copy. Existing Snapshots are migrated from the shared finalizer.
+- **`cram-hmac-alg` is rendered only where it is configured (#270).** A shared secret alone no longer implies a digest. `linstor-migrate` stamps `DrbdOptions/Net/cram-hmac-alg: sha1` on exactly the definitions LINSTOR authenticated and drops the secret from those it did not.
+- **`verify-alg` is rendered from `DrbdOptions/auto-verify-alg` (#270).** A cluster already on blockstor gets it on the next reconcile wherever `auto-verify-alg` is set and no explicit `verify-alg` is.
+- **An adopted replica is never formatted (#269).** mkfs runs only on a replica blockstor created empty (`SkipInitialSync` true), on DRBD and storage-only stacks alike. An adopted volume of a `FileSystem/Type` definition that has no filesystem stays without one until an operator formats it.
+- **A probe that cannot prove the mkfs target empty fails the apply (#269).** The resource reports `refusing mkfs.<type> <device>` until the probe gives a clear answer.
+- **The first render of an adopted resource waits for its peers (#268).** While the kernel slot is connected to a peer that has no Resource yet, the satellite holds the apply for up to 5 minutes (`BSTOR_ADOPTION_PEER_WAIT_S` overrides it), then renders without that peer and records an `AdoptedPeerWithoutResource` Warning Event. Apply all Resources of a definition together.
+- **The DRBD orphan sweeper fails closed (#272).** A slot whose ownership cannot be proven is left up, and a cycle whose inputs cannot be read is skipped. An empty `--state-dir` now tears nothing down.
+
+### Added
+
+- `linstor-migrate` carries LINSTOR's satellite-level `/STLT` `DrbdOptions/*` into `ControllerConfig` and reports every LINSTOR property no blockstor object carries (#270).
+- `linstor-migrate` carries the ZFS delete strategy, at controller and definition level, and the rename suffix LINSTOR recorded for each replica (#271).
+- A replica or definition delete that is still in progress answers with a warning naming the node, and the replica stays flagged `DELETE` until its satellite has deleted the storage (#271).
+- The migration runbook captures `drbdsetup show` before cutover and compares it afterwards (#270).
+
+### Fixed
+
+- **After a migration, unclaimed `pvc-*` zvols were destroyed with their snapshots (#271).** The sweeper that did it is gone, and LINSTOR's `_deleted_*` zvols are finished by deleting the migrated Snapshots that keep them.
+- **A replica was released over a volume still on disk (#271).** A delete on a pool with no registered provider, a failing probe or an unimported ZFS pool is now retried instead of being read as done.
+- **Snapshot copies on other nodes leaked (#271).** The first node to delete its copy used to release the shared finalizer.
+- **`node lost` left the node's objects terminating forever (#271).**
+- **Bulk adoption disconnected healthy DRBD peers (#268).** The stale-peer prune now acts only on slots blockstor rendered and peers it knows are gone, and kernel peer names are matched under any spelling.
+- **Adopted Filesystem volumes were force-promoted for mkfs (#269).** The backing probe now sees a filesystem, LUKS, an LVM PV or swap below DRBD internal metadata, "nothing found" counts only when the device reads back, and a refused or failed mkfs is followed by the demote.
+- **Adoption removed LINSTOR's DRBD net options and peer authentication (#270).** `ping-int`, `ping-timeout`, `timeout`, `connect-int`, `verify-alg` and `cram-hmac-alg` render as LINSTOR rendered them.
+- **The DRBD orphan sweeper could take down slots it did not own (#272).** A failed Node read, an unparsable opt-out annotation, a failed definition list, a marker probe error, or a marker that is a symlink or directory no longer leads to `drbdsetup down`, and the `.res` GC skips symlinked files.
+
 ## v0.3.0 — 2026-11-16
 
 Every LUKS volume gets its own password under a cluster master key that several passphrases can open, and the LINSTOR migration keeps each replica's DRBD port.
