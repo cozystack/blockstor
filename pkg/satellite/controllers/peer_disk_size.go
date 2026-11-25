@@ -66,7 +66,8 @@ type peerSizeRefusal struct {
 func peerSizeRefusals(res *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) []peerSizeRefusal {
 	var refusals []peerSizeRefusal
 
-	for _, own := range res.Status.Volumes {
+	for v := range res.Status.Volumes {
+		own := &res.Status.Volumes[v]
 		if own.DeviceSizeKib <= 0 || !slices.Contains(diskStatesHoldingData, own.DiskState) {
 			continue
 		}
@@ -97,14 +98,14 @@ func peerSizeRefusals(res *blockstoriov1alpha1.Resource, peers []blockstoriov1al
 }
 
 // volumeStatus is the status res reports for volume vn.
-func volumeStatus(res *blockstoriov1alpha1.Resource, vn int32) (blockstoriov1alpha1.ResourceVolumeStatus, bool) {
-	for _, vol := range res.Status.Volumes {
-		if vol.VolumeNumber == vn {
-			return vol, true
+func volumeStatus(res *blockstoriov1alpha1.Resource, vn int32) (*blockstoriov1alpha1.ResourceVolumeStatus, bool) {
+	for i := range res.Status.Volumes {
+		if res.Status.Volumes[i].VolumeNumber == vn {
+			return &res.Status.Volumes[i], true
 		}
 	}
 
-	return blockstoriov1alpha1.ResourceVolumeStatus{}, false
+	return nil, false
 }
 
 // connectedTo reports whether res shows its connection to node
