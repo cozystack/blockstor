@@ -26,6 +26,10 @@ package version
 // stamp them via `-ldflags -X` (Bug 169).
 const Project = "blockstor"
 
+// LogKey is the key every blockstor binary logs Version under when it
+// starts, so the release a process runs is in its first log lines.
+const LogKey = "blockstor_version"
+
 // Version / GitCommit identify the blockstor build. Defaults are
 // development-friendly placeholders; the production Dockerfile rewrites
 // them via `go build -ldflags "-X .../version.Version=<tag> -X

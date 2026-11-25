@@ -60,3 +60,28 @@ func TestReleasedImagesStampTheirVersion(t *testing.T) {
 		t.Errorf("release workflow does not pass the VERSION build-arg to the image build")
 	}
 }
+
+// The Dockerfile says every binary logs the release it was built for at
+// start-up, and only the satellite did: the controller and the API
+// server logged none, so a controller upgraded ahead of its satellites
+// could not be told apart from one that was not, from its logs alone.
+func TestEveryBinaryLogsItsVersionAtStart(t *testing.T) {
+	t.Parallel()
+
+	root := repoRoot240(t)
+
+	for _, file := range []string{
+		"cmd/controller/main.go",
+		"cmd/apiserver/main.go",
+		"pkg/satellite/agent.go",
+	} {
+		src, err := os.ReadFile(filepath.Join(root, file))
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+
+		if !strings.Contains(string(src), "version.LogKey, version.Version") {
+			t.Errorf("%s logs no blockstor_version at start-up", file)
+		}
+	}
+}
