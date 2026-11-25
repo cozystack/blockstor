@@ -250,7 +250,7 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		Flags:       target.Spec.Flags,
 		Props:       wireProps,
 		Peers:       desiredPeers,
-		Volumes:     buildVolumes(rd, target),
+		Volumes:     withDeviceSizes(buildVolumes(rd, target), target, peers),
 		DrbdOptions: drbdOpts,
 		LayerStack:  layerStack,
 		Connections: connectionsFromRD(rd),
@@ -1040,6 +1040,34 @@ func seedFromGI(target *blockstoriov1alpha1.Resource, volumeNumber int32) string
 	}
 
 	return ""
+}
+
+// withDeviceSizes stamps every volume with the largest DRBD device size
+// any replica of the definition reports for it, this one included. A
+// diskless replica reports the size its peers agreed on, so a replica
+// toggled to diskful finds it on its own status as well.
+func withDeviceSizes(vols []*intent.DesiredVolume, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) []*intent.DesiredVolume {
+	for _, vol := range vols {
+		vol.DeviceSizeKib = reportedDeviceSize(target, vol.VolumeNumber)
+
+		for i := range peers {
+			vol.DeviceSizeKib = max(vol.DeviceSizeKib, reportedDeviceSize(&peers[i], vol.VolumeNumber))
+		}
+	}
+
+	return vols
+}
+
+// reportedDeviceSize is the DRBD device size res reports for the given
+// volume, 0 when it reports none.
+func reportedDeviceSize(res *blockstoriov1alpha1.Resource, volumeNumber int32) int64 {
+	for i := range res.Status.Volumes {
+		if res.Status.Volumes[i].VolumeNumber == volumeNumber {
+			return res.Status.Volumes[i].DeviceSizeKib
+		}
+	}
+
+	return 0
 }
 
 // observedGI is the current GI the satellite last reported for the given

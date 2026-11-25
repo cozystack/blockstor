@@ -711,6 +711,17 @@ type ResourceVolumeStatus struct {
 	// (refusing to mount a no-quorum volume) reads this signal.
 	// +optional
 	Quorum bool `json:"quorum,omitempty"`
+
+	// deviceSizeKib is the size of this replica's DRBD device in KiB,
+	// the `size:` token of `drbdsetup events2 --statistics --full`
+	// device frames. A diskless replica reports the size its peers
+	// agreed on. The controller hands the largest size any replica
+	// reports to a replica that is getting a new lower disk, which
+	// must hold at least that much: the kernel refuses to attach a
+	// disk smaller than the device, and a volume adopted from LINSTOR
+	// can be a few KiB larger than its definition.
+	// +optional
+	DeviceSizeKib int64 `json:"deviceSizeKib,omitempty"`
 }
 
 // +kubebuilder:object:root=true

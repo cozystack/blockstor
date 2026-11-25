@@ -25,6 +25,7 @@ package luks
 import (
 	"context"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -70,6 +71,12 @@ func statBlockDevice(path string) (bool, error) {
 	return mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0, nil
 }
 
+// HeaderKiB is what a LUKS2 header Format writes takes from the front of
+// the device: cryptsetup's default LUKS2 data offset, 16 MiB. The opened
+// device is the lower one less this. LINSTOR assumes the same size for
+// LUKS2 when it sizes the volume under a LUKS layer.
+const HeaderKiB = 16 * 1024
+
 // Format runs `cryptsetup luksFormat` against device with the given
 // keyfile contents. Idempotent: if the device already carries a LUKS
 // header, we no-op.
@@ -114,6 +121,62 @@ func (c *Cryptsetup) Format(ctx context.Context, device string, key []byte) erro
 // EnsureEmpty, which fails closed.
 func (c *Cryptsetup) IsLUKS(ctx context.Context, device string) bool {
 	return c.runProbe(ctx, "isLuks", device) == nil
+}
+
+// DataOffsetKiB reads from device's LUKS header where the encrypted data
+// starts, which is what the header takes from the front of the device:
+// the data segment's offset for LUKS2, the payload offset for LUKS1.
+// That is HeaderKiB for a LUKS2 header Format writes, 2 MiB for a LUKS1
+// one and 4 MiB for one some LUKS2 builds wrote. It reports false when
+// the header cannot be read.
+func (c *Cryptsetup) DataOffsetKiB(ctx context.Context, device string) (int64, bool) {
+	out, err := c.exec.Run(ctx, "cryptsetup", "luksDump", device)
+	if err != nil {
+		return 0, false
+	}
+
+	return parseDataOffsetKiB(string(out))
+}
+
+// parseDataOffsetKiB reads the data offset out of `cryptsetup luksDump`:
+// LUKS1 prints "Payload offset: <sectors>", LUKS2 an "offset: <n>
+// [bytes]" line under its first data segment. The keyslot areas carry
+// offsets of their own, so only the "Data segments" section is read.
+func parseDataOffsetKiB(dump string) (int64, bool) {
+	const (
+		bytesPerKiB   = 1024
+		sectorsPerKiB = 2
+	)
+
+	inSegments := false
+
+	for line := range strings.SplitSeq(dump, "\n") {
+		trimmed := strings.TrimSpace(line)
+
+		if sectors, ok := strings.CutPrefix(trimmed, "Payload offset:"); ok {
+			n, err := strconv.ParseInt(strings.TrimSpace(sectors), 10, 64)
+
+			return n / sectorsPerKiB, err == nil && n > 0
+		}
+
+		if line != "" && line[0] != ' ' && line[0] != '\t' {
+			inSegments = strings.HasPrefix(trimmed, "Data segments:")
+
+			continue
+		}
+
+		if !inSegments {
+			continue
+		}
+
+		if offset, ok := strings.CutPrefix(trimmed, "offset:"); ok {
+			n, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimSpace(offset), " [bytes]"), 10, 64)
+
+			return n / bytesPerKiB, err == nil && n > 0
+		}
+	}
+
+	return 0, false
 }
 
 // IsActive reports whether the dm-crypt mapping dmName is active.

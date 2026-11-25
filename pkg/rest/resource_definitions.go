@@ -1194,6 +1194,17 @@ func applyRDModify(rd *apiv1.ResourceDefinition, patch *resourceDefinitionModify
 	return nil
 }
 
+// markAndCascadeRDDelete flags the definition DELETE and stamps the
+// delete on every child replica, the order handleRDDelete relies on.
+func (s *Server) markAndCascadeRDDelete(ctx context.Context, name string) error {
+	err := store.MarkDefinitionDeleting(ctx, s.Store, name)
+	if err != nil {
+		return err //nolint:wrapcheck // the caller maps store errors to REST codes
+	}
+
+	return s.cascadeDeleteResources(ctx, name)
+}
+
 // handleRDDelete drops an RD plus cascades the per-replica teardown.
 //
 // Idempotent on NotFound (Bug 56 sibling): CSI spec § DeleteVolume
@@ -1272,13 +1283,7 @@ func (s *Server) deleteDefinitionData(ctx context.Context, name string) ([]apiv1
 	// existing `blockstor.org/satellite-resource`
 	// finalizer then drains DRBD before the apiserver removes
 	// the object.
-	err = store.MarkDefinitionDeleting(ctx, s.Store, name)
-	if err != nil {
-		//nolint:wrapcheck // MarkDefinitionDeleting names the definition
-		return nil, err
-	}
-
-	err = s.cascadeDeleteResources(ctx, name)
+	err = s.markAndCascadeRDDelete(ctx, name)
 	if err != nil {
 		return nil, err
 	}

@@ -63,10 +63,12 @@ func TestEnsureRefreservationCoverage(t *testing.T) {
 		`"volsize="`,
 	}
 
-	// Functions exempt from the rule: the helper itself + any test
-	// helpers (none currently).
+	// Functions exempt from the rule: the helper itself, and the
+	// volblocksize probe, whose `zfs create -n` is a dry run that
+	// creates nothing.
 	allow := map[string]bool{
-		"ensureRefreservation": true,
+		"ensureRefreservation":   true,
+		"defaultVolblocksizeKib": true,
 	}
 
 	pkgDir := "."

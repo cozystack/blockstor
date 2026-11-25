@@ -63,6 +63,7 @@ func TestClassifyState(t *testing.T) {
 		{"Timeout", color.Broken},
 		{"EVICTED", color.Broken},
 		{"DELETING", color.Broken},
+		{"AttachFailed", color.Broken},
 		// Neutral — a real state that is neither good nor bad.
 		{"Diskless", color.Neutral},
 		{"TieBreaker", color.Neutral},

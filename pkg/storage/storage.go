@@ -26,6 +26,7 @@ package storage
 import (
 	"context"
 	"io"
+	"strconv"
 
 	"github.com/cockroachdb/errors"
 )
@@ -91,6 +92,16 @@ type VolumeStatus struct {
 	AllocatedKib int64
 	UsableKib    int64
 	State        string // PROVISIONED / ERROR / NOT_PROVISIONED
+}
+
+// SizeArg is a volume size in KiB as the LVM CLI takes it. LVM rounds a
+// size up to a whole extent of the volume group, which is the allocation
+// unit LINSTOR rounds an LVM volume up to (LvmProvider.getExtentSize):
+// a lower disk sized for DRBD metadata comes out the size LINSTOR gives
+// it, not a whole MiB larger. At least 1 KiB, which LVM raises to one
+// extent.
+func SizeArg(kib int64) string {
+	return strconv.FormatInt(max(kib, 1), 10) + "k"
 }
 
 // StateNotProvisioned is the VolumeStatus.State of a volume that is not on
