@@ -2228,8 +2228,8 @@ func (r *Reconciler) growBacking(
 }
 
 // lowerDiskKib is the size, in KiB, of the lower disk a volume is
-// created at; a grow sizes it the same way (growBackingKib), except
-// that it never sizes the metadata for fewer than 15 peer slots.
+// created at; a grow sizes it the same way (growBackingKib), for the
+// slots the superblock holds (Reconciler.grownPeerSlots).
 //
 // Under DRBD with internal metadata the lower disk holds the data area
 // and the metadata after it, so it is sized like LINSTOR sizes it: the

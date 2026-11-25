@@ -71,18 +71,21 @@ func TestGrowBackingKibNeverSizesBelowFifteenPeerSlots(t *testing.T) {
 	fifteen := drbdGrossKib(definition, drbd.LegacyPeerSlots)
 	vol := &intent.DesiredVolume{SizeKib: definition}
 
+	r := NewReconciler(ReconcilerConfig{})
+	grown := func(dr *intent.DesiredResource) int64 { return growBackingKib(dr, vol, true, r.grownPeerSlots(dr, vol)) }
+
 	seven := int32(7)
-	if got := growBackingKib(&intent.DesiredResource{PeerSlots: &seven}, vol, true); got != fifteen {
+	if got := grown(&intent.DesiredResource{PeerSlots: &seven}); got != fifteen {
 		t.Errorf("7 recorded peer slots: got %d KiB, want %d, the size for 15", got, fifteen)
 	}
 
-	if got := growBackingKib(&intent.DesiredResource{}, vol, true); got != fifteen {
+	if got := grown(&intent.DesiredResource{}); got != fifteen {
 		t.Errorf("no recorded count: got %d KiB, want %d for 15 slots", got, fifteen)
 	}
 
 	thirtyOne := int32(31)
 
-	got := growBackingKib(&intent.DesiredResource{PeerSlots: &thirtyOne}, vol, true)
+	got := grown(&intent.DesiredResource{PeerSlots: &thirtyOne})
 	if want := drbdGrossKib(definition, 31); got != want {
 		t.Errorf("31 recorded peer slots: got %d KiB, want %d", got, want)
 	}
@@ -113,7 +116,7 @@ func TestGrowBackingKibFollowsTheSuperblock(t *testing.T) {
 		dr := &intent.DesiredResource{PeerSlots: tc.recorded, MetadataPeerSlots: tc.metadata}
 		geometry := drbd.GeometryForPeerSlots(int(*tc.metadata))
 
-		got := growBackingKib(dr, vol, true)
+		got := growBackingKib(dr, vol, true, NewReconciler(ReconcilerConfig{}).grownPeerSlots(dr, vol))
 		if want := drbdGrossKib(definition, int(*tc.metadata)); got != want {
 			t.Errorf("%s: got %d KiB, want %d", tc.name, got, want)
 		}

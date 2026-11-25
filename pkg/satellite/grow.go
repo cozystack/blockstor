@@ -152,19 +152,20 @@ func drbdGrossKib(netKib int64, peerSlots int) int64 {
 // growBackingKib is the backing size a grow of vol has to reach for the
 // device the consumer sees to have the definition size: the size plus
 // DRBD's internal metadata when DRBD keeps it on this device, plus the
-// LUKS header when LUKS sits under it. The metadata is sized for the
-// slots its superblock holds (grownPeerSlots). LINSTOR sizes the backing the
+// LUKS header when LUKS sits under it. The metadata is sized for
+// peerSlots, the slots its superblock holds (Reconciler.grownPeerSlots).
+// LINSTOR sizes the backing the
 // same way, so an adopted volume's backing already carries both. Under
 // DRBD the data area is the definition or the largest device any
 // replica reports, whichever is larger, as for a new lower disk
 // (lowerDiskKib): a volume adopted from LINSTOR exposes a few KiB more
 // than its definition, and a backing grown short of that could not be
 // attached.
-func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withDRBD bool) int64 {
+func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withDRBD bool, peerSlots int) int64 {
 	size := vol.GetSizeKib()
 
 	if withDRBD && vol.GetMetaPool() == "" {
-		size = drbdGrossKib(max(size, vol.GetDeviceSizeKib()), grownPeerSlots(dr))
+		size = drbdGrossKib(max(size, vol.GetDeviceSizeKib()), peerSlots)
 	}
 
 	if needsLUKS(dr.GetLayerStack()) {
@@ -175,9 +176,16 @@ func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withD
 	return size
 }
 
-// grownPeerSlots is the peer-slot count a grow sizes the metadata of an
-// existing device for: the count its superblock holds, which the
-// satellite read once and published (Status.MetadataPeerSlots).
+// grownPeerSlots is the peer-slot count a grow sizes the metadata of vol
+// for: the count its superblock holds. That is the count the satellite
+// read once and published (Status.MetadataPeerSlots), else the one this
+// process created the metadata with or read (noteMetadataSlots), else,
+// for a replica whose metadata is not created yet, the replica's own
+// count, which create-md is about to write: a restore, or a clone,
+// whose definition grew before its first activation grows its backing
+// first and creates the metadata on it after. Sized for 15 instead,
+// such a replica got a device larger than the definition and than its
+// blank siblings, and refused them for good.
 //
 // `drbdadm resize` runs without --size, so DRBD gives the data area all
 // of the lower disk beyond the metadata the superblock holds. Sized for
@@ -186,16 +194,39 @@ func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withD
 // clone or a restore created at the definition's size provides; sized
 // for fewer, it leaves the device short of the definition.
 //
-// Until the superblock was read, the replica's record is not enough: a
-// satellite that predates the record creates 15 whatever the controller
-// stamped, as during a rolling upgrade. So it is sized for at least 15
-// then, which can only leave the device larger, never short.
-func grownPeerSlots(dr *intent.DesiredResource) int {
+// For metadata that exists and was neither read nor created here, the
+// replica's record is not enough: a satellite that predates the record
+// creates 15 whatever the controller stamped, as during a rolling
+// upgrade. So it is sized for at least 15 then, which can only leave the
+// device larger, never short.
+func (r *Reconciler) grownPeerSlots(dr *intent.DesiredResource, vol *intent.DesiredVolume) int {
 	if read := dr.GetMetadataPeerSlots(); read != nil {
 		return int(*read)
 	}
 
+	if slots, ok := r.knownMetadataSlots(dr.GetName(), vol.GetVolumeNumber()); ok {
+		return int(slots)
+	}
+
+	if r.metadataPending(dr) {
+		return replicaGeometry(dr).MaxPeers
+	}
+
 	return int(max(drbd.EffectivePeerSlots(dr.GetPeerSlots()), drbd.LegacyPeerSlots))
+}
+
+// metadataPending reports a replica whose metadata this node has not
+// created yet: neither the MetadataCreated condition nor the
+// .md-created marker it falls back on. Its first activation creates the
+// metadata in the replica's own layout (replicaGeometry).
+func (r *Reconciler) metadataPending(dr *intent.DesiredResource) bool {
+	if dr.GetMetadataCreated() || r.cfg.StateDir == "" {
+		return false
+	}
+
+	_, err := os.Stat(filepath.Join(r.cfg.StateDir, dr.GetName()+".md-created"))
+
+	return os.IsNotExist(err)
 }
 
 // growKey builds the key of the per-volume grow tables.
@@ -267,7 +298,7 @@ func (r *Reconciler) planAttachGrow(
 		return growStep{}
 	}
 
-	target := growBackingKib(dr, vol, true)
+	target := growBackingKib(dr, vol, true, r.grownPeerSlots(dr, vol))
 	if target <= usableKib {
 		return growStep{}
 	}
@@ -350,7 +381,7 @@ func (r *Reconciler) planGrow(dr *intent.DesiredResource, vol *intent.DesiredVol
 		return step
 	}
 
-	if target := growBackingKib(dr, vol, withDRBD); target > usableKib {
+	if target := growBackingKib(dr, vol, withDRBD, r.grownPeerSlots(dr, vol)); target > usableKib {
 		step.backingKib = target
 
 		return step
