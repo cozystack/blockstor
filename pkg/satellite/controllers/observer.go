@@ -117,6 +117,10 @@ type observation struct {
 	// listMap entry on the apiserver or (worse) emit False frames
 	// the next reconcile would treat as "kernel slot gone".
 	HasKernelLoaded bool
+	// ForceIOFailures mirrors `force-io-failures:` on resource frames.
+	// Not written to Status: only the DRBD workarounds read it, from
+	// the cache (workaround_hints.go).
+	ForceIOFailures bool
 	// Destroyed marks a `destroy resource` frame: the kernel slot is
 	// gone, and with it everything the observer knew about it.
 	Destroyed   bool
@@ -161,6 +165,11 @@ type volumeObservation struct {
 	// DeviceSizeKib is the DRBD device size from the `size:` token of
 	// a `device` frame; 0 when the frame did not carry one.
 	DeviceSizeKib int64
+
+	// Open is the `open:yes|no|unknown` of the events2 `device` frame,
+	// empty when the frame did not carry it. Not published to Status:
+	// only the DRBD workarounds' hints read it (workaround_hints.go).
+	Open string
 
 	// SyncPeer is the peer a peer-device frame's out-of-sync count is
 	// about (its `conn-name`).
@@ -352,6 +361,7 @@ func translateResourceEvent(ev drbd.Event) (observation, bool) {
 		HasResource:           true,
 		KernelLoaded:          normalizeKernelLoaded(ev.Action),
 		HasKernelLoaded:       true,
+		ForceIOFailures:       ev.Fields["force-io-failures"] == drbdFlagYes,
 		Destroyed:             ev.Action == eventActionDestroy,
 	}, true
 }
@@ -462,6 +472,7 @@ func translateDeviceEvent(ev drbd.Event) (observation, bool) {
 		DiskState:    disk,
 		CurrentUUID:  ev.Fields["current-uuid"],
 		BackingDev:   ev.Fields["backing_dev"],
+		Open:         ev.Fields["open"],
 	}
 
 	// `quorum:yes|no` is emitted on every `device` frame on
@@ -767,6 +778,9 @@ const (
 	// volume has lost quorum — the CSI plugin's mount path keys
 	// off this signal.
 	drbdQuorumYes = "yes"
+	// drbdFlagYes is how events2 prints any set flag, such as
+	// `force-io-failures:yes` on resource frames.
+	drbdFlagYes = "yes"
 )
 
 // newObserverRunnableFromConfig builds the observer the manager runs, so the
@@ -1016,6 +1030,12 @@ type resourceObservation struct {
 	Suspended      string
 	PromotionScore *int32
 	MayPromote     *bool
+
+	// ForceIOFailures and Unloaded feed the DRBD workarounds' hints
+	// only (workaround_hints.go); Unloaded marks a resource whose
+	// kernel slot was destroyed.
+	ForceIOFailures bool
+	Unloaded        bool
 }
 
 // NeedLeaderElection reports that this runnable does NOT need
@@ -1706,6 +1726,8 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 		cur.InUse = ev.InUse
 		cur.Role = ev.Role
 		cur.Suspended = normalizeSuspended(ev.Suspended)
+		cur.ForceIOFailures = ev.ForceIOFailures
+		cur.Unloaded = ev.HasKernelLoaded && !ev.KernelLoaded
 
 		mergePromotion(&cur, ev)
 	}
@@ -2845,6 +2867,12 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 	// Status SSA write.
 	if incoming.BackingDev != "" {
 		merged.BackingDev = incoming.BackingDev
+	}
+
+	// Open, like BackingDev, is cached for the workarounds' hints only
+	// and never marks the volume changed.
+	if incoming.Open != "" {
+		merged.Open = incoming.Open
 	}
 
 	cache[incoming.VolumeNumber] = merged

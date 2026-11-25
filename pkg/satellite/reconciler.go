@@ -432,6 +432,14 @@ type Reconciler struct {
 	// only; a restart resets the counter (at worst a few extra requeues).
 	restoreSnapshotMissingTries map[string]int
 
+	// demotes paces the retry of a demote this satellite still owes a
+	// replica it promoted itself; see auto_demote.go.
+	demotes demoteRetry
+
+	// inflight marks the resources an apply or delete is changing; see
+	// inflight.go.
+	inflight inFlight
+
 	// retryAt is, per resource name, when a pass put off work that is
 	// due again with no event to bring it: a dwell window, a throttle,
 	// a best-effort step that failed. The satellite runs no periodic
@@ -526,6 +534,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		lastRecoveryPromoteAt:       map[string]time.Time{},
 		firstLateAddStallAt:         map[string]time.Time{},
 		restoreSnapshotMissingTries: map[string]int{},
+		demotes:                     newDemoteRetry(),
 		adjustFailed:                map[string]bool{},
 		firstUnresolvedPoolAt:       map[string]time.Time{},
 		failedDRBDApply:             map[string]bool{},
@@ -977,6 +986,15 @@ const drbdRolePrimary = "Primary"
 // land in the response body so the controller can surface granular
 // status without aborting the rest of the cleanup.
 func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResourceRequest) (*intent.DeleteResourceResponse, error) {
+	defer r.inflight.enter(req.GetName())()
+
+	return r.deleteResource(ctx, req)
+}
+
+// deleteResource is DeleteResource while the resource is marked busy.
+//
+//nolint:unparam // DeleteResource's signature, error reserved for transport faults
+func (r *Reconciler) deleteResource(ctx context.Context, req *intent.DeleteResourceRequest) (*intent.DeleteResourceResponse, error) {
 	var downMsg string
 
 	if r.cfg.Adm != nil {
@@ -1169,6 +1187,7 @@ func (r *Reconciler) removeResourceState(name string) error {
 	// too: nothing reads it, but nothing else would remove it.
 	for _, suffix := range []string{
 		".res", ResFileCandidateSuffix, ".md-created", ".mkfs.done", ".owned", bornSoloSuffix, adjustFailedSuffix,
+		demotePendingSuffix, ReconnectPendingSuffix,
 	} {
 		err := os.Remove(filepath.Join(r.cfg.StateDir, name+suffix))
 		if err != nil && !os.IsNotExist(err) {
@@ -1202,6 +1221,13 @@ func failApply(res *intent.ResourceApplyResult, err error) {
 // enabled (cfg.Adm != nil), also renders the `.res` file and runs
 // drbdadm create-md / adjust.
 func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *intent.ResourceApplyResult {
+	defer r.inflight.enter(dr.GetName())()
+
+	return r.applyResource(ctx, dr)
+}
+
+// applyResource is applyOne while the resource is marked busy.
+func (r *Reconciler) applyResource(ctx context.Context, dr *intent.DesiredResource) *intent.ResourceApplyResult {
 	res := &intent.ResourceApplyResult{
 		Name:     dr.GetName(),
 		NodeName: dr.GetNodeName(),
@@ -3488,6 +3514,13 @@ func (r *Reconciler) reconcileKernelMyNodeID(ctx context.Context, dr *intent.Des
 // automatically when kern->disk=="none" but conf->disk points at a
 // real path. Matches upstream LINSTOR's DrbdLayer pipeline.
 func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredResource, diskless, firstActivation, resized, cloned bool, devices map[int32]string) error {
+	// A demote this satellite still owes the replica from an earlier
+	// auto-promote goes first: every promote below owes its own.
+	err := r.retryPendingDemote(ctx, dr.GetName())
+	if err != nil {
+		return err
+	}
+
 	// Pickup-time resize: the storage layer was just grown, drbdadm
 	// resize tells the kernel to extend the replicated device to
 	// match. Adjust on its own won't do this — only resize re-reads
@@ -5656,16 +5689,38 @@ func needsMkfs(dr *intent.DesiredResource) bool {
 }
 
 func (r *Reconciler) runAutoPromote(ctx context.Context, dr *intent.DesiredResource) error {
-	err := r.cfg.Adm.PrimaryForce(ctx, dr.GetName())
+	// The demote is owed from the moment the promote may have happened,
+	// so a demote that fails, or a satellite that dies before it, still
+	// leaves the replica to be demoted by a later apply.
+	owedBefore := r.demoteOwed(dr.GetName())
+
+	err := r.owePendingDemote(dr.GetName())
 	if err != nil {
+		return err
+	}
+
+	err = r.cfg.Adm.PrimaryForce(ctx, dr.GetName())
+	if err != nil {
+		// A refused role change leaves the role as it was: nothing
+		// new to demote.
+		if !owedBefore {
+			settleErr := r.settlePendingDemote(dr.GetName())
+			if settleErr != nil {
+				return settleErr
+			}
+		}
+
 		return errors.Wrapf(err, "auto-primary %s", dr.GetName())
 	}
 
 	// Demote whatever mkfs did, as LINSTOR's primaryAutoClose does: a
 	// refused or failed mkfs must not leave the replica Primary, where
-	// it blocks every other node from using the volume.
+	// it blocks every other node from using the volume. A demote that
+	// does not go through stays owed (owePendingDemote above) and a
+	// later apply retries it, so the mkfs error is what the apply
+	// reports.
 	mkfsErr := r.runAutoMkfs(ctx, dr, drbdDevicesForMkfs(dr))
-	err = r.cfg.Adm.Secondary(ctx, dr.GetName())
+	err = r.autoSecondary(ctx, dr.GetName())
 
 	if mkfsErr != nil {
 		if err != nil {
@@ -5675,11 +5730,7 @@ func (r *Reconciler) runAutoPromote(ctx context.Context, dr *intent.DesiredResou
 		return errors.Wrapf(mkfsErr, "auto-mkfs %s", dr.GetName())
 	}
 
-	if err != nil {
-		return errors.Wrapf(err, "auto-secondary %s", dr.GetName())
-	}
-
-	return nil
+	return err
 }
 
 // drbdDevicesForMkfs builds the {volNumber → /dev/drbd<minor>} map
