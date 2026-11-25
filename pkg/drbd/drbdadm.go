@@ -61,6 +61,10 @@ type Adm struct {
 	// now is the clock schemaFailures are aged by; time.Now unless a
 	// test sets it.
 	now func() time.Time
+
+	// statusTimeout bounds each `drbdsetup status` call (status);
+	// DefaultStatusTimeout when zero.
+	statusTimeout time.Duration
 }
 
 // schemaFailure is a failed schema read and when it failed.
@@ -784,7 +788,7 @@ func (a *Adm) NewCurrentUUID(ctx context.Context, resource string) error {
 // failure is best-effort-ignored (a peer already StandAlone is fine); a
 // clear-bitmap or adjust failure surfaces.
 func (a *Adm) MintLateAddSource(ctx context.Context, resource string) ([]int32, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return nil, errors.Wrapf(err, "drbdsetup status %s", resource)
 	}
@@ -1083,7 +1087,7 @@ func currentOfGITuple(tuple string) string {
 // defined" message returns an empty slice + nil error: a kernel
 // with no DRBD resources is a valid steady state, not a failure.
 func (a *Adm) StatusResources(ctx context.Context) ([]string, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status")
+	out, err := a.status(ctx)
 	if err != nil {
 		// `No currently configured DRBD found.` (kernel module loaded
 		// but zero resources) and friends all bubble up non-zero. Treat
@@ -1154,7 +1158,7 @@ func (a *Adm) StatusResources(ctx context.Context) ([]string, error) {
 // surfaces only for genuinely-unexpected failures (binary
 // missing, exec/IO error) that the caller should bubble up.
 func (a *Adm) IsLoaded(ctx context.Context, resource string) (bool, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource)
+	out, err := a.status(ctx, resource)
 	if err != nil {
 		// Any non-zero exit is treated as "absent": the dominant
 		// failure mode is `drbdsetup status` returning exit 10 +
@@ -1185,7 +1189,7 @@ func (a *Adm) IsLoaded(ctx context.Context, resource string) (bool, error) {
 // fix is `down` + re-`up`; the self-heal path needs this reader to
 // detect the mismatch (kernel my-id != allocated Status.DRBDNodeID).
 func (a *Adm) KernelMyNodeID(ctx context.Context, resource string) (int32, bool) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return -1, false
 	}
@@ -1234,7 +1238,7 @@ func (a *Adm) KernelMyNodeID(ctx context.Context, resource string) (int32, bool)
 // a fresh, never-promoted peer reports Inconsistent (or no connection
 // yet) and does NOT block.
 func (a *Adm) AnyConnectedPeerHasData(ctx context.Context, resource string) bool {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return false
 	}
@@ -1282,7 +1286,7 @@ func (a *Adm) AnyConnectedPeerHasData(ctx context.Context, resource string) bool
 // is connected with the new minor yet — that is the "fresh
 // volume" steady state, no peer holds data for it).
 func (a *Adm) AnyConnectedPeerHasDataForVolume(ctx context.Context, resource string, volNumber int32) bool {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return false
 	}
@@ -1347,7 +1351,7 @@ func (a *Adm) AnyConnectedPeerHasDataForVolume(ctx context.Context, resource str
 // Conservative on any probe / parse failure: returns false, the retry
 // just waits for the next reconcile.
 func (a *Adm) SafeForMkfsRetryPromote(ctx context.Context, resource string) bool {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return false
 	}
@@ -1424,7 +1428,7 @@ func (a *Adm) SafeForMkfsRetryPromote(ctx context.Context, resource string) bool
 //
 // Conservative on any probe / parse failure: returns false.
 func (a *Adm) Day0SiblingSetConnected(ctx context.Context, resource string, disklessPeers map[string]bool) bool {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return false
 	}
@@ -1511,7 +1515,7 @@ func (a *Adm) Day0SiblingSetConnected(ctx context.Context, resource string, disk
 // re-fires. Conservative on any probe/parse failure (returns false) —
 // a missed promote just retries on the next reconcile.
 func (a *Adm) NeedsRecoveryPromote(ctx context.Context, resource string) bool {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return false
 	}
@@ -1667,7 +1671,7 @@ func peerDeviceActivelySyncing(peerDev drbdsetupStatusPeerDevice) bool {
 // probe/parse failure (returns false) — a missed promote just retries on
 // the next reconcile.
 func (a *Adm) NeedsSoloPromote(ctx context.Context, resource string) bool {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return false
 	}
@@ -1810,7 +1814,7 @@ func localIsUpToDate(devices []drbdsetupStatusDevice) bool {
 // Self-limiting: once the peers reach UpToDate the predicate stops
 // holding. Conservative on any probe/parse failure → false.
 func (a *Adm) NeedsLateAddPromote(ctx context.Context, resource string) bool {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return false
 	}
@@ -2041,7 +2045,7 @@ func lateAddVolumeNeedsLocalPromote(conns []drbdsetupStatusConnection, vol, myID
 // volume reaches UpToDate it no longer qualifies, so the predicate stops
 // returning it.
 func (a *Adm) LateAddResyncKickVolumes(ctx context.Context, resource string) []int32 {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return nil
 	}
@@ -2225,7 +2229,7 @@ const (
 //   - parsed, some peer-device SyncSource/SyncTarget → DownVetoResync.
 //   - parsed, all peer-devices quiescent → DownAllowed.
 func (a *Adm) EvaluateDownVeto(ctx context.Context, resource string) DownVeto {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		// Conclusive absence (clean not-loaded) → down is a no-op, allow
 		// it so a genuinely idle/downed resource is never deferred
@@ -2277,7 +2281,7 @@ func (a *Adm) EvaluateDownVeto(ctx context.Context, resource string) DownVeto {
 // resource the kernel no longer holds has no disk attached, whatever
 // the replica's configuration says.
 func (a *Adm) HasAttachedDisk(ctx context.Context, resource string) (bool, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", "--verbose", resource)
+	out, err := a.status(ctx, "--verbose", resource)
 	if isResourceNotLoadedErr(err, out) {
 		return false, nil
 	}
@@ -2375,7 +2379,7 @@ func (a *Adm) HasAttachedDisk(ctx context.Context, resource string) (bool, error
 //   - parses each indented volume line (`disk:<state>`) and returns
 //     true on the first match for any of the not-attached states.
 func (a *Adm) HasDisklessVolume(ctx context.Context, resource string) (bool, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", "--verbose", resource)
+	out, err := a.status(ctx, "--verbose", resource)
 	if err != nil {
 		// Slot absent / netlink hiccup → not in the race window we
 		// care about. Same convention IsLoaded uses (zero value +
@@ -2487,7 +2491,7 @@ func ParseConfiguredDeviceMinor(err error) (int32, bool) {
 // resource being initialised, best-effort `drbdsetup down`s it to free
 // the minor and retries create-md.
 func (a *Adm) ResourceOwningMinor(ctx context.Context, minor int32) (string, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", "--verbose")
+	out, err := a.status(ctx, "--verbose")
 	if err != nil {
 		// `No currently configured DRBD found.` — kernel has no
 		// resources, so no minor is owned. Surface "" + nil.

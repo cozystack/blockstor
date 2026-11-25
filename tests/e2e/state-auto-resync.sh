@@ -389,12 +389,15 @@ echo "     UpToDate-after-resync reached  = $saw_established_after_sync"
 # satellite reconciler emitted between LOG_BOUNDARY_TS and now.
 # The satellite logs at INFO level when it shells out to drbdadm;
 # search the pod log for /drbdadm.*adjust/ entries with a
-# timestamp >= the boundary. Any hit is a Bug 8 regression on the
+# timestamp >= the boundary. The drift check's sh-list-adjustable
+# lines name drbdadm and "adjust" without running an adjust, so they
+# are left out. Any other hit is a Bug 8 regression on the
 # auto-path: the reconciler must defer adjust while the kernel is
 # resyncing a peer.
 echo ">> check satellite log on $N3 for any drbdadm adjust since $LOG_BOUNDARY_TS"
 ADJUST_HITS=$(kubectl -n "$NS" logs "$N3_POD" --since-time="$LOG_BOUNDARY_TS" 2>/dev/null \
-    | grep -iE 'drbdadm.*adjust|adjusting drbd resource' || true)
+    | grep -iE 'drbdadm.*adjust|adjusting drbd resource' \
+    | grep -v 'sh-list-adjustable' || true)
 if [[ -n "$ADJUST_HITS" ]]; then
     echo "FAIL: satellite reconciler ran drbdadm adjust on $N3 during/after the resync"
     echo "      Bug 8 regression on the auto-recovery path:"
