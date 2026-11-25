@@ -19,7 +19,12 @@ limitations under the License.
 package satellite
 
 import (
+	"context"
+	"net/http"
+	"syscall"
 	"testing"
+
+	"github.com/cockroachdb/errors"
 )
 
 // TestNewReconcilerWiresExec pins Bug 311 regression (#501 reopen):
@@ -76,5 +81,27 @@ func TestNewReconcilerWiresExec(t *testing.T) {
 	if rec.cfg.Cryptsetup == nil {
 		t.Fatal("Agent.newReconciler MUST wire ReconcilerConfig.Cryptsetup; " +
 			"nil Cryptsetup makes LUKS-layered RDs unfulfillable")
+	}
+}
+
+// TestStreamServerShutdownIsNotAFailure: the stream server answers the
+// agent's shutdown with http.ErrServerClosed, wrapped; every satellite
+// stop logged it as an ERROR. A server that stopped for any other
+// reason is still one.
+func TestStreamServerShutdownIsNotAFailure(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.Wrap(http.ErrServerClosed, "stream server"), false},
+		{errors.Wrap(context.Canceled, "stream server"), false},
+		{errors.Wrap(syscall.EADDRINUSE, "stream server: listen tcp 0.0.0.0:3372"), true},
+	} {
+		if got := streamServerFailed(tc.err); got != tc.want {
+			t.Errorf("streamServerFailed(%v) = %v, want %v", tc.err, got, tc.want)
+		}
 	}
 }
