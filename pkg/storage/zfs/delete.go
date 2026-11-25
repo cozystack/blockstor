@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -83,6 +84,12 @@ func (p *Provider) DeleteVolume(ctx context.Context, vol storage.Volume) error {
 // DeleteVolumeWithSuffix is DeleteVolume with the rename suffix recorded for
 // the replica, so a zvol with snapshots lands where they will be looked for.
 func (p *Provider) DeleteVolumeWithSuffix(ctx context.Context, vol storage.Volume, suffix string) error {
+	unlock, err := p.lockDeletes(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	dataset := p.volumeDataset(vol)
 
 	present, err := p.datasetPresent(ctx, dataset)
@@ -103,12 +110,46 @@ func (p *Provider) DeleteVolumeWithSuffix(ctx context.Context, vol storage.Volum
 // it when that zvol was marked for deletion and this was its last snapshot. A
 // snapshot with clones is marked and renamed instead.
 func (p *Provider) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error {
+	unlock, err := p.lockDeletes(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	dataset, err := p.locateSnapshot(ctx, snap)
 	if err != nil || dataset == "" {
 		return err
 	}
 
 	return p.deleteSnapshotDataset(ctx, dataset)
+}
+
+// deleteLocks holds one lock per zpool, shared by every Provider on it.
+//
+//nolint:gochecknoglobals // one lock set for every Provider in the process
+var deleteLocks sync.Map
+
+// lockDeletes runs the deletes of one zpool one at a time, the way LINSTOR's
+// device manager runs them in a single pass. A delete reads names (a clone's
+// origin, a zvol's snapshots) and acts on them a few commands later, and the
+// cascade only ever follows the names it read: a clone delete that read its
+// origin before a source delete renamed the zvol under it looks for the
+// snapshot under the old name, finds nothing, and the marked zvol and
+// snapshot stay for good, since only a cascade destroys them. Two deletes in
+// the same zpool can share a snapshot, so the lock is per zpool rather than
+// per Provider or per dataset. Waiting for it gives up with the context.
+func (p *Provider) lockDeletes(ctx context.Context) (func(), error) {
+	zpool, _, _ := strings.Cut(p.cfg.Pool, "/")
+
+	value, _ := deleteLocks.LoadOrStore(zpool, make(chan struct{}, 1))
+	lock, _ := value.(chan struct{})
+
+	select {
+	case lock <- struct{}{}:
+		return func() { <-lock }, nil
+	case <-ctx.Done():
+		return nil, errors.Wrapf(ctx.Err(), "wait for the other deletes in zpool %s", zpool)
+	}
 }
 
 func (p *Provider) deleteVolumeDataset(ctx context.Context, dataset, suffix string) error {
