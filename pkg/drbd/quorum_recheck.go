@@ -176,7 +176,7 @@ func (a *Adm) canRelaxQuorumPolicy(ctx context.Context, resource string, minors 
 // suspended reports whether the kernel holds the resource's I/O for any
 // reason.
 func suspended(res *drbdsetupStatusResource) bool {
-	return res.SuspendedUser || res.SuspendedNoData || res.SuspendedFencing || res.SuspendedQuorum
+	return (res.SuspendedUser != nil && *res.SuspendedUser) || res.SuspendedNoData || res.SuspendedFencing || res.SuspendedQuorum
 }
 
 // remainingVolumesHoldQuorum reports whether the resource keeps a volume
