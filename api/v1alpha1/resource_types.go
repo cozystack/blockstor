@@ -535,6 +535,20 @@ type ResourceStatus struct {
 	// +optional
 	ToggleDiskRetries int32 `json:"toggleDiskRetries,omitempty"`
 
+	// deletedVolumes is this replica's confirmation of volume definition
+	// deletes: the satellite lists a volume here once it has removed the
+	// volume from DRBD and deleted its storage, because its volume
+	// definition is flagged DELETE. The controller removes the volume
+	// definition once every replica of the definition lists it with the
+	// same deleteID. The satellite drops an entry once its volume
+	// definition is gone. Empty on a satellite that predates volume
+	// definition deletes, which therefore holds the definition until it is
+	// upgraded rather than having its volume skipped.
+	// +listType=map
+	// +listMapKey=volumeNumber
+	// +optional
+	DeletedVolumes []DeletedVolumeStatus `json:"deletedVolumes,omitempty"`
+
 	// applyFailure is the error of the satellite's last apply pass on
 	// this replica, with the volume sizes that pass was applying. The
 	// satellite sets it when a pass fails and removes it when one
@@ -543,6 +557,19 @@ type ResourceStatus struct {
 	// LINSTOR returns its satellite's error.
 	// +optional
 	ApplyFailure *ResourceApplyFailure `json:"applyFailure,omitempty"`
+}
+
+// DeletedVolumeStatus is one replica's confirmation that it deleted the
+// volume of a volume definition flagged DELETE.
+type DeletedVolumeStatus struct {
+	// volumeNumber is the deleted volume's number.
+	VolumeNumber int32 `json:"volumeNumber"`
+
+	// deleteID is the deleteID of the volume definition the satellite
+	// acted on.
+	// +optional
+	// +kubebuilder:validation:MaxLength=64
+	DeleteID string `json:"deleteID,omitempty"`
 }
 
 // ResourceApplyFailure is the error of a failed satellite apply pass.

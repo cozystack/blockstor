@@ -728,8 +728,9 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 			volumesFromStatus(crd.Status.Volumes),
 			crd.Status.Connections,
 		),
-		UUID:        string(crd.UID),
-		Annotations: withoutNameAnnotations(cloneAnnotations(crd.Annotations)),
+		DeletedVolumes: deletedVolumesFromStatus(crd.Status.DeletedVolumes),
+		UUID:           string(crd.UID),
+		Annotations:    withoutNameAnnotations(cloneAnnotations(crd.Annotations)),
 		// Upstream LINSTOR populates `create_timestamp` (the Python
 		// CLI's `CreatedOn` column). The Resource CRD's
 		// metadata.creationTimestamp is the per-replica creation time
@@ -738,6 +739,21 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 		ApplyFailure:    applyFailureFromStatus(crd.Status.ApplyFailure),
 		PeerSlots:       peerSlotsOf(crd),
 	}
+}
+
+// deletedVolumesFromStatus carries the satellite's volume definition delete
+// confirmations onto the wire Resource.
+func deletedVolumesFromStatus(in []crdv1alpha1.DeletedVolumeStatus) []apiv1.DeletedVolume {
+	if len(in) == 0 {
+		return nil
+	}
+
+	out := make([]apiv1.DeletedVolume, 0, len(in))
+	for _, d := range in {
+		out = append(out, apiv1.DeletedVolume{VolumeNumber: d.VolumeNumber, DeleteID: d.DeleteID})
+	}
+
+	return out
 }
 
 // peerSlotsOf is a replica's peer-slot count on the wire: the recorded

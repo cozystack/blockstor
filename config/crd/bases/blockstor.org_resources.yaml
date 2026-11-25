@@ -731,6 +731,39 @@ spec:
                 x-kubernetes-list-map-keys:
                 - peerNodeName
                 x-kubernetes-list-type: map
+              deletedVolumes:
+                description: |-
+                  deletedVolumes is this replica's confirmation of volume definition
+                  deletes: the satellite lists a volume here once it has removed the
+                  volume from DRBD and deleted its storage, because its volume
+                  definition is flagged DELETE. The controller removes the volume
+                  definition once every replica of the definition lists it with the
+                  same deleteID. The satellite drops an entry once its volume
+                  definition is gone. Empty on a satellite that predates volume
+                  definition deletes, which therefore holds the definition until it is
+                  upgraded rather than having its volume skipped.
+                items:
+                  description: |-
+                    DeletedVolumeStatus is one replica's confirmation that it deleted the
+                    volume of a volume definition flagged DELETE.
+                  properties:
+                    deleteID:
+                      description: |-
+                        deleteID is the deleteID of the volume definition the satellite
+                        acted on.
+                      maxLength: 64
+                      type: string
+                    volumeNumber:
+                      description: volumeNumber is the deleted volume's number.
+                      format: int32
+                      type: integer
+                  required:
+                  - volumeNumber
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - volumeNumber
+                x-kubernetes-list-type: map
               drbdMinor:
                 description: |-
                   drbdMinor is a read-only mirror of the volume-0 minor now
