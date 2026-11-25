@@ -307,6 +307,12 @@ const apiCallRcFailExistsRscDfn int64 = 501
 // replicas.
 const apiCallRcFailInUse int64 = 997
 
+// apiCallRcFailInsufficientPeerSlots mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_INSUFFICIENT_PEER_SLOTS` (993): a replica with a disk
+// that the resource definition has no DRBD peer slot left for, or a
+// peer-slot count too low for the replicas a definition already has.
+const apiCallRcFailInsufficientPeerSlots int64 = 993
+
 // apiCallRcFailInvldVlmSize mirrors upstream LINSTOR's
 // `ApiConsts.FAIL_INVLD_VLM_SIZE` (206). Used when an operator-supplied
 // size violates the contract (e.g. `vd set-size` shrink without

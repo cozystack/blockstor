@@ -60,9 +60,9 @@ func TestDrbdmetaCreateMDSucceeds(t *testing.T) {
 		"--force",
 		"0", "v09", contract.LoopDevicePath, "internal",
 		"create-md",
-		// MaxPeers-1 mirrors pkg/drbd/drbdadm.go:CreateMD exactly —
+		// The count a replica without a recorded one is created with —
 		// drbdadm translates --max-peers=N to this trailing positional.
-		itoa(drbd.MaxPeers-1),
+		itoa(drbd.LegacyPeerSlots),
 	)
 
 	if res.ExitCode != 0 {
@@ -175,7 +175,7 @@ func TestDrbdmetaDumpMdParses(t *testing.T) {
 	}
 
 	mustContain(t, res.Stdout, `version "v09"`, "version line")
-	mustContain(t, res.Stdout, "max-peers "+itoa(drbd.MaxPeers-1), "max-peers value")
+	mustContain(t, res.Stdout, "max-peers "+itoa(drbd.LegacyPeerSlots), "max-peers value")
 	mustContain(t, res.Stdout, "current-uuid", "current-uuid line")
 	mustContain(t, res.Stdout, "peer[", "per-peer slot")
 }
@@ -276,7 +276,7 @@ func createThenSetGI(t *testing.T, setGiArgs ...string) contract.RunResult {
 
 	return contract.RunDrbdmetaChain(t,
 		[][]string{
-			{"--force", "0", "v09", contract.LoopDevicePath, "internal", "create-md", itoa(drbd.MaxPeers - 1)},
+			{"--force", "0", "v09", contract.LoopDevicePath, "internal", "create-md", itoa(drbd.LegacyPeerSlots)},
 			append([]string{"--force", "0", "v09", contract.LoopDevicePath, "internal", "set-gi"}, setGiArgs...),
 		})
 }
@@ -290,7 +290,7 @@ func createThenDumpMd(t *testing.T) contract.RunResult {
 
 	return contract.RunDrbdmetaChain(t,
 		[][]string{
-			{"--force", "0", "v09", contract.LoopDevicePath, "internal", "create-md", itoa(drbd.MaxPeers - 1)},
+			{"--force", "0", "v09", contract.LoopDevicePath, "internal", "create-md", itoa(drbd.LegacyPeerSlots)},
 			{"--force", "0", "v09", contract.LoopDevicePath, "internal", "dump-md"},
 		})
 }

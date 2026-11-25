@@ -252,6 +252,23 @@ func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 	placed := countDiskfulReplicas(plan.existing, plan.disabled)
 	want := int(filter.PlaceCount)
 
+	// Every replica with a disk takes a DRBD peer slot on every replica
+	// of the definition. LINSTOR places all of them in one transaction,
+	// through the check a single resource create runs, so a placement
+	// the slots cannot hold fails whole, with nothing created
+	// (CtrlRscCrtApiHelper.checkPeerSlotsForNewPeer). Checked here for
+	// all of them at once: the replicas this call writes are not in the
+	// cache the per-replica check reads until a moment later. A count no
+	// candidate set can reach is checked for the replicas it can place,
+	// and fails as a shortfall, as LINSTOR's fails for want of nodes
+	// before it creates anything.
+	if n := min(want-placed, candidateNodeCount(plan.preferred, plan.lastResort)); n > 0 {
+		err = store.CheckPeerSlotsForNewPeers(ctx, p.store, rdName, make([]string, n))
+		if err != nil {
+			return Placement{Want: want}, errors.Wrapf(err, "place %d replicas of %s", n, rdName)
+		}
+	}
+
 	defer p.holdWitness(ctx, rdName, want-placed)()
 
 	placed, err = p.placeDiskful(ctx, rdName, plan.state, plan.preferred, placed, want)
@@ -272,6 +289,20 @@ func (p *Placer) place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 	}
 
 	return plan.state.placement(placed, want), plan.partialShortfall(placed, want)
+}
+
+// candidateNodeCount is the number of nodes the candidate pools are on,
+// the most replicas a placement can add.
+func candidateNodeCount(sets ...[]apiv1.StoragePool) int {
+	nodes := map[string]struct{}{}
+
+	for _, set := range sets {
+		for i := range set {
+			nodes[naming.Key(set[i].NodeName)] = struct{}{}
+		}
+	}
+
+	return len(nodes)
 }
 
 // placePlan bundles everything Place needs after the read-side
@@ -883,6 +914,15 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 // pkg/rest.promoteDisklessReplica. A create that finds a replica
 // written since newState goes through takeOverReplicaWrittenMeanwhile.
 func (s *state) writeReplica(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) (bool, error) {
+	// Each replica with a disk takes a DRBD peer slot on every replica of
+	// the definition. LINSTOR's autoplace creates its replicas through the
+	// resource create, which refuses the one the slots cannot hold; the
+	// placement stops there, with the replicas before it in place.
+	err := store.CheckPeerSlotsForNewPeer(ctx, st, rdName, pool.NodeName)
+	if err != nil {
+		return false, errors.Wrapf(err, "place a replica of %s on %s", rdName, pool.NodeName)
+	}
+
 	if _, isWitness := s.upgradeable[naming.Key(pool.NodeName)]; isWitness {
 		return false, s.promoteWitness(ctx, st, rdName, pool)
 	}
@@ -893,7 +933,7 @@ func (s *state) writeReplica(ctx context.Context, st store.Store, rdName string,
 		Props:    map[string]string{storPoolNameProp: pool.StoragePoolName},
 	}
 
-	err := st.Resources().Create(ctx, &res)
+	err = st.Resources().Create(ctx, &res)
 	if err == nil {
 		return true, nil
 	}

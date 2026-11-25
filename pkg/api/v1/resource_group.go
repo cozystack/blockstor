@@ -128,4 +128,9 @@ type ResourceGroupSpawn struct {
 	OverrideProps              map[string]string `json:"override_props,omitempty"`
 	DeleteProps                []string          `json:"delete_props,omitempty"`
 	DeleteNamespace            []string          `json:"delete_namespaces,omitempty"`
+
+	// PeerSlots is the peer-slot count the spawn names for the new
+	// definition; zero leaves it to the group and PeerSlotsNewResource,
+	// as in LINSTOR.
+	PeerSlots int32 `json:"peer_slots,omitempty"`
 }

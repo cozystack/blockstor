@@ -89,7 +89,7 @@ func TestGrowBeforeAttachAttachesWithoutResizingTheDevice(t *testing.T) {
 
 			// The size the backing grows to: what a new one is created
 			// at for the adopted device, which LVM rounds to an extent.
-			grownKib := drbd.InternalMetadataGrossKiB(adoptedDev, drbd.DefaultGeometry()) + header
+			grownKib := drbd.InternalMetadataGrossKiB(adoptedDev, drbd.GeometryForPeerSlots(drbd.LegacyPeerSlots)) + header
 			bytes := func(kib int64) storage.FakeResponse {
 				return storage.FakeResponse{Stdout: []byte(strconv.FormatInt(kib*1024, 10) + "\n")}
 			}
