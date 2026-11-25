@@ -241,15 +241,19 @@ func TestObserverReadsTheGIWhenARoleChanges(t *testing.T) {
 }
 
 // A replica with no peer has no peer device for drbdsetup to name the
-// volume by, and one whose kernel read fails has nothing from it; both
-// are read from the backing device, as before.
-func TestObserverReadsTheGIFromDiskWithoutAKernelAnswer(t *testing.T) {
+// volume by, and is read from the backing device, as before. One whose
+// kernel read fails publishes no GI rather than read the backing device
+// the kernel holds attached: the read ran drbdmeta --force against an
+// in-use Primary each time a replica of it was deleted.
+func TestObserverReadsTheGIFromDiskOnlyWithoutAPeer(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		frames []*observation
-		kernel *storage.FakeResponse
+		name      string
+		frames    []*observation
+		kernel    *storage.FakeResponse
+		want      string
+		readsDisk bool
 	}{
-		{name: "no peer", frames: []*observation{deviceUpToDate()}},
+		{name: "no peer", frames: []*observation{deviceUpToDate()}, want: statusTestGI, readsDisk: true},
 		{
 			name:   "kernel read fails",
 			frames: []*observation{peerConnectedWithID("n2", kernelTestPeerID), deviceUpToDate()},
@@ -275,8 +279,12 @@ func TestObserverReadsTheGIFromDiskWithoutAKernelAnswer(t *testing.T) {
 
 			o.resyncOnce(ctx)
 
-			if got := getStatusReplica(t, cli, name).Volumes[0].CurrentGI; got != statusTestGI {
-				t.Fatalf("published GI %q, want the one on disk %q", got, statusTestGI)
+			if got := getStatusReplica(t, cli, name).Volumes[0].CurrentGI; got != tc.want {
+				t.Fatalf("published GI %q, want %q", got, tc.want)
+			}
+
+			if got := metaGIReads(fx); (got > 0) != tc.readsDisk {
+				t.Fatalf("read the backing device %d times, want reads: %v", got, tc.readsDisk)
 			}
 		})
 	}
