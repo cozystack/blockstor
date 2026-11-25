@@ -168,6 +168,10 @@ type ResourceReconciler struct {
 	// retries spaces the retries of a replica whose apply keeps failing.
 	retries applyBackoff
 
+	// deleteRetries spaces the retries of a replica whose delete keeps
+	// failing.
+	deleteRetries applyBackoff
+
 	// waits reports an apply that waits too long for the controller.
 	waits controllerWaits
 }
@@ -209,6 +213,18 @@ const applyFailureRequeue = 5 * time.Second
 // faster than the user-visible auto-place latency budget while
 // still giving the apiserver time to commit the Status patch.
 const peerAllocationRequeue = 2 * time.Second
+
+// deleteFailureRequeue is the first delay before a failed delete of a
+// replica is retried, doubled for each retry that fails, up to
+// deleteFailureMaxRequeue. The usual failure is ZFS refusing to destroy
+// a zvol it still counts as open (`dataset is busy`) for a moment after
+// `drbdsetup down`, which clears within seconds, so the delay starts
+// short; retried on every event and through the queue's own back-off,
+// one such delete was logged seventeen times in six seconds.
+const (
+	deleteFailureRequeue    = 500 * time.Millisecond
+	deleteFailureMaxRequeue = 30 * time.Second
+)
 
 // normalPriority is the queue priority of a real event, and of every
 // retry of a pass that did not converge: an item first queued from the
@@ -365,6 +381,7 @@ func (r *ResourceReconciler) reconcileResource(ctx context.Context, req ctrl.Req
 		if apierrors.IsNotFound(err) {
 			r.bringUp.forget(req.Name)
 			r.retries.reset(req.Name)
+			r.deleteRetries.reset(req.Name)
 			r.waits.forget(req.Name)
 
 			return ctrl.Result{}, nil
@@ -2190,6 +2207,12 @@ func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov
 		return ctrl.Result{}, nil
 	}
 
+	// A delete that failed is retried when its back-off runs out, not on
+	// every event that reaches the replica meanwhile.
+	if wait := r.deleteRetries.wait(res.Name); wait > 0 {
+		return ctrl.Result{RequeueAfter: wait}, nil
+	}
+
 	volumeNumbers, err := r.lookupVolumeNumbers(ctx, res)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -2220,14 +2243,18 @@ func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov
 	}
 
 	if !resp.GetOk() {
-		// Body-level failure — log and let controller-runtime
-		// back-off retry. We keep the finalizer in place so the
-		// CRD doesn't vanish before our tear-down succeeds.
-		log.FromContext(ctx).Info("DeleteResource per-resource failure",
-			"resource", res.Spec.ResourceDefinitionName, "message", resp.GetMessage())
+		// Body-level failure: keep the finalizer, so the Resource does
+		// not vanish before its storage is gone, and retry after a
+		// back-off.
+		retry := r.deleteRetries.after(res.Name, deleteFailureRequeue, deleteFailureMaxRequeue)
 
-		return ctrl.Result{Requeue: true}, nil
+		log.FromContext(ctx).Info("DeleteResource per-resource failure",
+			"resource", res.Spec.ResourceDefinitionName, "message", resp.GetMessage(), "retryIn", retry)
+
+		return ctrl.Result{RequeueAfter: retry}, nil
 	}
+
+	r.deleteRetries.reset(res.Name)
 
 	// Re-fetch via APIReader (uncached) so we strip ours off the
 	// freshest finalizer list. Falls back to the cached client
