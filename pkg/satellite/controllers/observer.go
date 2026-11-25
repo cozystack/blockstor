@@ -143,7 +143,11 @@ type observation struct {
 type volumeObservation struct {
 	VolumeNumber int32
 	DiskState    string
-	CurrentUUID  string
+	// DiskStateIfUnknown marks a DiskState that is a guess, not a
+	// frame's report: the cache takes it only while it holds no disk
+	// state for the volume.
+	DiskStateIfUnknown bool
+	CurrentUUID        string
 	// BackingDev is the lower-disk path from the events2 `device`
 	// frame's `backing_dev:` field. Used by the observer to read the
 	// on-disk current-UUID via drbdmeta get-gi when events2 doesn't
@@ -527,24 +531,22 @@ func parsePeerNodeID(raw string) *int32 {
 // the clear, a reader between the two frames sees stale "(NN%)"
 // on what the kernel already considers a settled replica.
 func peerDeviceVolumeObservation(ev drbd.Event, volNum int32) []volumeObservation {
-	// SyncSource invariant (BUG-045): a node reporting
-	// `replication:SyncSource` toward a peer is feeding that peer's
-	// resync, which the kernel only permits from a LOCAL disk that is
-	// itself UpToDate. The local `device` frame's `disk:UpToDate` may
-	// be missing or stale on a Secondary SyncSource (it is only
-	// re-emitted on an actual local disk-state transition, and a peer-
-	// device frame can create the volume-cache entry first with an
-	// empty DiskState). Stamp DiskState=UpToDate off the reliably-
-	// emitted peer-device frame so the CRD status projection never
-	// leaves a live source's diskState blank — the U130 last-copy
-	// delete guard reads exactly this field. mergeVolumeInto only ever
-	// upgrades a cached DiskState to a non-empty value, and UpToDate is
-	// the terminal disk-state, so this is idempotent and never
-	// downgrades a richer local-frame observation.
+	// BUG-045: a peer-device frame can create the volume-cache entry of
+	// a Secondary SyncSource before any `device` frame gave it a disk
+	// state (the local disk state did not change, so none is emitted),
+	// and the CRD status projection then left the source's diskState
+	// blank, which the U130 last-copy delete guard reads. A resync
+	// source is usually UpToDate, so the frame fills that in, but only
+	// where no disk state is known: DRBD also resyncs from an Outdated
+	// source to an Inconsistent peer (drbd_state.c handles a SyncSource
+	// whose disk is below UpToDate), and overwriting the Outdated the
+	// device frame reported showed a volume with no UpToDate replica
+	// left as UpToDate until the satellite restarted.
 	if ev.Fields["replication"] == drbdReplStateSyncSource {
 		obs := volumeObservation{
-			VolumeNumber: volNum,
-			DiskState:    drbdDiskStateUpToDate,
+			VolumeNumber:       volNum,
+			DiskState:          drbdDiskStateUpToDate,
+			DiskStateIfUnknown: true,
 		}
 
 		if oosStr, ok := ev.Fields["out-of-sync"]; ok {
@@ -2800,7 +2802,8 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 
 	changed := false
 
-	if incoming.DiskState != "" && merged.DiskState != incoming.DiskState {
+	guessOverReport := incoming.DiskStateIfUnknown && merged.DiskState != ""
+	if incoming.DiskState != "" && merged.DiskState != incoming.DiskState && !guessOverReport {
 		merged.DiskState = incoming.DiskState
 		changed = true
 	}
