@@ -695,6 +695,8 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 
 	retry, retryAsked := r.Config.Apply.TakeRetry(desired.GetName())
 
+	refusePeersTooSmall(selfIn(res, peers), peers, results)
+
 	anyFailed, waiting := r.recordPerResourceFailures(res, results, logger)
 	r.recordDroppedOptions(res, results)
 
@@ -1041,7 +1043,10 @@ const uncleanMetadataRefusedReason = "UncleanMetadataRefused"
 
 // applyRefusals lists every refusal reported as a Warning Event.
 func applyRefusals() []applyRefusal {
-	return append(luksRefusals(), metadataRefusals()...)
+	return append(append(luksRefusals(), metadataRefusals()...), applyRefusal{
+		errPeerDiskTooSmall, peerDiskTooSmallReason,
+		"the kernel refuses the connection to peers with a smaller disk",
+	})
 }
 
 // metadataRefusals are the refusals to write DRBD metadata. Each one is
