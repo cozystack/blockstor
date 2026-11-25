@@ -4,6 +4,17 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0-alpha.24 — 2026-11-25
+
+Pre-release for testing the LINSTOR adoption. It is built from main, which carries the same pull requests as for alpha.23, and from the open pull requests #273, #314, #315, #325, #326, #327, #328, #329, #330, #331, #332, #333, #334 and #335 that are not merged into main yet, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.23; the entries below are what changed since.
+
+### Changes since v0.4.0-alpha.23
+
+- **The controller and the API server log the release version at start-up (#332).** Both log `blockstor_version` with their start-up line, under the same key as the satellite, so a controller upgraded ahead of its satellites can be read from the logs alone.
+- **A DRBD device is resized only when it is short of its definition (#333).** A restore with grow no longer logs `Resize not allowed during resync` for every restored volume on the replica that received the snapshot from a peer; a device whose size cannot be read is still resized, so a failed grow is retried as before.
+- **A resync source keeps its reported Outdated disk state (#334).** After a volume lost its last UpToDate copy, `r l` no longer shows Outdated replicas that are resyncing a peer as UpToDate, and `r l --faulty` lists them; `status.volumes[].diskState` now agrees with `status.drbdState`.
+- **The GI of an attached replica is read through any peer the kernel still has (#335).** Deleting a replica of an in-use volume no longer makes the Primary's node run `drbdmeta --force ... get-gi` against its own attached backing device; a replica whose peer reads all fail publishes no GI on that pass, and one with no peer is still read from disk.
+
 ## v0.4.0-alpha.23 — 2026-11-25
 
 Pre-release for testing the LINSTOR adoption. It is built from main, which carries the same pull requests as for alpha.22, and from the open pull requests #273, #314, #315, #325, #326, #327, #328, #329, #330, #331 and #332 that are not merged into main yet, so anything below can change before v0.4.0. Do not run it in production. It carries everything in v0.4.0-alpha.22; the entries below are what changed since.
