@@ -72,7 +72,9 @@ func TestGrowBackingKibNeverSizesBelowFifteenPeerSlots(t *testing.T) {
 	vol := &intent.DesiredVolume{SizeKib: definition}
 
 	r := NewReconciler(ReconcilerConfig{})
-	grown := func(dr *intent.DesiredResource) int64 { return growBackingKib(dr, vol, true, r.grownPeerSlots(dr, vol)) }
+	grown := func(dr *intent.DesiredResource) int64 {
+		return growBackingKib(dr, vol, true, r.grownPeerSlots(dr, vol))
+	}
 
 	seven := int32(7)
 	if got := grown(&intent.DesiredResource{PeerSlots: &seven}); got != fifteen {
