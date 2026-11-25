@@ -695,6 +695,8 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 
 	retry, retryAsked := r.Config.Apply.TakeRetry(desired.GetName())
 
+	r.waitForAddressHandover(ctx, res, results, logger)
+
 	anyFailed, waiting := r.recordPerResourceFailures(res, results, logger)
 	r.recordDroppedOptions(res, results)
 
