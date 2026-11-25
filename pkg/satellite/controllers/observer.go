@@ -2793,6 +2793,23 @@ func mergeOutOfSyncInto(merged, incoming *volumeObservation) bool {
 	return true
 }
 
+// mergeDiskStateInto takes the disk state incoming reports, unless it
+// is only a guess (DiskStateIfUnknown) and a frame already reported
+// one, and reports whether the merged state changed.
+func mergeDiskStateInto(merged, incoming *volumeObservation) bool {
+	if incoming.DiskState == "" || merged.DiskState == incoming.DiskState {
+		return false
+	}
+
+	if incoming.DiskStateIfUnknown && merged.DiskState != "" {
+		return false
+	}
+
+	merged.DiskState = incoming.DiskState
+
+	return true
+}
+
 // mergeVolumeInto folds `incoming` into `cache` for its volume key.
 // Returns true if any field actually changed — the caller uses that
 // to decide whether to emit a fresh Status snapshot.
@@ -2800,13 +2817,7 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 	merged := cache[incoming.VolumeNumber]
 	merged.VolumeNumber = incoming.VolumeNumber
 
-	changed := false
-
-	guessOverReport := incoming.DiskStateIfUnknown && merged.DiskState != ""
-	if incoming.DiskState != "" && merged.DiskState != incoming.DiskState && !guessOverReport {
-		merged.DiskState = incoming.DiskState
-		changed = true
-	}
+	changed := mergeDiskStateInto(&merged, incoming)
 
 	// The GI read from disk belongs to the data the volume held then.
 	// A volume that stops holding data, or now sits on another backing
