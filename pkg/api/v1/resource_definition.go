@@ -18,6 +18,8 @@ limitations under the License.
 
 package v1
 
+import "slices"
+
 // ResourceDefinition mirrors the upstream `ResourceDefinition` shape. Each
 // PVC ends up as one ResourceDefinition with one or more VolumeDefinitions.
 //
@@ -218,6 +220,30 @@ type VolumeDefinition struct {
 	Props        map[string]string `json:"props,omitempty"`
 	Flags        []string          `json:"flags,omitempty"`
 	UUID         string            `json:"uuid,omitempty"`
+
+	// DeleteID is the CRD's deleteID, written with the DELETE flag; see
+	// api/v1alpha1.ResourceDefinitionVolume. Not on the wire: LINSTOR has
+	// no such field, and a replica's confirmation is matched against it
+	// inside blockstor only.
+	DeleteID string `json:"-"`
+}
+
+// VolumeDefinitionFlagDelete is the flag a volume definition carries from
+// `vd d` until every replica has deleted its volume; see
+// api/v1alpha1.VolumeDefinitionFlagDelete.
+const VolumeDefinitionFlagDelete = "DELETE"
+
+// Deleting reports whether the volume definition is flagged DELETE.
+func (vd *VolumeDefinition) Deleting() bool {
+	return vd != nil && slices.Contains(vd.Flags, VolumeDefinitionFlagDelete)
+}
+
+// LiveVolumeDefinitions drops the volume definitions flagged DELETE. A
+// snapshot or clone taken while one is flagged must not ask for its volume:
+// the replicas that already deleted it would fail the snapshot, and the
+// flag can stay for as long as a replica is offline.
+func LiveVolumeDefinitions(vds []VolumeDefinition) []VolumeDefinition {
+	return slices.DeleteFunc(slices.Clone(vds), func(vd VolumeDefinition) bool { return vd.Deleting() })
 }
 
 // VolumeDefinitionCreate is the upstream POST envelope for

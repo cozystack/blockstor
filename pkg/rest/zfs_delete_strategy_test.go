@@ -65,6 +65,12 @@ func seedDeleteStrategy(t *testing.T, scope, value string) store.Store {
 		t.Fatalf("seed replica: %v", err)
 	}
 
+	// No satellite runs here: an OFFLINE node keeps a delete that is let
+	// through from waiting out the whole confirmation budget.
+	if err := backend.Nodes().Create(ctx, &apiv1.Node{Name: "node-a", ConnectionStatus: apiv1.NodeTypeOffline}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
 	if err := backend.Snapshots().Create(ctx, &apiv1.Snapshot{Name: "s1", ResourceName: "rd-gated"}); err != nil {
 		t.Fatalf("seed snapshot: %v", err)
 	}

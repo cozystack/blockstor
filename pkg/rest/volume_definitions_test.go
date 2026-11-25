@@ -1454,8 +1454,9 @@ func TestVDDeleteUnknownReturns200Warning(t *testing.T) {
 				t.Errorf("ret_code: got %#x, want WARN bit (%#x) set", rc[0].RetCode, maskWarn)
 			}
 
-			if !strings.Contains(rc[0].Message, "already absent") {
-				t.Errorf("message: got %q, want 'already absent' marker", rc[0].Message)
+			// LINSTOR's WARN_NOT_FOUND text.
+			if !strings.HasSuffix(rc[0].Message, " not found.") || !strings.HasPrefix(rc[0].Message, "Resource definition: ") {
+				t.Errorf("message: got %q, want LINSTOR's \"Resource definition: <rd>, Volume number: <n> not found.\"", rc[0].Message)
 			}
 		})
 	}

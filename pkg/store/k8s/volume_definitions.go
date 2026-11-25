@@ -20,6 +20,7 @@ package k8s
 
 import (
 	"context"
+	"slices"
 	"sort"
 
 	"github.com/cockroachdb/errors"
@@ -411,6 +412,34 @@ func (s *volumeDefinitions) Delete(ctx context.Context, rdName string, volumeNum
 	}), "update RD %q to remove volume %d", rdName, volumeNumber)
 }
 
+// RemoveDeleted is store.VolumeDefinitionStore.RemoveDeleted. The check and
+// the removal are one optimistic write: a definition replaced in between
+// fails the write on its resourceVersion, and the retry sees the new one.
+func (s *volumeDefinitions) RemoveDeleted(ctx context.Context, rdName string, volumeNumber int32, deleteID string) error {
+	return errors.Wrapf(retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		rd, err := s.fetchRDLive(ctx, rdName)
+		if err != nil {
+			return err
+		}
+
+		idx := slices.IndexFunc(rd.Spec.VolumeDefinitions, func(vd crdv1alpha1.ResourceDefinitionVolume) bool {
+			return vd.VolumeNumber == volumeNumber
+		})
+		if idx == -1 {
+			return errors.Wrapf(store.ErrNotFound, "volume %d on resource definition %q", volumeNumber, rdName)
+		}
+
+		vd := &rd.Spec.VolumeDefinitions[idx]
+		if !slices.Contains(vd.Flags, crdv1alpha1.VolumeDefinitionFlagDelete) || vd.DeleteID != deleteID {
+			return errors.Wrapf(store.ErrVolumeDefinitionNotDeleting, "volume %d on resource definition %q", volumeNumber, rdName)
+		}
+
+		rd.Spec.VolumeDefinitions = slices.Delete(rd.Spec.VolumeDefinitions, idx, idx+1)
+
+		return s.c.Update(ctx, rd)
+	}), "remove volume %d of RD %q after its delete", volumeNumber, rdName)
+}
+
 // isConflictOrNotFound flags errors that justify a retry on the
 // VolumeDefinitions Create path. Conflict = RD spec mutated between
 // Get and Update (RD reconciler races our write). NotFound = the
@@ -500,6 +529,7 @@ func crdToWireVD(vd *crdv1alpha1.ResourceDefinitionVolume) apiv1.VolumeDefinitio
 		SizeKib:      vd.SizeKib,
 		Props:        vd.Props,
 		Flags:        vd.Flags,
+		DeleteID:     vd.DeleteID,
 	}
 }
 
@@ -509,6 +539,7 @@ func wireToCRDVD(vd *apiv1.VolumeDefinition) crdv1alpha1.ResourceDefinitionVolum
 		SizeKib:      vd.SizeKib,
 		Props:        vd.Props,
 		Flags:        vd.Flags,
+		DeleteID:     vd.DeleteID,
 	}
 }
 
@@ -536,6 +567,18 @@ func wireToCRDVD(vd *apiv1.VolumeDefinition) crdv1alpha1.ResourceDefinitionVolum
 func wireToCRDVDPreserving(prev *crdv1alpha1.ResourceDefinitionVolume, wire *apiv1.VolumeDefinition) crdv1alpha1.ResourceDefinitionVolume {
 	out := wireToCRDVD(wire)
 	out.DRBDMinor = prev.DRBDMinor
+
+	// A delete in flight stays in flight: a modify built from a wire value
+	// that never saw the DELETE flag must not clear it, nor swap the
+	// deleteID the replicas' confirmations are matched against. The CRD
+	// refuses the former anyway; this keeps the modify from failing on it.
+	if slices.Contains(prev.Flags, crdv1alpha1.VolumeDefinitionFlagDelete) {
+		if !slices.Contains(out.Flags, crdv1alpha1.VolumeDefinitionFlagDelete) {
+			out.Flags = append(slices.Clone(out.Flags), crdv1alpha1.VolumeDefinitionFlagDelete)
+		}
+
+		out.DeleteID = prev.DeleteID
+	}
 
 	return out
 }

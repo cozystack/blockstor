@@ -543,6 +543,8 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	srcVDs = apiv1.LiveVolumeDefinitions(srcVDs)
+
 	if !s.clonedStackHasItsPassphrase(r.Context(), w, &src, &req, len(srcVDs) > 0) {
 		return
 	}
@@ -2442,6 +2444,8 @@ func computeCloneStatus(ctx context.Context, st store.Store, srcName, targetName
 	if err != nil {
 		return clonestatus.Complete
 	}
+
+	srcVDs = apiv1.LiveVolumeDefinitions(srcVDs)
 
 	targetVDs, err := st.VolumeDefinitions().List(ctx, targetName)
 	if err != nil {

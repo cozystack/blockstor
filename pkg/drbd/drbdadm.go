@@ -2470,29 +2470,111 @@ func ParseConfiguredDeviceMinor(err error) (int32, bool) {
 // resource being initialised, best-effort `drbdsetup down`s it to free
 // the minor and retries create-md.
 func (a *Adm) ResourceOwningMinor(ctx context.Context, minor int32) (string, error) {
+	dev, err := a.minorDevice(ctx, minor)
+
+	return dev.resource, err
+}
+
+// ErrMinorInUse refuses to take a volume out of a resource that is Primary
+// or whose device is open: detaching it would leave its consumer without a
+// disk while its peers delete theirs.
+var ErrMinorInUse = errors.New("DRBD device is in use")
+
+// RemoveMinor takes one volume out of a loaded resource: `drbdsetup detach`
+// releases the backing device, then `drbdsetup del-minor` drops the DRBD
+// device itself. `drbdadm adjust` does the same for a volume a re-rendered
+// .res no longer lists; this is for the case it is not run, a resource
+// whose last volume goes, which renders no .res at all.
+//
+// The check comes before the detach, not after it. DRBD 9 lets an open
+// Primary detach while its peers are UpToDate and only del-minor refuses the
+// open device, so by then the consumer has already lost its local disk, and
+// the peers, seeing the volume gone, delete theirs. A Primary resource or an
+// open device is refused here, and a detach that fails on a volume that has
+// a disk stops the removal before anything else runs.
+func (a *Adm) RemoveMinor(ctx context.Context, minor int32) error {
+	return a.removeMinor(ctx, minor, nil)
+}
+
+// removeMinor is RemoveMinor with a check run after the detach, right
+// before del-minor; an error from it stops the removal there.
+func (a *Adm) removeMinor(ctx context.Context, minor int32, beforeDelMinor func(context.Context) error) error {
+	m := strconv.Itoa(int(minor))
+
+	dev, err := a.minorDevice(ctx, minor)
+	if err != nil {
+		return err
+	}
+
+	if dev.resource == "" {
+		return nil
+	}
+
+	if dev.role == "Primary" || dev.open == "yes" {
+		return errors.Wrapf(ErrMinorInUse, "minor %s of %s (role %s, open %s)", m, dev.resource, dev.role, dev.open)
+	}
+
+	if dev.disk != "Diskless" {
+		_, err = a.exec.Run(ctx, "drbdsetup", "detach", m)
+		if err != nil {
+			return errors.Wrapf(err, "drbdsetup detach %s", m)
+		}
+	}
+
+	if beforeDelMinor != nil {
+		err = beforeDelMinor(ctx)
+		if err != nil {
+			return err
+		}
+	}
+
+	_, err = a.exec.Run(ctx, "drbdsetup", "del-minor", m)
+	if err != nil {
+		return errors.Wrapf(err, "drbdsetup del-minor %s", m)
+	}
+
+	return nil
+}
+
+// minorDevice is what `drbdsetup status --verbose` says about one minor:
+// the resource that holds it, that resource's role, and the volume's disk
+// state and open count where the kernel reports one. A minor no kernel slot
+// holds comes back zero.
+type minorDevice struct {
+	resource string
+	role     string
+	disk     string
+	open     string
+}
+
+func (a *Adm) minorDevice(ctx context.Context, minor int32) (minorDevice, error) {
 	out, err := a.status(ctx, "--verbose")
 	if err != nil {
 		// `No currently configured DRBD found.` — kernel has no
 		// resources, so no minor is owned. Surface "" + nil.
 		if strings.Contains(string(out), "No currently configured DRBD") ||
 			strings.Contains(err.Error(), "No currently configured DRBD") {
-			return "", nil
+			return minorDevice{}, nil
 		}
 
-		return "", errors.Wrap(err, "drbdsetup status --verbose")
+		return minorDevice{}, errors.Wrap(err, "drbdsetup status --verbose")
 	}
 
+	return parseMinorDevice(string(out), minor), nil
+}
+
+func parseMinorDevice(out string, minor int32) minorDevice {
 	needle := fmt.Sprintf("minor:%d", minor)
 
-	var currentResource string
+	var current minorDevice
 
-	for line := range strings.SplitSeq(string(out), "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		// Column-0 line opens a new resource block.
 		if line != "" && line[0] != ' ' && line[0] != '\t' &&
 			!strings.HasPrefix(strings.TrimSpace(line), "#") {
 			fields := strings.Fields(line)
 			if len(fields) > 0 {
-				currentResource = fields[0]
+				current = minorDevice{resource: fields[0], role: statusField(fields, "role")}
 			}
 
 			continue
@@ -2501,12 +2583,27 @@ func (a *Adm) ResourceOwningMinor(ctx context.Context, minor int32) (string, err
 		// Indented volume line — look for the minor token. Use a
 		// space-bounded match so `minor:200` doesn't accidentally
 		// fire on `minor:20001`.
-		if slices.Contains(strings.Fields(line), needle) {
-			return currentResource, nil
+		fields := strings.Fields(line)
+		if slices.Contains(fields, needle) {
+			current.disk = statusField(fields, "disk")
+			current.open = statusField(fields, "open")
+
+			return current
 		}
 	}
 
-	return "", nil
+	return minorDevice{}
+}
+
+// statusField is the value of a `key:value` token, or "".
+func statusField(fields []string, key string) string {
+	for _, f := range fields {
+		if v, ok := strings.CutPrefix(f, key+":"); ok {
+			return v
+		}
+	}
+
+	return ""
 }
 
 // run is the single shell-out site so every drbdadm error gets

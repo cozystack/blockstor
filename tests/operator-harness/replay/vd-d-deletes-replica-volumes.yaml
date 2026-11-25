@@ -1,0 +1,84 @@
+name: vd-d-deletes-replica-volumes
+description: |
+  `vd d` deletes the volume on every replica, as LINSTOR does, and the
+  volume definition leaves the resource definition only once every
+  replica's satellite has confirmed. blockstor used to drop the
+  definition at once and leave each replica's backing volume on disk.
+
+  Sequence:
+    1. rd c + vd c (vol-0) + vd c (vol-1) on 2 diskful replicas.
+    2. Drive both volumes UpToDate.
+    3. `vd d 1`: the definition is flagged DELETE, each satellite takes
+       volume 1 out of DRBD and deletes its storage, then the definition
+       is removed. vd_count 1 holds only after both confirmed.
+    4. Every replica converges to exactly {0}, and volume 0 stays
+       UpToDate.
+
+  The backing-volume check itself (no `<rd>_00001` LV or zvol left on
+  either node) is kernel and disk truth that the harness cannot read; it
+  lives in the L6 cell tests/e2e/cli-matrix/vd-d-cascades-replicas.sh.
+  L1: pkg/rest/vd_delete_linstor_test.go and
+  pkg/satellite/controllers/vd_delete_test.go.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vol0
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: create-vol1
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-both-volumes-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: vd-d-vol1
+    cmd: ["volume-definition", "delete", "{{rd}}", "1"]
+    expect_exit: 0
+    await:
+      # Removed only once both satellites deleted their volume 1.
+      kind: vd_count
+      rd: "{{rd}}"
+      expected: 1
+      timeout_s: 120
+  - name: replicas-settle-on-vol0
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: volumes_settled
+      rd: "{{rd}}"
+      expected: "0"
+      settle_s: 8
+      polls: 5
+      timeout_s: 120
+  - name: vol0-stays-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 120
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

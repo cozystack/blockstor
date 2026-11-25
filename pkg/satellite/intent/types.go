@@ -781,6 +781,33 @@ func (x *ResourceApplyResult) GetMessage() string {
 	return x.Message
 }
 
+// DeleteVolumesRequest asks the satellite to delete some volumes of a
+// replica it keeps: the ones whose volume definition is flagged DELETE.
+type DeleteVolumesRequest struct {
+	// Name is the resource's kernel and storage name.
+	Name string
+
+	// Volumes are the volumes to delete.
+	Volumes []VolumeToDelete
+
+	// DeletedSuffix is the rename suffix recorded for this replica's
+	// zvols; see storage.SuffixedDeleter.
+	DeletedSuffix string
+}
+
+// VolumeToDelete is one volume of a DeleteVolumesRequest.
+type VolumeToDelete struct {
+	VolumeNumber int32
+
+	// Minor is the volume's DRBD minor; nil when the resource has no
+	// DRBD layer or the minor was never allocated.
+	Minor *int32
+
+	// StoragePool is the pool the volume lives in; empty on a diskless
+	// replica, which has no storage to delete.
+	StoragePool string
+}
+
 // DeleteResourceRequest is the apply chain's input for tearing
 // down a Resource on one satellite. Carries the RD name, the
 // pool the volumes were provisioned on, and the per-RD volume
