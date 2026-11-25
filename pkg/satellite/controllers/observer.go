@@ -2126,12 +2126,28 @@ func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm,
 // partitions. Read that way on every resync, a hundred replicas held
 // a satellite at its CPU limit, with the disk rescans the uevents set
 // off. drbdsetup asks the kernel over netlink and opens nothing.
+//
+// Every peer the observer holds is asked, not only the lowest: right
+// after a replica is deleted the observer still holds the peer the
+// kernel just dropped, and asking only that one fell through to
+// drbdmeta --force against the attached, in-use backing device of a
+// Primary. A replica with peers whose reads all failed publishes no GI
+// this time rather than read the disk: the kernel owns the metadata of
+// an attached device, and what drbdmeta finds there can trail it. The
+// backing device is read only for a replica without peers, which no
+// drbdsetup get-gi can name.
 func (o *ObserverRunnable) readCurrentGI(ctx context.Context, adm *drbd.Adm, name string, vol *volumeObservation) string {
-	if peer, ok := o.anyPeerNodeID(name); ok {
+	peers := o.peerNodeIDs(name)
+
+	for _, peer := range peers {
 		current, err := adm.KernelCurrentGI(ctx, name, peer, vol.VolumeNumber)
 		if err == nil && current != "" {
 			return current
 		}
+	}
+
+	if len(peers) > 0 {
+		return ""
 	}
 
 	current, err := adm.CurrentGI(ctx, name, vol.VolumeNumber, vol.BackingDev)
@@ -2142,28 +2158,23 @@ func (o *ObserverRunnable) readCurrentGI(ctx context.Context, adm *drbd.Adm, nam
 	return current
 }
 
-// anyPeerNodeID returns the lowest DRBD node-id of name's peers the
-// observer has seen, for naming a peer device to drbdsetup.
-func (o *ObserverRunnable) anyPeerNodeID(name string) (int32, bool) {
+// peerNodeIDs returns the DRBD node-ids of name's peers the observer
+// has seen, lowest first, for naming a peer device to drbdsetup.
+func (o *ObserverRunnable) peerNodeIDs(name string) []int32 {
 	o.connMu.Lock()
 	defer o.connMu.Unlock()
 
-	var (
-		lowest int32
-		found  bool
-	)
+	ids := make([]int32, 0, len(o.connCache[name]))
 
 	for _, peer := range o.connCache[name] {
-		if peer.PeerDRBDNodeID == nil {
-			continue
-		}
-
-		if !found || *peer.PeerDRBDNodeID < lowest {
-			lowest, found = *peer.PeerDRBDNodeID, true
+		if peer.PeerDRBDNodeID != nil {
+			ids = append(ids, *peer.PeerDRBDNodeID)
 		}
 	}
 
-	return lowest, found
+	slices.Sort(ids)
+
+	return ids
 }
 
 // rememberProbedGI keeps a get-gi result on the cached volume, so the
