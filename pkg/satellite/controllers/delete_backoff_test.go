@@ -31,7 +31,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
-var errDatasetBusy = errors.New("zfs destroy tank/pvc-del_00000: dataset is busy")
+var errZvolBusy = errors.New("zfs destroy tank/pvc-del_00000: dataset is busy")
 
 // busyProvider refuses every volume delete, as ZFS does for a zvol it
 // still counts as open right after `drbdsetup down`.
@@ -42,7 +42,7 @@ type busyProvider struct {
 func (p *busyProvider) DeleteVolume(ctx context.Context, vol storage.Volume) error {
 	_ = p.orderingProvider.DeleteVolume(ctx, vol)
 
-	return errDatasetBusy
+	return errZvolBusy
 }
 
 // A delete the storage refuses is retried after a back-off that doubles
