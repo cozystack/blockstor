@@ -368,6 +368,13 @@ type Reconciler struct {
 	// Process memory only: a restart allows another resizeRetryLimit.
 	resizeRetries map[string]resizeRetry
 
+	// metadataSlots records, per "<resource>/<volNumber>", the peer-slot
+	// count the volume's superblock holds, as this process created it
+	// or read it: a grow sizes the metadata for it before the read is
+	// published (Status.MetadataPeerSlots), and it is not read twice.
+	// Process memory only: after a restart the published count serves.
+	metadataSlots map[string]int32
+
 	// restoreClonedHere records, per "<resource>/<volNumber>", whether
 	// this process itself cloned or received the snapshot into a volume
 	// that was not on disk before (true), or first found the volume
@@ -514,6 +521,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		restoreBlankFallback:        map[string]bool{},
 		growSteps:                   map[string]growStep{},
 		resizeRetries:               map[string]resizeRetry{},
+		metadataSlots:               map[string]int32{},
 		restoreClonedHere:           map[string]bool{},
 		lastRecoveryPromoteAt:       map[string]time.Time{},
 		firstLateAddStallAt:         map[string]time.Time{},
@@ -1302,16 +1310,7 @@ func (r *Reconciler) superblockPeerSlots(ctx context.Context, dr *intent.Desired
 			return 0
 		}
 
-		target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
-
-		found, err := r.cfg.Adm.MetadataGeometry(ctx, target)
-		if err != nil {
-			log.FromContext(ctx).V(1).Info("cannot read the peer slots of the superblock yet", "volume", target, "error", err.Error())
-
-			return 0
-		}
-
-		slots, ok := drbd.PeerSlotCount(found.MaxPeers)
+		slots, ok := r.superblockSlotsOf(ctx, dr, vol)
 		if !ok {
 			return 0
 		}
@@ -1327,6 +1326,59 @@ func (r *Reconciler) superblockPeerSlots(ctx context.Context, dr *intent.Desired
 	}
 
 	return read
+}
+
+// superblockSlotsOf is the peer-slot count of vol's superblock: the one
+// this process created it with or read before, else read now with
+// dump-md and kept. A new replica's metadata is created here, so its
+// count is known without reading the disk again.
+func (r *Reconciler) superblockSlotsOf(ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume) (int32, bool) {
+	if slots, ok := r.knownMetadataSlots(dr.GetName(), vol.GetVolumeNumber()); ok {
+		return slots, true
+	}
+
+	target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
+
+	found, err := r.cfg.Adm.MetadataGeometry(ctx, target)
+	if err != nil {
+		log.FromContext(ctx).V(1).Info("cannot read the peer slots of the superblock yet", "volume", target, "error", err.Error())
+
+		return 0, false
+	}
+
+	slots, ok := drbd.PeerSlotCount(found.MaxPeers)
+	if !ok {
+		return 0, false
+	}
+
+	r.noteMetadataSlots(target, found.MaxPeers)
+
+	return slots, true
+}
+
+// noteMetadataSlots records the peer-slot count of the superblock of
+// target, "<resource>/<volNumber>", that this process created or read.
+func (r *Reconciler) noteMetadataSlots(target string, maxPeers int) {
+	slots, ok := drbd.PeerSlotCount(maxPeers)
+	if !ok {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.metadataSlots[target] = slots
+}
+
+// knownMetadataSlots is the count noteMetadataSlots recorded for a
+// volume, if any.
+func (r *Reconciler) knownMetadataSlots(rdName string, vn int32) (int32, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	slots, ok := r.metadataSlots[growKey(rdName, vn)]
+
+	return slots, ok
 }
 
 // readsSuperblockPeerSlots reports whether the pass that produced res
@@ -2448,7 +2500,8 @@ func (r *Reconciler) forgetResource(rdName string, volNums []int32) {
 // forgetRestoreRecord drops what this process recorded about restoring a
 // volume once that volume is deleted here, so a definition re-created
 // under the same name starts clean instead of inheriting a blank fallback
-// or a clone that no longer exists.
+// or a clone that no longer exists, and the peer slots of the metadata
+// that went with it.
 func (r *Reconciler) forgetRestoreRecord(rdName string, volNum int32) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -2457,6 +2510,7 @@ func (r *Reconciler) forgetRestoreRecord(rdName string, volNum int32) {
 	delete(r.restoreBlankFallback, key)
 	delete(r.restoreClonedHere, key)
 	delete(r.restoreSnapshotMissingTries, key)
+	delete(r.metadataSlots, growKey(rdName, volNum))
 }
 
 // bumpRestoreSnapshotMissing increments and returns the consecutive
@@ -5411,6 +5465,8 @@ func isLateAddWinner(dr *intent.DesiredResource) bool {
 func (r *Reconciler) createMDWithCollisionRecovery(ctx context.Context, selfRD, target string, geometry drbd.MetadataGeometry) error {
 	err := r.cfg.Adm.CreateMDWithGeometry(ctx, target, geometry)
 	if err == nil {
+		r.noteMetadataSlots(target, geometry.MaxPeers)
+
 		return nil
 	}
 
@@ -5451,7 +5507,14 @@ func (r *Reconciler) createMDWithCollisionRecovery(ctx context.Context, selfRD, 
 		return err //nolint:wrapcheck // caller wraps with create-md context
 	}
 
-	return r.cfg.Adm.CreateMDWithGeometry(ctx, target, geometry) //nolint:wrapcheck // caller wraps with create-md context
+	err = r.cfg.Adm.CreateMDWithGeometry(ctx, target, geometry)
+	if err != nil {
+		return err //nolint:wrapcheck // caller wraps with create-md context
+	}
+
+	r.noteMetadataSlots(target, geometry.MaxPeers)
+
+	return nil
 }
 
 // maybeStampMetadata is the create-md decision branch lifted out of
