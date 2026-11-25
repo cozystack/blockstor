@@ -2111,8 +2111,8 @@ func (r *ResourceReconciler) refreshDefinitionForFirstApply(
 }
 
 // refreshTargetFromAPIReader does an uncached Get on the target
-// Resource and overwrites `res` in place when the APIReader reports
-// non-nil DRBD-IDs. Returns true iff every DRBD-ID is now populated,
+// Resource and replaces `res` with that revision when the APIReader
+// reports non-nil DRBD-IDs. Returns true iff every DRBD-ID is now populated,
 // signalling the caller to fall through the wait gate. Returns false
 // when the APIReader also reports nil (controller really hasn't
 // stamped yet) or on lookup error (caller falls back to the cached
@@ -2145,9 +2145,14 @@ func (r *ResourceReconciler) refreshTargetFromAPIReader(ctx context.Context, res
 		return false
 	}
 
-	res.Status.DRBDNodeID = fresh.Status.DRBDNodeID
-	res.Status.DRBDPort = fresh.Status.DRBDPort
-	res.Status.DRBDMinor = fresh.Status.DRBDMinor
+	// The whole revision, not the three ids: the controller writes the
+	// replica's peer slots and skip-initial-sync decision in the spec
+	// write before it mirrors the ids, so ids taken alone would sit next
+	// to a cached spec that has neither. The apply would then size the
+	// lower disk for 15 slots and create 7-slot metadata on it a pass
+	// later, leaving the device larger than the definition and larger
+	// than every replica the controller stamped first.
+	*res = fresh
 
 	return true
 }
