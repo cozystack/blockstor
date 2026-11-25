@@ -46,6 +46,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/rest"
 	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
+	"github.com/cozystack/blockstor/pkg/version"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -358,7 +359,7 @@ func main() {
 	signalCtx := ctrl.SetupSignalHandler()
 	go waitForCacheSync(signalCtx, mgr, ready, func(msg string) { setupLog.Info(msg) })
 
-	setupLog.Info("Starting manager")
+	setupLog.Info("Starting manager", version.LogKey, version.Version)
 	if err := mgr.Start(signalCtx); err != nil {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
