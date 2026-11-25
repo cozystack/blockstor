@@ -84,11 +84,13 @@ func (s *Server) handleRGList(w http.ResponseWriter, r *http.Request) {
 	// list endpoint. Same semantics: names match as the store keys them,
 	// unknown names => empty list, missing param => no filter.
 	nameFilter := multiValueQuery(r, "resource_groups")
-	if len(nameFilter) > 0 {
+	propFilter := propsQuery(r)
+
+	if len(nameFilter) > 0 || len(propFilter) > 0 {
 		filtered := rgs[:0]
 
 		for i := range rgs {
-			if matchAnyName(nameFilter, rgs[i].Name) {
+			if matchAnyName(nameFilter, rgs[i].Name) && matchProps(propFilter, rgs[i].Props) {
 				filtered = append(filtered, rgs[i])
 			}
 		}
@@ -227,7 +229,9 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 
 	err = s.Store.ResourceGroups().Create(r.Context(), &rg)
 	if err != nil {
-		writeStoreError(w, err)
+		// FAIL_EXISTS_RSC_GRP on a duplicate: linstor-csi takes it for a
+		// concurrent CreateVolume that made the group first.
+		writeStoreErrorTyped(w, err, storeKindResourceGrp)
 
 		return
 	}
@@ -423,6 +427,25 @@ func applyRGUpdatePatch(existing, patch *apiv1.ResourceGroup, raw []byte) {
 // rather than failing the parent `rg modify` over a list-side hiccup.
 func countChildRDs(ctx context.Context, st store.Store, rgName string) int {
 	rds, err := st.ResourceDefinitions().List(ctx)
+
+	return childRDCount(rds, err, rgName)
+}
+
+// countChildRDsUncached is countChildRDs from the API server, for the
+// rg delete gate. The cache can still hold a definition a delete has
+// just removed: linstor-csi deletes the group right after the last
+// volume of its class, refused with FAIL_EXISTS_RSC_DFN it gives up,
+// and nothing deletes the group after that. LINSTOR answers from its
+// own state, which has the definition gone by then.
+func countChildRDsUncached(ctx context.Context, st store.Store, rgName string) int {
+	rds, err := st.ResourceDefinitions().ListUncached(ctx)
+
+	return childRDCount(rds, err, rgName)
+}
+
+// childRDCount counts the definitions of rds in rgName, -1 when the list
+// failed.
+func childRDCount(rds []apiv1.ResourceDefinition, err error, rgName string) int {
 	if err != nil {
 		return -1
 	}
@@ -871,7 +894,7 @@ func (s *Server) refuseRGDeleteIfReferenced(w http.ResponseWriter, r *http.Reque
 	// (the RG is presumed unsafe to drop) but degrade the message
 	// to omit the unknown count rather than print "-1 resource-
 	// definitions".
-	childCount := countChildRDs(r.Context(), s.Store, name)
+	childCount := countChildRDsUncached(r.Context(), s.Store, name)
 	if childCount == 0 {
 		return false
 	}
@@ -910,7 +933,7 @@ func (s *Server) captureResourceGroup(ctx context.Context, name string) (apiv1.R
 // when the delete is safe to commit. Mirrors Bug 145's
 // `rollbackSPDeleteIfRaced` shape.
 func (s *Server) rollbackRGDeleteIfRaced(w http.ResponseWriter, r *http.Request, name string, captured *apiv1.ResourceGroup) bool {
-	childCount := countChildRDs(r.Context(), s.Store, name)
+	childCount := countChildRDsUncached(r.Context(), s.Store, name)
 	if childCount == 0 {
 		return false
 	}

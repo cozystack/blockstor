@@ -21,6 +21,7 @@ package rest
 import (
 	"net/http"
 	"slices"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -234,6 +235,15 @@ func (s *Server) handleResourceToggleDisk(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// REST 1.28 says what to toggle into in the body; python-linstor sends
+	// every `r td` there once the controller advertises it. A request
+	// without a body is the flip this route did before.
+	if r.ContentLength != 0 {
+		s.toggleDiskByOperation(w, r)
+
+		return
+	}
+
 	if !s.refuseDiskfulWithoutPeerSlot(w, r, rdName, node) {
 		return
 	}
@@ -266,6 +276,80 @@ func (s *Server) handleResourceToggleDisk(w http.ResponseWriter, r *http.Request
 		RetCode: maskInfo,
 		Message: "resource '" + rdName + "' on '" + node + "' toggled to " + state,
 	}})
+}
+
+// toggleDiskRequest is LINSTOR's ToggleDiskRequest (REST 1.28).
+type toggleDiskRequest struct {
+	Operation   string   `json:"operation,omitempty"`
+	StoragePool string   `json:"storage_pool,omitempty"`
+	MigrateFrom string   `json:"migrate_from,omitempty"`
+	LayerList   []string `json:"layer_list,omitempty"`
+}
+
+// The operations of a toggle-disk request, matched case-insensitively as
+// LINSTOR's ToggleOp.parse does.
+const (
+	toggleIntoDiskful  = "into_drbd_diskful"
+	toggleIntoDiskless = "into_drbd_diskless"
+	toggleIntoClient   = "into_drbd_client"
+)
+
+// toggleDiskByOperation serves the REST 1.28 form of
+// `PUT .../resources/{node}/toggle-disk`: the body names the operation,
+// the storage pool and, for a migration, the node to migrate from. It
+// does what the older path forms do: `toggle-disk/diskful[/{pool}]`,
+// `toggle-disk/diskless` and `migrate-disk/{from}[/{pool}]`.
+//
+// INTO_DRBD_CLIENT, a diskless replica without a quorum vote, is refused:
+// blockstor renders no such replica. So is a layer list, which no toggle
+// here changes. A diskless storage pool is accepted and has no effect, as
+// blockstor keeps no diskless pools.
+func (s *Server) toggleDiskByOperation(w http.ResponseWriter, r *http.Request) {
+	var req toggleDiskRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if len(req.LayerList) > 0 {
+		writeError(w, http.StatusNotImplemented,
+			"toggle-disk with a layer list is not supported: the replica keeps the layers of its definition")
+
+		return
+	}
+
+	operation := strings.ToLower(req.Operation)
+
+	if req.MigrateFrom != "" {
+		if operation != "" && operation != toggleIntoDiskful {
+			writeError(w, http.StatusBadRequest,
+				"toggle-disk: migrate_from moves a disk, it needs operation INTO_DRBD_DISKFUL, not "+req.Operation)
+
+			return
+		}
+
+		r.SetPathValue("dst", r.PathValue("node"))
+		r.SetPathValue("src", req.MigrateFrom)
+		s.migrateDiskCommon(w, r, req.StoragePool)
+
+		return
+	}
+
+	switch operation {
+	case toggleIntoDiskful:
+		r.SetPathValue("pool", req.StoragePool)
+		s.handleResourceToggleDiskToDiskful(w, r)
+	case toggleIntoDiskless:
+		s.handleResourceToggleDiskToDiskless(w, r)
+	case toggleIntoClient:
+		writeError(w, http.StatusNotImplemented,
+			"toggle-disk INTO_DRBD_CLIENT is not supported: blockstor has no diskless replica without a "+
+				"quorum vote, use INTO_DRBD_DISKLESS")
+	case "":
+		writeError(w, http.StatusBadRequest, "No toggle operation type was specified")
+	default:
+		writeError(w, http.StatusBadRequest, "Could not parse '"+req.Operation+"'. Valid operations: "+
+			"INTO_DRBD_DISKFUL, INTO_DRBD_CLIENT, INTO_DRBD_DISKLESS")
+	}
 }
 
 // handleResourceToggleDiskToDiskless forces the replica to diskless,

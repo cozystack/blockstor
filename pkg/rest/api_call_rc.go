@@ -77,6 +77,13 @@ const warnRscNotFound = maskWarn | int64(2048)
 // two no-op replays.
 const warnRDNotFound = maskWarn | int64(2049)
 
+// warnNotFound is LINSTOR's generic WARN_NOT_FOUND (3000), the code
+// unmake-available answers for a definition that does not exist.
+// golinstor does not fail on a warning, so this only matters to a client
+// that matches the code itself, and to one comparing replies with
+// LINSTOR's.
+const warnNotFound = maskWarn | int64(3000)
+
 // warnRGNotFound flags a delete-of-missing on
 // `DELETE /v1/resource-groups/{rg}`. Bug 66: the Python linstor CLI
 // pipes the response body through its XML parser when the HTTP layer
@@ -258,12 +265,12 @@ const apiCallRcFailSnapshotsNotSupported int64 = 994
 const apiCallRcFailExistsSnapshotDfn int64 = 514
 
 // apiCallRcFailExistsStorPoolDfn mirrors upstream LINSTOR's
-// `ApiConsts.FAIL_EXISTS_STOR_POOL_DFN` (508). Emitted by
+// `ApiConsts.FAIL_EXISTS_STOR_POOL_DFN` (509; it was 508). Emitted by
 // `POST /v1/storage-pool-definitions` when a definition with the
 // requested name already exists. The MASK_ERROR bit is OR'd in by
-// the envelope wrapper at the call site; the bare 508 sub-code here
-// keeps the wire shape byte-identical to upstream's `linstor sp-d c`
-// reply on the same input.
+// the envelope wrapper at the call site; LINSTOR's own sub-code keeps
+// the wire shape byte-identical to upstream's `linstor sp-d c` reply
+// on the same input.
 //
 // Finding 6: blockstor never wired the POST handler before, so a
 // duplicate create returned 405 instead of this typed conflict. With
@@ -271,7 +278,7 @@ const apiCallRcFailExistsSnapshotDfn int64 = 514
 // `client.ApiCallError.Is(client.FAIL_EXISTS_STOR_POOL_DFN)` returns
 // true on a real duplicate — operators that branch on typed errors
 // can treat "already exists" as a no-op success.
-const apiCallRcFailExistsStorPoolDfn int64 = 508
+const apiCallRcFailExistsStorPoolDfn int64 = 509
 
 // warnStoragePoolDfnNotFound flags a delete-of-missing on
 // `DELETE /v1/storage-pool-definitions/{name}`. Sub-code 2059 sits
@@ -331,7 +338,8 @@ const apiCallRcFailInvldVlmSize int64 = 206
 const apiCallRcFailInvldVlmNr int64 = 205
 
 // apiCallRcFailExistsVlmDfn mirrors upstream LINSTOR's
-// `ApiConsts.FAIL_EXISTS_VLM_DFN` (502). Emitted by `POST
+// `ApiConsts.FAIL_EXISTS_VLM_DFN` (503; it was 502, which is LINSTOR's
+// FAIL_EXISTS_RSC). Emitted by `POST
 // /v1/resource-definitions/{rd}/volume-definitions` when the
 // requested VolumeNumber already has a definition under the parent
 // RD. Bug 140: the in-tree handler used to surface
@@ -340,30 +348,25 @@ const apiCallRcFailInvldVlmNr int64 = 205
 // audit-log greppers that routed on the upstream catalogue missed
 // the conflict.
 //
-// Choosing 502 (rather than a fresh sub-code in our 996+ range)
-// keeps the wire shape byte-identical to upstream's `linstor vd c`
-// reply on the same input — alongside FAIL_EXISTS_RSC_DFN (501)
-// and FAIL_EXISTS_SNAPSHOT_DFN (514) which are already in this
-// file.
-const apiCallRcFailExistsVlmDfn int64 = 502
+// LINSTOR's own value keeps the wire shape byte-identical to upstream's
+// `linstor vd c` reply on the same input, and linstor-csi from v1.13
+// tests it with errors.Is to tell a concurrent restore of the volume
+// definitions from a failure.
+const apiCallRcFailExistsVlmDfn int64 = 503
 
 // apiCallRcFailInvldStorPoolName mirrors upstream LINSTOR's
-// `ApiConsts.FAIL_INVLD_STOR_POOL_NAME` (552). Bug 135 uses it on
+// `ApiConsts.FAIL_INVLD_STOR_POOL_NAME` (208; it was 552). Bug 135 uses it on
 // `POST /v1/nodes/{node}/storage-pools` when the requested backing
 // VG / zpool isn't in the satellite's `Aux/DiscoveredVGs` /
 // `Aux/DiscoveredZPools` set. The MASK_ERROR bit is OR'd in by the
-// envelope wrapper at the call site; the bare 552 sub-code here
-// keeps the wire shape byte-identical to upstream's `linstor sp c`
-// reply on the same input.
-//
-// Choosing 552 (rather than a fresh sub-code in our 996+ range) lets
-// audit-log greppers that already classify upstream's
-// FAIL_INVLD_STOR_POOL_NAME traffic catch blockstor's equivalent
-// without a separate rule.
-const apiCallRcFailInvldStorPoolName int64 = 552
+// envelope wrapper at the call site; LINSTOR's own sub-code keeps the
+// wire shape byte-identical to upstream's `linstor sp c` reply on the
+// same input.
+const apiCallRcFailInvldStorPoolName int64 = 208
 
 // apiCallRcFailExistsStorPool mirrors upstream LINSTOR's
-// `ApiConsts.FAIL_EXISTS_STOR_POOL` (508). Emitted by
+// `ApiConsts.FAIL_EXISTS_STOR_POOL` (510; it was 508, which is LINSTOR's
+// FAIL_EXISTS_VLM_CONN). Emitted by
 // `POST /v1/nodes/{node}/storage-pools` when an SP with the same
 // (node, pool) already exists. Bug-hunt v0.1.3 Finding 1: the pre-fix
 // handler silently mutated the live row's Props / ProviderKind /
@@ -373,13 +376,10 @@ const apiCallRcFailInvldStorPoolName int64 = 552
 // POST is CREATE-only; mutation lives behind PUT (storage-pool modify).
 //
 // The MASK_ERROR bit is OR'd in by the `apiCallRcError` envelope
-// wrapper at the call site; the bare 508 sub-code here keeps the
-// wire shape byte-identical to upstream's `linstor sp c` reply on
-// the same input. Choosing 508 (rather than a fresh sub-code in our
-// 996+ range) lets audit-log greppers that already classify
-// upstream's FAIL_EXISTS_STOR_POOL traffic catch blockstor's
-// equivalent without a separate rule.
-const apiCallRcFailExistsStorPool int64 = 508
+// wrapper at the call site; LINSTOR's own sub-code keeps the wire
+// shape byte-identical to upstream's `linstor sp c` reply on the same
+// input.
+const apiCallRcFailExistsStorPool int64 = 510
 
 // apiCallRcFailExistsNode mirrors upstream LINSTOR's
 // `ApiConsts.FAIL_EXISTS_NODE` (500). Wired through
@@ -413,12 +413,11 @@ const apiCallRcFailExistsNode int64 = 500
 // returned false and piraeus-operator could not branch on "already
 // exists" vs. real conflict.
 //
-// Upstream `ApiConsts.FAIL_EXISTS_RSC` is 502, which collides with
-// blockstor's historical `apiCallRcFailExistsVlmDfn` (also 502).
-// We park FAIL_EXISTS_RSC at 504 — outside the upstream cluster —
-// so golinstor's `Is(FAIL_EXISTS_RSC)` check uses a distinct sub-code
-// from VlmDfn while staying in the blockstor-internal allocation band.
-const apiCallRcFailExistsRsc int64 = 504
+// Upstream `ApiConsts.FAIL_EXISTS_RSC` is 502. It was parked at 504
+// while FAIL_EXISTS_VLM_DFN sat on 502 by mistake; both now carry
+// LINSTOR's own values, which linstor-csi from v1.13 tests with
+// errors.Is to tell a concurrent restore from a failure.
+const apiCallRcFailExistsRsc int64 = 502
 
 // apiCallRcFailExistsRscGrp mirrors upstream LINSTOR's
 // `ApiConsts.FAIL_EXISTS_RSC_GRP`. Emitted by `POST
@@ -432,11 +431,11 @@ const apiCallRcFailExistsRsc int64 = 504
 // distinguish "RG already exists" from any other 5xx-class store
 // error.
 //
-// 510 (rather than upstream's 522 in `third_party/linstor-common/
-// consts.json`) is the blockstor-internal allocation chosen by the
-// bug-hunt report so the sub-code is stable across the typed
-// duplicate-create family.
-const apiCallRcFailExistsRscGrp int64 = 510
+// 522, LINSTOR's value in `third_party/linstor-common/consts.json`:
+// linstor-csi from v1.13 treats it as a concurrent CreateVolume having
+// made the group first. An earlier blockstor-internal 510 is LINSTOR's
+// FAIL_EXISTS_STOR_POOL, so golinstor read it as something else.
+const apiCallRcFailExistsRscGrp int64 = 522
 
 // apiCallRcFailNotFoundNode mirrors upstream LINSTOR's
 // `ApiConsts.FAIL_NOT_FOUND_NODE`. Used by `writeStoreErrorTyped` on
@@ -448,11 +447,10 @@ const apiCallRcFailExistsRscGrp int64 = 510
 // path that surfaces a Node NotFound through `writeStoreError`
 // (rather than the inline gate) still gets the typed band.
 //
-// 503 (rather than upstream's 300 in `third_party/linstor-common/
-// consts.json`) is the blockstor-internal allocation chosen by the
-// bug-hunt report so the typed duplicate / not-found family is
-// numerically contiguous.
-const apiCallRcFailNotFoundNode int64 = 503
+// 300, LINSTOR's value. The blockstor-internal 503 that preceded it is
+// LINSTOR's FAIL_EXISTS_VLM_DFN, and LINSTOR answers its not-found band
+// (300-399) with HTTP 404.
+const apiCallRcFailNotFoundNode int64 = 300
 
 // apiCallRcFailNotFoundRscDfn mirrors upstream LINSTOR's
 // `ApiConsts.FAIL_NOT_FOUND_RSC_DFN`. Used by `writeStoreErrorTyped`
@@ -463,10 +461,8 @@ const apiCallRcFailNotFoundNode int64 = 503
 // covers the post-gate paths that surface a NotFound from the store
 // (cache lag, race with a concurrent `rd d`).
 //
-// 540 (rather than upstream's 301 in `third_party/linstor-common/
-// consts.json`) is the blockstor-internal allocation chosen by the
-// bug-hunt report.
-const apiCallRcFailNotFoundRscDfn int64 = 540
+// 301, LINSTOR's value in `third_party/linstor-common/consts.json`.
+const apiCallRcFailNotFoundRscDfn int64 = 301
 
 // apiCallRcFailNotFoundStorPool mirrors upstream LINSTOR's
 // `ApiConsts.FAIL_NOT_FOUND_STOR_POOL`. Used by `writeStoreErrorTyped`
@@ -475,10 +471,8 @@ const apiCallRcFailNotFoundRscDfn int64 = 540
 // the target node and the existing Bug-118 inline gate is bypassed
 // (cache lag, race with a concurrent `sp d`).
 //
-// 550 (rather than upstream's 310 in `third_party/linstor-common/
-// consts.json`) is the blockstor-internal allocation chosen by the
-// bug-hunt report.
-const apiCallRcFailNotFoundStorPool int64 = 550
+// 310, LINSTOR's value in `third_party/linstor-common/consts.json`.
+const apiCallRcFailNotFoundStorPool int64 = 310
 
 // ObjRefs key constants — the wire-side identifiers upstream LINSTOR
 // uses to tag ApiCallRc entries with the object(s) the message refers
