@@ -48,35 +48,39 @@ var (
 // commit + image build time, which differ per image — vars (Bug 169)
 // so the Dockerfile can stamp them via `-ldflags -X`.
 const (
-	LinstorVersion = "1.33.2"
-	// RestAPIVersion: bumped from "1.23.0" → "1.27.0" (Bug 222). The
-	// upstream Java LINSTOR contract advanced through 1.24, 1.25, 1.26
-	// and 1.27 while we still advertised 1.23 — and python-linstor's
-	// `_require_version()` gates every CLI flag added in that window
-	// (e.g. `--storage-pool-list`, `--diskless-on-remaining` second
-	// form, several rg-modify keys) client-side on this string. Until
-	// we report a version >= the gate, the CLI refuses to even send
-	// the request and blockstor looks like it's missing features it
-	// actually serves.
+	// LinstorVersion is the LINSTOR release whose REST contract blockstor
+	// serves; see RestAPIVersion for the one place it differs.
+	LinstorVersion = "1.35.0"
+	// RestAPIVersion opens python-linstor's client-side
+	// `_require_version()` gates, and linstor-csi from v1.13 refuses to
+	// start below 1.29 (MinimumRestApiMinor in its highlevelclient).
+	// History: 1.23.0 until Bug 222 raised it to 1.27.0, which stayed
+	// until truncate and delete_empty_resource_definition (1.29.0) were
+	// served. make-available's auto_manage_dual_primary and
+	// unmake-available, which linstor-csi v1.13 also needs, are in
+	// LINSTOR 1.35.0's spec but in no CHANGELOG-OPENAPI.md entry.
 	//
-	// Bug 238 (OpenAPI spec version drift): the vendored OpenAPI spec
-	// at `third_party/linstor-openapi/rest_v1_openapi.yaml` carries
-	// `info.version: 1.28.0` — strictly newer than what we serve
-	// here. The served version is deliberately the LOWER of (vendored
-	// spec, supported endpoints): the 1.28.0 spec includes endpoints
-	// blockstor has not yet wired (snapshot-clone data plane, full
-	// rebalance, etc.), so advertising 1.28.0 would open additional
-	// python-linstor `_require_version` gates whose CLI calls then
-	// either 404 or silently produce wrong results.
+	// It is the highest version whose additions are all either served or
+	// refused with an explicit 501 because they have no meaning here
+	// (database export, API tokens, drbd-reactorctl, DRBD client
+	// replicas). 1.29.1, which LINSTOR 1.35.0 serves, only adds clone
+	// volume_sizes; blockstor refuses that one but could serve it, so the
+	// version stops at 1.29.0 and python-linstor keeps the flag gated.
+	//
+	// The spec is not vendored here any more: it went with the switch to
+	// golinstor's types, and `make rest-types` still names the regen
+	// script that went with it. 1.29.0 was checked against LINSTOR
+	// v1.35.0: docs/rest_v1_openapi.yaml, whose info.version is 1.29.1,
+	// and CHANGELOG-OPENAPI.md at the root.
 	//
 	// When bumping this string a future contributor MUST:
-	//   1. confirm every endpoint added between RestAPIVersion and
-	//      `third_party/linstor-openapi/rest_v1_openapi.yaml`
-	//      info.version is either wired or refused with an explicit
-	//      501 envelope;
-	//   2. update `pkg/version/bug_238_test.go` to reflect the new
-	//      alignment (or document the new divergence).
-	RestAPIVersion = "1.27.0"
+	//   1. confirm every endpoint and field added up to the new version
+	//      in CHANGELOG-OPENAPI.md and the rest_v1_openapi.yaml of the
+	//      LINSTOR release that serves it is either wired or refused
+	//      with an explicit 501 envelope;
+	//   2. update the compatibility matrix in docs/linstor-csi-compatibility.md
+	//      and pkg/rest/version_bug_222_test.go.
+	RestAPIVersion = "1.29.0"
 )
 
 // LinstorGitHash is the blockstor source commit SHA. Default

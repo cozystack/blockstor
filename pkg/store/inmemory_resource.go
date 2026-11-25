@@ -20,6 +20,7 @@ package store
 
 import (
 	"context"
+	"maps"
 	"slices"
 	"sort"
 	"sync"
@@ -40,6 +41,10 @@ type inMemoryResources struct {
 	mu        sync.RWMutex
 	m         map[rKey]apiv1.Resource
 	volStates map[rKey]map[int32]apiv1.VolumeState
+
+	// rds lets a replica delete take the resource-connection props of
+	// its node off the definition, as the Kubernetes store does.
+	rds *inMemoryResourceDefinitions
 }
 
 func (s *inMemoryResources) List(_ context.Context) ([]apiv1.Resource, error) {
@@ -204,6 +209,7 @@ func (s *inMemoryResources) Delete(_ context.Context, rdName, node string) error
 	}
 
 	delete(s.m, key)
+	s.dropConnectionProps(rdName, node)
 
 	return nil
 }
@@ -233,6 +239,7 @@ func (s *inMemoryResources) DeleteIfTieBreaker(_ context.Context, rdName, node s
 	}
 
 	delete(s.m, key)
+	s.dropConnectionProps(rdName, node)
 
 	return true, nil
 }
@@ -321,4 +328,24 @@ func (s *inMemoryResources) VolumeStateForTest(rdName, node string, volumeNumber
 	st, ok := s.volStates[resourceKey(rdName, node)][volumeNumber]
 
 	return st, ok
+}
+
+// dropConnectionProps takes the resource-connection props of node off
+// the definition; see the Kubernetes store's twin.
+func (s *inMemoryResources) dropConnectionProps(rdName, node string) {
+	if s.rds == nil {
+		return
+	}
+
+	s.rds.mu.Lock()
+	defer s.rds.mu.Unlock()
+
+	rd, ok := s.rds.m[naming.Key(rdName)]
+	if !ok || !apiv1.DropResourceConnectionProps(node, maps.Clone(rd.Props)) {
+		return
+	}
+
+	working := cloneForPatch(rd)
+	apiv1.DropResourceConnectionProps(node, working.Props)
+	s.rds.m[naming.Key(rdName)] = working
 }

@@ -19,6 +19,7 @@ limitations under the License.
 package rest
 
 import (
+	"maps"
 	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -117,4 +118,12 @@ func redactSensitiveEffectiveProps(eff apiv1.EffectiveProperties) {
 			eff[k] = entry
 		}
 	}
+}
+
+// redactedProps returns a redacted copy of props, leaving props as it is.
+func redactedProps(props map[string]string) map[string]string {
+	out := maps.Clone(props)
+	redactSensitiveProps(out)
+
+	return out
 }
