@@ -1272,6 +1272,17 @@ func (s *Server) refuseRDPeerSlotsModify(w http.ResponseWriter, r *http.Request,
 	return true
 }
 
+// markAndCascadeRDDelete flags the definition DELETE and stamps the
+// delete on every child replica, the order handleRDDelete relies on.
+func (s *Server) markAndCascadeRDDelete(ctx context.Context, name string) error {
+	err := store.MarkDefinitionDeleting(ctx, s.Store, name)
+	if err != nil {
+		return err //nolint:wrapcheck // the caller maps store errors to REST codes
+	}
+
+	return s.cascadeDeleteResources(ctx, name)
+}
+
 // handleRDDelete drops an RD plus cascades the per-replica teardown.
 //
 // Idempotent on NotFound (Bug 56 sibling): CSI spec § DeleteVolume
@@ -1327,14 +1338,7 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// existing `blockstor.org/satellite-resource`
 	// finalizer then drains DRBD before the apiserver removes
 	// the object.
-	err = store.MarkDefinitionDeleting(r.Context(), s.Store, name)
-	if err != nil {
-		writeStoreError(w, err)
-
-		return
-	}
-
-	err = s.cascadeDeleteResources(r.Context(), name)
+	err = s.markAndCascadeRDDelete(r.Context(), name)
 	if err != nil {
 		writeStoreError(w, err)
 
