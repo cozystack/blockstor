@@ -737,16 +737,9 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 	// so the modify delta is re-applied to the freshly-fetched VD on
 	// every retry. The previous `Get → mutate → Update` path's retry
 	// loop replayed the caller's stale wire snapshot and silently lost
-	// concurrent prop edits on the same VD.
-	err = s.Store.VolumeDefinitions().PatchVolumeDefinitionSpec(r.Context(), rd, vn, func(vd *apiv1.VolumeDefinition) error {
-		mergeVolumeDefinitionPatch(vd, &patch)
-
-		// Path-derived VolumeNumber wins — never trust the body's
-		// vol_num.
-		vd.VolumeNumber = vn
-
-		return nil
-	})
+	// concurrent prop edits on the same VD. The answer waits until the
+	// cache shows the write, so a read after it does too.
+	err = s.patchVolumeDefinition(r.Context(), rd, vn, &patch)
 	if err != nil {
 		writeStoreError(w, err)
 

@@ -519,6 +519,16 @@ func (r *ResourceReconciler) maybeAutoDiskful(
 		return false, nil
 	}
 
+	// A diskless replica in use during a live migration is the
+	// migration's target, Primary next to the source. Attaching a disk
+	// to it then means a full resync while two nodes write, and the
+	// unmake-available that follows the migration keeps a diskful
+	// replica it was meant to remove. Wait until the migration is over.
+	migrating, err := r.dualPrimaryOpen(ctx, target)
+	if err != nil || migrating {
+		return false, err
+	}
+
 	hasDeficit, err := r.hasDiskfulDeficit(ctx, peers, rd)
 	if err != nil {
 		return false, err
@@ -558,6 +568,22 @@ func (r *ResourceReconciler) maybeAutoDiskful(
 	}
 
 	return true, nil
+}
+
+// dualPrimaryOpen reports whether the definition of target lets target be
+// Primary next to another node (see apiv1.DualPrimaryOpen). A definition
+// that is gone opens nothing.
+func (r *ResourceReconciler) dualPrimaryOpen(ctx context.Context, target *blockstoriov1alpha1.Resource) (bool, error) {
+	rd, err := r.Store.ResourceDefinitions().Get(ctx, target.Spec.ResourceDefinitionName)
+	if err != nil {
+		if cerrors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	return apiv1.DualPrimaryOpen(rd.Props, target.Spec.NodeName), nil
 }
 
 // hasDiskfulDeficit reports whether the volume has fewer live diskful

@@ -108,6 +108,10 @@ func TestGroupFRCreateExplicit(t *testing.T) {
 func TestGroupFRAutoPlace2ReachesUpToDate(t *testing.T) {
 	stack, cli, rd := setupGroupFRD(t, "ap2")
 
+	// The election only runs until a replica reports data; keep the
+	// definition at day0 so the invariant is checked where it holds.
+	stack.Satellite.SimulateVolumesUnreported(rd)
+
 	cli.JSON(t, "resource", "create", rd, "--auto-place", "2",
 		"--storage-pool", "lvm-thin")
 

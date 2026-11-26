@@ -1086,31 +1086,31 @@ func snapshotDeleteFailureRcs(rd, snapName string, failures []apiv1.SnapshotDele
 // surface 504 + an actionable envelope citing the stuck-state if
 // the budget runs out. The success path (snapshot reaped within
 // budget) keeps the existing 200 + maskInfo wire shape.
+//
+// `delete_empty_resource_definition` (REST 1.29) also deletes the definition
+// once neither a replica nor a snapshot is left, see deleteDefinitionIfEmpty;
+// linstor-csi from v1.13 sends it on every DeleteSnapshot. As in LINSTOR it
+// runs after a snapshot that was already gone as well, so a retry finishes
+// what an earlier attempt left. `nodes`, a delete on some nodes only, is
+// refused: the snapshot would go on every node.
 func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 	snapName := r.PathValue("snap")
+
+	if nodes := multiValueQuery(r, "nodes"); len(nodes) > 0 {
+		writeError(w, http.StatusNotImplemented,
+			"deleting snapshot '"+snapName+"' of '"+rd+"' on some nodes only is not supported: "+
+				"leave out the node list to delete it everywhere")
+
+		return
+	}
 
 	// A missing snapshot is answered before any restore is judged: there is
 	// nothing to hold, and the idempotent 200 is what a CSI retry needs.
 	err := store.DeleteSnapshot(r.Context(), s.Store, rd, snapName)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			// A retry of a delete that timed out lands here once the
-			// finalizer drained. Answer only after the cache has seen the
-			// snapshot go too, as the resource delete does: LINSTOR serves
-			// every read after the answer from the model the delete
-			// changed. Lag is not a stuck satellite, so the outcome of
-			// the wait does not change the answer.
-			_ = s.waitForSnapshotDeletionVisible(r.Context(), rd, snapName)
-
-			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-				RetCode: warnSnapshotNotFound,
-				Message: "snapshot already absent: " + snapName,
-				ObjRefs: map[string]string{
-					objRefRscDfn:      rd,
-					objRefSnapshotDfn: snapName,
-				},
-			}})
+			s.answerSnapshotAbsent(w, r, rd, snapName)
 
 			return
 		}
@@ -1158,8 +1158,47 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+	s.answerSnapshotDeleted(w, r, rd, &apiv1.APICallRc{
 		RetCode: maskInfo,
 		Message: "snapshot deleted: " + snapName,
-	}})
+	})
+}
+
+// answerSnapshotAbsent answers a snapshot delete that found the snapshot
+// gone. A retry of a delete that timed out lands here once the finalizer
+// drained. It answers only after the cache has seen the snapshot go too,
+// as the resource delete does: LINSTOR serves every read after the
+// answer from the model the delete changed. Lag is not a stuck
+// satellite, so the outcome of the wait does not change the answer.
+func (s *Server) answerSnapshotAbsent(w http.ResponseWriter, r *http.Request, rd, snapName string) {
+	_ = s.waitForSnapshotDeletionVisible(r.Context(), rd, snapName)
+
+	s.answerSnapshotDeleted(w, r, rd, &apiv1.APICallRc{
+		RetCode: warnSnapshotNotFound,
+		Message: "snapshot already absent: " + snapName,
+		ObjRefs: map[string]string{
+			objRefRscDfn:      rd,
+			objRefSnapshotDfn: snapName,
+		},
+	})
+}
+
+// answerSnapshotDeleted answers a snapshot delete that went through, or
+// found the snapshot gone, after deleting the definition as well when the
+// request asked for it and nothing is left on it.
+func (s *Server) answerSnapshotDeleted(w http.ResponseWriter, r *http.Request, rd string, done *apiv1.APICallRc) {
+	answer := []apiv1.APICallRc{*done}
+
+	if queryFlag(r, deleteEmptyRDQuery) {
+		deleted, err := s.deleteDefinitionIfEmpty(r.Context(), rd)
+		if err != nil {
+			writeStoreError(w, err)
+
+			return
+		}
+
+		answer = append(answer, deleted...)
+	}
+
+	writeJSON(w, http.StatusOK, answer)
 }

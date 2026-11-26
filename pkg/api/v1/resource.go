@@ -236,11 +236,14 @@ type Volume struct {
 }
 
 // VolumeLayerData mirrors upstream LINSTOR's per-volume layer
-// descriptor: a `type` (DRBD/STORAGE/LUKS/…) plus an opaque
-// `data` blob (we leave it empty for now — the CLI only reads
-// the type discriminator to gate the disk_state trust path).
+// descriptor: a `type` (DRBD/STORAGE/LUKS/…) plus the layer's `data`.
+// Only the STORAGE layer of a replica with a disk carries data: the
+// sizes linstor-csi adds up to the capacity a thin pool has promised
+// (ReservedCapacity) when a StorageClass sets overProvision. The CLI
+// only reads the type discriminator to gate the disk_state trust path.
 type VolumeLayerData struct {
-	Type string `json:"type"`
+	Type string              `json:"type"`
+	Data *StorageVolumeLayer `json:"data,omitempty"`
 }
 
 // VolumeState is the runtime state surface of a Volume.
@@ -325,6 +328,12 @@ type ResourceModify struct {
 	LayerObject      *ResourceLayer    `json:"layer_object,omitempty"`
 	Annotations      map[string]string `json:"annotations,omitempty"`
 	ToggleDiskCancel bool              `json:"toggle_disk_cancel,omitempty"`
+	// DrbdTiebreaker and DrbdClient (REST 1.28) turn a diskless replica
+	// into a tiebreaker or a diskless replica without a quorum vote, or
+	// back. blockstor refuses both, apart from drbd_client=false, which
+	// every replica here already is.
+	DrbdTiebreaker *bool `json:"drbd_tiebreaker,omitempty"`
+	DrbdClient     *bool `json:"drbd_client,omitempty"`
 	// NO `omitempty` here: mirrors Resource.Volumes / ResourceWithVolumes.Volumes
 	// (Bug 137 follow-up). GET emits `volumes` even when nil/empty;
 	// the operator's round-trip pipes the same wire shape back.

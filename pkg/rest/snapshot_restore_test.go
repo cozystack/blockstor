@@ -1113,10 +1113,9 @@ func TestSnapshotRestoreVolumeDefinitionConflict_G3b(t *testing.T) {
 		t.Fatalf("ret_code: got %+v, want a negative (error) code", rc)
 	}
 
-	// FAIL_EXISTS_VLM_DFN (502) sub-code so golinstor's typed matcher fires.
-	const failBit = 502
-	if rc[0].RetCode&failBit != failBit {
-		t.Errorf("ret_code: got %#x, want FAIL_EXISTS_VLM_DFN (502) bit set", rc[0].RetCode)
+	// FAIL_EXISTS_VLM_DFN (503) so golinstor's typed matcher fires.
+	if rc[0].RetCode != apiCallRcError|apiCallRcFailExistsVlmDfn {
+		t.Errorf("ret_code: got %#x, want FAIL_EXISTS_VLM_DFN (503)", rc[0].RetCode)
 	}
 
 	// The target RD's original volume 0 must remain untouched (size
