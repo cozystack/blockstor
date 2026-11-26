@@ -147,7 +147,7 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	a.logger.Info("agent starting",
 		"node", a.cfg.NodeName,
-		"blockstor_version", version.Version)
+		version.LogKey, version.Version)
 
 	rec := a.newReconciler()
 
