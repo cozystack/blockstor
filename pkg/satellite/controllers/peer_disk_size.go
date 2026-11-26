@@ -74,7 +74,11 @@ func peerSizeRefusals(res *blockstoriov1alpha1.Resource, peers []blockstoriov1al
 
 		for i := range peers {
 			peer := &peers[i]
-			if naming.Same(peer.Spec.NodeName, res.Spec.NodeName) || slices.Contains(peer.Spec.Flags, apiv1.ResourceFlagDiskless) {
+			// An INACTIVE peer is left out of the .res, so DRBD never
+			// dials it; the size it reported before is stale.
+			if naming.Same(peer.Spec.NodeName, res.Spec.NodeName) ||
+				slices.Contains(peer.Spec.Flags, apiv1.ResourceFlagDiskless) ||
+				slices.Contains(peer.Spec.Flags, apiv1.ResourceFlagInactive) {
 				continue
 			}
 

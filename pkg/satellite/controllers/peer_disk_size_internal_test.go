@@ -82,6 +82,7 @@ func TestPeerSizeRefusals(t *testing.T) {
 		"equal sizes":                    {larger, []*blockstoriov1alpha1.Resource{sizedReplica("luc", 65564, "Inconsistent", nil)}, nil},
 		"peer that reported no size yet": {larger, []*blockstoriov1alpha1.Resource{sizedReplica("luc", 0, "", nil)}, nil},
 		"diskless peer":                  {larger, []*blockstoriov1alpha1.Resource{disklessPeer(luc)}, nil},
+		"inactive peer":                  {larger, []*blockstoriov1alpha1.Resource{flaggedPeer(luc, apiv1.ResourceFlagInactive)}, nil},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -104,8 +105,12 @@ func TestPeerSizeRefusals(t *testing.T) {
 }
 
 func disklessPeer(res *blockstoriov1alpha1.Resource) *blockstoriov1alpha1.Resource {
+	return flaggedPeer(res, apiv1.ResourceFlagDiskless)
+}
+
+func flaggedPeer(res *blockstoriov1alpha1.Resource, flag string) *blockstoriov1alpha1.Resource {
 	out := res.DeepCopy()
-	out.Spec.Flags = []string{apiv1.ResourceFlagDiskless}
+	out.Spec.Flags = []string{flag}
 
 	return out
 }
