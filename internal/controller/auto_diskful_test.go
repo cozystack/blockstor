@@ -373,3 +373,65 @@ func TestAutoDisklessSkipsWhenNoPool(t *testing.T) {
 		t.Errorf("StorPoolName set without a pool: %v", got.Spec.Props)
 	}
 }
+
+// A diskless replica in use while a live migration is prepared to its
+// node is the migration target, Primary next to the source: it stays
+// diskless until the migration is over, so no disk is attached and
+// resynced while two nodes write.
+func TestAutoDisklessWaitsForTheLiveMigration(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+
+	_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "stand",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+	})
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name: "pvc-migrating",
+		Props: map[string]string{
+			apiv1.LiveMigrateSourceProp: "n0",
+			apiv1.LiveMigrateTargetProp: "n1",
+			apiv1.ResourceConnectionPropKey("n0", "n1", apiv1.AllowTwoPrimariesProp): "yes",
+		},
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	resCRD := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-migrating.n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-migrating",
+			NodeName:               "n1",
+			Flags:                  []string{apiv1.ResourceFlagDiskless},
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{InUse: true},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		WithObjects(resCRD).
+		Build()
+
+	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme, Store: st}
+
+	for range 8 {
+		_, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-migrating.n1"}})
+		if err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+	}
+
+	got := &blockstoriov1alpha1.Resource{}
+	if err := cli.Get(ctx, types.NamespacedName{Name: "pvc-migrating.n1"}, got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if !slices.Contains(got.Spec.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("the migration target was made diskful mid migration: %v", got.Spec.Flags)
+	}
+}

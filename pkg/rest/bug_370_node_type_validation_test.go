@@ -48,7 +48,7 @@ import (
 // The fix wires `validateNodeType` at the wire boundary BEFORE the
 // store path, mirroring how Bug 97 / Bug 120 / Bug 368 / Bug 369 / Bug
 // 371 already gate other typed enum fields. Returns 400 +
-// FAIL_INVLD_NODE_TYPE (upstream sub-code 430) with the offending
+// FAIL_INVLD_NODE_TYPE (upstream sub-code 201) with the offending
 // value + the accepted enumeration listed inline.
 
 // TestBug370POSTNodeRefusesInvalidType pins the reproducer body.
@@ -86,7 +86,7 @@ func TestBug370POSTNodeRefusesInvalidType(t *testing.T) {
 		t.Errorf("envelope missing accepted-value enumeration: %s", got)
 	}
 
-	// FAIL_INVLD_NODE_TYPE (430) sub-code must be set so
+	// FAIL_INVLD_NODE_TYPE (201) must be the code so
 	// golinstor's `Is(FAIL_INVLD_NODE_TYPE)` returns true.
 	var rcs []apiv1.APICallRc
 	if err := json.Unmarshal(got, &rcs); err != nil {
@@ -97,9 +97,8 @@ func TestBug370POSTNodeRefusesInvalidType(t *testing.T) {
 		t.Fatalf("envelope length: got %d, want 1", len(rcs))
 	}
 
-	const failInvldNodeType = int64(430)
-	if rcs[0].RetCode&failInvldNodeType != failInvldNodeType {
-		t.Errorf("ret_code: got %#x, want FAIL_INVLD_NODE_TYPE (430) bit set",
+	if rcs[0].RetCode != apiCallRcError|apiCallRcFailInvldNodeType {
+		t.Errorf("ret_code: got %#x, want FAIL_INVLD_NODE_TYPE (201)",
 			rcs[0].RetCode)
 	}
 
