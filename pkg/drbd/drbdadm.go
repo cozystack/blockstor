@@ -1154,11 +1154,16 @@ func (a *Adm) StatusResources(ctx context.Context) ([]string, error) {
 //     present but the named resource isn't.
 //
 // Returning false + nil error is the dominant "absent" signal so
-// callers don't need to branch on the error type; a true error
-// surfaces only for genuinely-unexpected failures (binary
-// missing, exec/IO error) that the caller should bubble up.
+// callers don't need to branch on the error type. A status that did
+// not answer is the exception and fails with ErrStatusTimeout: the
+// slot may well be loaded and holding its backing disk, and a caller
+// that read it as absent would go on to reclaim that disk.
 func (a *Adm) IsLoaded(ctx context.Context, resource string) (bool, error) {
 	out, err := a.status(ctx, resource)
+	if errors.Is(err, ErrStatusTimeout) {
+		return false, err
+	}
+
 	if err != nil {
 		// Any non-zero exit is treated as "absent": the dominant
 		// failure mode is `drbdsetup status` returning exit 10 +
@@ -1230,15 +1235,22 @@ func (a *Adm) KernelMyNodeID(ctx context.Context, resource string) (int32, bool)
 // cache-trail that can leave a freshly-recreated replica's peer Status
 // looking empty/Inconsistent at BuildDesired time.
 //
-// Conservative: returns false on any probe/parse failure (kernel slot
+// Conservative: returns false on any other probe/parse failure (kernel slot
 // absent, status non-zero, malformed JSON) so a genuinely-fresh RD
 // — where no peer has data and the probe legitimately finds nothing —
 // still force-primaries (Bug 77 / first-replica seed preserved). The
 // only states that gate the promote are the three committed-data ones;
 // a fresh, never-promoted peer reports Inconsistent (or no connection
 // yet) and does NOT block.
+//
+// A status that did not answer reports true: it says nothing about the
+// peers, and the only caller forces primary on false.
 func (a *Adm) AnyConnectedPeerHasData(ctx context.Context, resource string) bool {
 	out, err := a.status(ctx, resource, "--json")
+	if errors.Is(err, ErrStatusTimeout) {
+		return true
+	}
+
 	if err != nil {
 		return false
 	}
@@ -2376,10 +2388,16 @@ func (a *Adm) HasAttachedDisk(ctx context.Context, resource string) (bool, error
 // Convention (matches IsLoaded):
 //   - non-zero exit from drbdsetup → false + nil (slot absent;
 //     not our race window)
+//   - no answer → ErrStatusTimeout: the disk state is unknown, and
+//     "not diskless" would let the caller release SkipDisk
 //   - parses each indented volume line (`disk:<state>`) and returns
 //     true on the first match for any of the not-attached states.
 func (a *Adm) HasDisklessVolume(ctx context.Context, resource string) (bool, error) {
 	out, err := a.status(ctx, "--verbose", resource)
+	if errors.Is(err, ErrStatusTimeout) {
+		return false, err
+	}
+
 	if err != nil {
 		// Slot absent / netlink hiccup → not in the race window we
 		// care about. Same convention IsLoaded uses (zero value +

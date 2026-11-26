@@ -120,3 +120,26 @@ func TestStatusKeepsTheCallersDeadline(t *testing.T) {
 		t.Errorf("got %v, want the caller's deadline", err)
 	}
 }
+
+// TestProbesDoNotReadATimeoutAsNo: the probes the apply path acts on
+// report a status that did not answer as an error, or, for the peer
+// data gate, as the answer that vetoes the force, never as the negative
+// answer a caller would go on to act on.
+func TestProbesDoNotReadATimeoutAsNo(t *testing.T) {
+	t.Parallel()
+
+	adm := drbd.NewAdm(wedgedStatusExec{})
+	adm.SetStatusTimeout(20 * time.Millisecond)
+
+	if _, err := adm.IsLoaded(t.Context(), "pvc-a"); !errors.Is(err, drbd.ErrStatusTimeout) {
+		t.Errorf("IsLoaded: got %v, want ErrStatusTimeout", err)
+	}
+
+	if _, err := adm.HasDisklessVolume(t.Context(), "pvc-a"); !errors.Is(err, drbd.ErrStatusTimeout) {
+		t.Errorf("HasDisklessVolume: got %v, want ErrStatusTimeout", err)
+	}
+
+	if !adm.AnyConnectedPeerHasData(t.Context(), "pvc-a") {
+		t.Error("AnyConnectedPeerHasData: a timeout reported no data peer, which forces primary")
+	}
+}
