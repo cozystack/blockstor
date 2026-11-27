@@ -152,7 +152,16 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 func (s *Server) spawnCreate(w http.ResponseWriter, r *http.Request, rgName string, rg *apiv1.ResourceGroup, req *apiv1.ResourceGroupSpawn) {
 	rd := buildSpawnedRD(req, rgName, rg)
 
-	err := s.Store.ResourceDefinitions().Create(r.Context(), &rd)
+	// The peer slots the spawned definition's replicas get: the spawn's
+	// peer_slots, else the group's, as LINSTOR's spawn resolves them.
+	err := store.ResolvePeerSlots(r.Context(), s.Store, &rd, req.PeerSlots)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	err = s.Store.ResourceDefinitions().Create(r.Context(), &rd)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -184,6 +193,11 @@ func (s *Server) spawnCreate(w http.ResponseWriter, r *http.Request, rgName stri
 	// `r l` would be empty after spawn until the operator runs a
 	// separate `r c --auto-place=N`.
 	deployed, placeErr := spawnAutoplace(r.Context(), s, rd.Name, rg, req)
+
+	if s.refuseSpawnBeyondPeerSlots(w, r, rd.Name, placeErr) {
+		return
+	}
+
 	if placeErr != nil {
 		log.FromContext(r.Context()).WithName("rest").
 			Error(placeErr, "spawn autoplace", "rd", rd.Name)
@@ -204,6 +218,21 @@ func (s *Server) spawnCreate(w http.ResponseWriter, r *http.Request, rgName stri
 		RetCode: maskInfo,
 		Message: "resource definition spawned: " + rd.Name,
 	}}, notReady...))
+}
+
+// refuseSpawnBeyondPeerSlots answers a spawn whose placement the peer
+// slots cannot hold, and reports whether it did. LINSTOR spawns the
+// definition and places its replicas in one transaction, so such a
+// spawn fails whole and leaves no definition behind.
+func (s *Server) refuseSpawnBeyondPeerSlots(w http.ResponseWriter, r *http.Request, rdName string, placeErr error) bool {
+	if !errors.Is(placeErr, store.ErrInsufficientPeerSlots) {
+		return false
+	}
+
+	rollbackSpawn(r.Context(), s.Store, rdName)
+	writeStoreError(w, placeErr)
+
+	return true
 }
 
 // spawnAutoplace runs the same placer/select-filter merge that

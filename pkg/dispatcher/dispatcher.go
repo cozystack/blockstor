@@ -267,12 +267,47 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		// Threaded verbatim (pointer tri-state preserved): nil/false →
 		// no skip, true → skip.
 		SkipInitialSync: copyBoolPtr(target.Spec.SkipInitialSync),
+		PeerSlots:       replicaPeerSlots(target, rd),
+		// A replica with no count recorded and none read yet has its
+		// superblock read, so the controller records the count it was
+		// created with rather than guess 15.
+		MetadataPeerSlots:     copyInt32Ptr(target.Status.MetadataPeerSlots),
+		ReadMetadataPeerSlots: readsMetadataPeerSlots(target),
 		// The satellite's solo-promote reads these two to stay inside
 		// LINSTOR's case: never promote a replica that is being deleted,
 		// and never one whose definition has another diskful replica.
 		Deleting:            isDeleting(target, rd),
 		OtherDiskfulReplica: anyOtherDiskfulReplica(target, peers),
 	}
+}
+
+// replicaPeerSlots is the peer-slot count the replica's metadata is
+// created with and its lower disk sized for: the replica's own, which
+// the controller copies from the definition when it allocates the
+// replica's identities, else the definition's, which is what the
+// controller is about to copy. A replica that had a node id before
+// counts were recorded has the count its superblock holds; nil, for one
+// whose superblock was not read yet or a definition with no count, is
+// read as 15.
+func replicaPeerSlots(target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) *int32 {
+	slots := target.Spec.PeerSlots
+
+	switch {
+	case target.PeerSlotsPredateRecord():
+		// The count its superblock holds, once read, until the
+		// controller records it.
+		slots = target.Status.MetadataPeerSlots
+	case slots == nil && rd != nil:
+		slots = rd.Spec.PeerSlots
+	}
+
+	if slots == nil {
+		return nil
+	}
+
+	v := *slots
+
+	return &v
 }
 
 // isDeleting reports whether the target replica or its definition is
@@ -299,14 +334,39 @@ func anyOtherDiskfulReplica(target *blockstoriov1alpha1.Resource, peers []blocks
 			continue
 		}
 
-		flags := peers[i].Spec.Flags
-		if !slices.Contains(flags, apiv1.ResourceFlagDiskless) &&
-			!slices.Contains(flags, apiv1.ResourceFlagTieBreaker) {
+		if !isDisklessFlags(peers[i].Spec.Flags) {
 			return true
 		}
 	}
 
 	return false
+}
+
+// readsMetadataPeerSlots reports a diskful replica with a node id whose
+// superblock nobody read yet. Read once, its count sizes every grow,
+// and records the count of a replica that predates the record.
+func readsMetadataPeerSlots(target *blockstoriov1alpha1.Resource) bool {
+	hasNodeID := target.Spec.DRBDNodeID != nil || target.Status.DRBDNodeID != nil
+
+	return hasNodeID && target.Status.MetadataPeerSlots == nil && !isDisklessFlags(target.Spec.Flags)
+}
+
+// copyInt32Ptr returns a fresh copy of an *int32, so the payload does not
+// alias the caller's Resource.
+func copyInt32Ptr(v *int32) *int32 {
+	if v == nil {
+		return nil
+	}
+
+	out := *v
+
+	return &out
+}
+
+// isDisklessFlags reports a replica that keeps no disk: DISKLESS, or a
+// TIE_BREAKER witness.
+func isDisklessFlags(flags []string) bool {
+	return slices.Contains(flags, apiv1.ResourceFlagDiskless) || slices.Contains(flags, apiv1.ResourceFlagTieBreaker)
 }
 
 // copyBoolPtr returns a fresh copy of a *bool so the DesiredResource

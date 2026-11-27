@@ -53,7 +53,7 @@ func TestCreateMDNamesARefusalAndItsReason(t *testing.T) {
 		Err:    storage.FakeExitError{Code: 40},
 	})
 
-	err := drbd.NewAdm(fx).CreateMD(t.Context(), "pvc-1/0")
+	err := drbd.NewAdm(fx).CreateMDWithMaxPeers(t.Context(), "pvc-1/0", drbd.LegacyPeerSlots)
 	if !errors.Is(err, drbd.ErrCreateMDRefused) {
 		t.Fatalf("CreateMD = %v, want ErrCreateMDRefused", err)
 	}
@@ -83,7 +83,7 @@ func TestCreateMDOtherFailuresAreNotRefusals(t *testing.T) {
 		Err:    storage.FakeExitError{Code: 20},
 	})
 
-	err := drbd.NewAdm(fx).CreateMD(t.Context(), "pvc-1/0")
+	err := drbd.NewAdm(fx).CreateMDWithMaxPeers(t.Context(), "pvc-1/0", drbd.LegacyPeerSlots)
 	if err == nil || errors.Is(err, drbd.ErrCreateMDRefused) {
 		t.Fatalf("CreateMD = %v, want a failure that is not a refusal", err)
 	}
@@ -128,16 +128,20 @@ func TestMetadataGeometryReadsAnUncleanSuperblock(t *testing.T) {
 }
 
 // LINSTOR lets a resource have up to 31 peer slots. Such a superblock is
-// read, not reported as unreadable, and clamped to the 15 blockstor
-// creates: smaller metadata fits where larger metadata was.
+// read, not reported as unreadable, and clamped to the replica's own
+// count: smaller metadata fits where larger metadata was.
 func TestMetadataGeometryReadsMoreSlotsThanBlockstorCreates(t *testing.T) {
 	got, err := drbd.ParseMetadataGeometry([]byte(strings.Replace(geometryHeader, "max-peers 7;", "max-peers 31;", 1)))
 	if err != nil || got.MaxPeers != 31 {
 		t.Fatalf("ParseMetadataGeometry = %+v, %v; want 31 peer slots", got, err)
 	}
 
-	if clamped := got.Clamped(); clamped.MaxPeers != drbd.MaxPeers-1 || clamped.ALStripes != 1 {
-		t.Errorf("Clamped = %+v, want 15 peer slots and the layout kept", clamped)
+	if clamped := got.ClampedTo(drbd.LegacyPeerSlots); clamped.MaxPeers != drbd.LegacyPeerSlots || clamped.ALStripes != 1 {
+		t.Errorf("ClampedTo(15) = %+v, want 15 peer slots and the layout kept", clamped)
+	}
+
+	if clamped := got.ClampedTo(drbd.DefaultPeerSlots); clamped.MaxPeers != drbd.DefaultPeerSlots {
+		t.Errorf("ClampedTo(7) = %+v, want 7 peer slots", clamped)
 	}
 }
 
@@ -177,7 +181,7 @@ func TestCreateMDWithGeometryPassesTheActivityLogLayout(t *testing.T) {
 		t.Fatalf("CreateMDWithGeometry: %v", err)
 	}
 
-	if err := drbd.NewAdm(fx).CreateMDWithGeometry(t.Context(), "pvc-1/0", drbd.DefaultGeometry()); err != nil {
+	if err := drbd.NewAdm(fx).CreateMDWithGeometry(t.Context(), "pvc-1/0", drbd.GeometryForPeerSlots(drbd.LegacyPeerSlots)); err != nil {
 		t.Fatalf("CreateMDWithGeometry: %v", err)
 	}
 
