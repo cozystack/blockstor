@@ -2310,7 +2310,7 @@ func (a *Adm) HasAttachedDisk(ctx context.Context, resource string) (bool, error
 			}
 
 			switch state {
-			case "Diskless", "Detaching", "Failed":
+			case string(DiskStateDiskless), string(DiskStateDetaching), string(DiskStateFailed):
 			default:
 				return true, nil
 			}
@@ -2549,11 +2549,11 @@ func (a *Adm) removeMinor(ctx context.Context, minor int32, beforeDelMinor func(
 		return nil
 	}
 
-	if dev.role == "Primary" || dev.open == "yes" {
+	if dev.role == string(RolePrimary) || dev.open == "yes" {
 		return errors.Wrapf(ErrMinorInUse, "minor %s of %s (role %s, open %s)", m, dev.resource, dev.role, dev.open)
 	}
 
-	if dev.disk != "Diskless" {
+	if dev.disk != string(DiskStateDiskless) {
 		_, err = a.exec.Run(ctx, "drbdsetup", "detach", m)
 		if err != nil {
 			return errors.Wrapf(err, "drbdsetup detach %s", m)

@@ -856,6 +856,23 @@ func AllocatedNodeID(r *blockstoriov1alpha1.Resource) (int32, bool) {
 	return id, id >= 0
 }
 
+// replicaPool is the replica's default storage pool, in the precedence
+// buildVolumes describes: the typed Spec.StoragePool, then the
+// Resource's StorPoolName prop, then, for a diskful replica only, the
+// definition's.
+func replicaPool(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstoriov1alpha1.Resource, diskless bool) string {
+	pool := target.Spec.StoragePool
+	if pool == "" {
+		pool = target.Spec.Props["StorPoolName"]
+	}
+
+	if !diskless && pool == "" {
+		pool = rd.Spec.Props["StorPoolName"]
+	}
+
+	return pool
+}
+
 // buildVolumes turns the parent ResourceDefinition's VolumeDefinitions
 // into DesiredVolumes for the satellite. DISKLESS replicas still get
 // volume entries — DRBD-9 needs a `volume { ... }` block per peer in
@@ -903,14 +920,7 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 	// historical Spec.StoragePool that the REST handler preserved on
 	// demote, which is exactly the marker the satellite needs to
 	// know which provider to call DeleteVolume against.
-	rdPool := target.Spec.StoragePool
-	if rdPool == "" {
-		rdPool = target.Spec.Props["StorPoolName"]
-	}
-
-	if !diskless && rdPool == "" {
-		rdPool = rd.Spec.Props["StorPoolName"]
-	}
+	rdPool := replicaPool(rd, target, diskless)
 
 	// External-metadata pool (scenario 6.18, UG9
 	// §"Using external DRBD metadata"). Resolves the
