@@ -21,6 +21,7 @@ package store
 import (
 	"context"
 	"maps"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -79,13 +80,27 @@ func SeedPeerAuthentication(ctx context.Context, st Store, rd *apiv1.ResourceDef
 	return nil
 }
 
-// hasProp reports whether props names key exactly. The satellite renders a
-// DrbdOptions key only in its canonical spelling, so a value under another
-// spelling never reaches the .res and must not stop the stamp.
+// hasProp reports whether props names key the way the satellite reads it:
+// the DrbdOptions/ prefix exactly, the section in any case, the option
+// exactly. A spelling the satellite renders counts, so no second value is
+// stamped next to it; one it skips does not, since it never reaches the
+// .res.
 func hasProp(props map[string]string, key string) bool {
-	_, ok := props[key]
+	wantSection, wantOption, _ := strings.Cut(strings.TrimPrefix(key, drbd.PropPrefix), "/")
 
-	return ok
+	for name := range props {
+		rest, ok := strings.CutPrefix(name, drbd.PropPrefix)
+		if !ok {
+			continue
+		}
+
+		section, option, ok := strings.Cut(rest, "/")
+		if ok && strings.EqualFold(section, wantSection) && option == wantOption {
+			return true
+		}
+	}
+
+	return false
 }
 
 // inheritedDefinitionProps merges the props rd inherits from its group and

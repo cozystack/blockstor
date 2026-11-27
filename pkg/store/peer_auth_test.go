@@ -149,23 +149,38 @@ func TestSeedPeerAuthenticationKeepsWhatAnOperatorSet(t *testing.T) {
 	}
 }
 
-// The satellite renders a DrbdOptions key only in its canonical spelling,
-// so a secret or digest under another spelling does not stop the stamp:
-// it would never reach the .res.
-func TestSeedPeerAuthenticationIgnoresAnOffSpelling(t *testing.T) {
+// Seeding counts a secret or digest the way the satellite reads the key:
+// the DrbdOptions/ prefix exactly, the section in any case. A spelling the
+// satellite renders stops the stamp, so the net section never gets two
+// values; one it skips does not, since it never reaches the .res.
+func TestSeedPeerAuthenticationReadsKeysAsTheSatelliteDoes(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewInMemory()
-	rd := &apiv1.ResourceDefinition{Name: "pvc-a", Props: map[string]string{
-		"drbdoptions/net/shared-secret": "off-spelling",
-		"drbdoptions/net/cram-hmac-alg": "sha256",
+
+	rendered := &apiv1.ResourceDefinition{Name: "pvc-a", Props: map[string]string{
+		"DrbdOptions/net/shared-secret": "fixture",
+		"DrbdOptions/NET/cram-hmac-alg": "sha256",
 	}}
 
-	if err := store.SeedPeerAuthentication(t.Context(), st, rd, ""); err != nil {
+	if err := store.SeedPeerAuthentication(t.Context(), st, rendered, ""); err != nil {
 		t.Fatalf("SeedPeerAuthentication: %v", err)
 	}
 
-	if len(rd.Props[drbd.SharedSecretProp]) != 20 || rd.Props[drbd.CramHMACAlgProp] != drbd.DefaultCramHMACAlg {
-		t.Errorf("the canonical secret and digest were not stamped next to an off-spelling")
+	if len(rendered.Props) != 2 {
+		t.Errorf("a second secret or digest was stamped next to a spelling the satellite renders: %d props", len(rendered.Props))
+	}
+
+	skipped := &apiv1.ResourceDefinition{Name: "pvc-b", Props: map[string]string{
+		"drbdoptions/Net/shared-secret": "fixture",
+		"drbdoptions/Net/cram-hmac-alg": "sha256",
+	}}
+
+	if err := store.SeedPeerAuthentication(t.Context(), st, skipped, ""); err != nil {
+		t.Fatalf("SeedPeerAuthentication: %v", err)
+	}
+
+	if len(skipped.Props[drbd.SharedSecretProp]) != 20 || skipped.Props[drbd.CramHMACAlgProp] != drbd.DefaultCramHMACAlg {
+		t.Errorf("no secret and digest were stamped next to a spelling the satellite skips")
 	}
 }
