@@ -123,6 +123,15 @@ const ConditionKernelLoaded = "KernelLoaded"
 // tracks the live spec rather than latching on the first sighting.
 const ConditionEncryptionKeyIgnored = "EncryptionKeyIgnored"
 
+// ConditionPeerSlotsKnown is False on a new replica that has waited
+// longer than the controller's limit for the peer-slot count of its
+// definition's replicas, naming the replicas whose count is missing, and
+// True once the replica has its count. The replica gets no DRBD node id
+// while it waits: stamped with a guess, its metadata would be created
+// with it for good. Written by the controller, under its own field
+// manager.
+const ConditionPeerSlotsKnown = "PeerSlotsKnown"
+
 // ResourceAnnotationVolumeNumbers is the metadata.annotation key the
 // satellite reconciler stamps on a Resource CRD after every successful
 // apply pass. The value is a comma-separated list of int32 volume

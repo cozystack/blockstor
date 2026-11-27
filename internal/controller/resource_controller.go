@@ -302,6 +302,10 @@ func (r *ResourceReconciler) ReconcilePass(ctx context.Context, req ctrl.Request
 		return result, err
 	}
 
+	// A replica waiting for its peer slots still gets its apply, and
+	// is looked at again when its wait reaches the limit.
+	awaitResult := result
+
 	// A freeze that fails is retried, but does not hold up the rest of
 	// the replica's housekeeping: the stamp only stops a later size
 	// change, and an in-use replica whose freeze keeps being refused
@@ -311,6 +315,10 @@ func (r *ResourceReconciler) ReconcilePass(ctx context.Context, req ctrl.Request
 	result, err = r.runApply(ctx, &target)
 	if freezeErr != nil {
 		return ctrl.Result{}, cerrors.Join(err, freezeErr)
+	}
+
+	if after := awaitResult.RequeueAfter; after > 0 && (result.RequeueAfter == 0 || after < result.RequeueAfter) {
+		result.RequeueAfter = after
 	}
 
 	return result, err
@@ -787,10 +795,11 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 
 		return inner
 	})
-	if cerrors.Is(err, errAwaitingPeerSlots) {
-		ctrl.LoggerFrom(ctx).V(1).Info("a new replica waits for the peer slots its definition's replicas hold", "resource", target.Name)
-
-		return false, nil
+	// A replica held back for its peer slots is the caller's to report
+	// (awaitPeerSlots), so the error goes up unwrapped.
+	var awaiting *awaitingPeerSlotsError
+	if cerrors.As(err, &awaiting) {
+		return false, awaiting
 	}
 
 	if err != nil {
@@ -2412,7 +2421,12 @@ func (r *ResourceReconciler) resolveEffectiveProps(ctx context.Context, target *
 // step, but the property tests live in package controller_test and
 // need a way in. Production callers use Reconcile.
 func (r *ResourceReconciler) EnsureDRBDIDsForTest(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) (bool, error) {
-	return r.ensureDRBDIDs(ctx, target, peers)
+	allocated, err := r.ensureDRBDIDs(ctx, target, peers)
+	if cerrors.Is(err, errAwaitingPeerSlots) {
+		return false, nil
+	}
+
+	return allocated, err
 }
 
 // CollectTakenNodeIDsForTest exposes the per-RD occupied node-id set

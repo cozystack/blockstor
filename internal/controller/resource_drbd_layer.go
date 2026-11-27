@@ -143,8 +143,23 @@ func (r *ResourceReconciler) allocateDRBDIDsIfUsed(
 	}
 
 	allocated, err := r.ensureDRBDIDs(ctx, target.DeepCopy(), nil)
+
+	var awaiting *awaitingPeerSlotsError
+	if cerrors.As(err, &awaiting) {
+		result, err := r.awaitPeerSlots(ctx, target, awaiting.untold)
+
+		return result, err != nil, err
+	}
+
 	if err != nil {
 		return ctrl.Result{}, true, err
+	}
+
+	if allocated {
+		err = r.settlePeerSlotsKnown(ctx, target)
+		if err != nil {
+			return ctrl.Result{}, true, err
+		}
 	}
 
 	// A definition adopted or created before counts were recorded gets

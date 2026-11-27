@@ -22,9 +22,15 @@ import (
 	"context"
 	"slices"
 	"strings"
+	"time"
 
 	cerrors "github.com/cockroachdb/errors"
+	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -40,6 +46,20 @@ import (
 // sibling re-runs its reconcile (enqueueSiblings).
 var errAwaitingPeerSlots = cerrors.New("awaiting the peer slots of the definition's replicas")
 
+// awaitingPeerSlotsError is errAwaitingPeerSlots naming the replicas
+// whose count is still missing, so the wait can say what it waits for.
+type awaitingPeerSlotsError struct {
+	untold []string
+}
+
+func (e *awaitingPeerSlotsError) Error() string {
+	return errAwaitingPeerSlots.Error() + ": " + strings.Join(e.untold, ", ")
+}
+
+func (e *awaitingPeerSlotsError) Is(target error) bool {
+	return target == errAwaitingPeerSlots //nolint:errorlint // identity of the sentinel
+}
+
 // knownPeerSlots is what the replicas of a definition tell of their
 // peer slots: the least count among those with a disk that recorded or
 // reported one, and whether a replica with a disk that predates the
@@ -47,7 +67,7 @@ var errAwaitingPeerSlots = cerrors.New("awaiting the peer slots of the definitio
 // nothing and holds nothing up: it gets what the others tell.
 type knownPeerSlots struct {
 	least  int32
-	untold bool
+	untold []string
 }
 
 // replicaKnownPeerSlots is the count a replica is known to have: its
@@ -85,7 +105,9 @@ func (r *ResourceReconciler) definitionKnownPeerSlots(ctx context.Context, rdNam
 
 		slots := replicaKnownPeerSlots(res)
 		if slots == nil {
-			known.untold = known.untold || res.PeerSlotsPredateRecord()
+			if res.PeerSlotsPredateRecord() {
+				known.untold = append(known.untold, res.Name)
+			}
 
 			continue
 		}
@@ -147,9 +169,9 @@ func (r *ResourceReconciler) peerSlotsToStamp(
 		return &known.least, nil
 	case predatesRecord:
 		return nil, nil //nolint:nilnil // a witness waits for its definition's count
-	case known.untold && replicaKeepsDisk(target):
-		return nil, cerrors.Wrapf(errAwaitingPeerSlots, "replica %q", target.Name)
-	case known.untold:
+	case len(known.untold) > 0 && replicaKeepsDisk(target):
+		return nil, &awaitingPeerSlotsError{untold: known.untold}
+	case len(known.untold) > 0:
 		// A new diskless replica is not held back: it creates no
 		// metadata, and is stamped once the count is known.
 		return nil, nil //nolint:nilnil // stamped once the count is known
@@ -230,7 +252,7 @@ func (r *ResourceReconciler) recordDefinitionPeerSlots(ctx context.Context, rdNa
 	}
 
 	known, err := r.definitionKnownPeerSlots(ctx, rdName, "")
-	if err != nil || known.untold || known.least == 0 {
+	if err != nil || len(known.untold) > 0 || known.least == 0 {
 		return err
 	}
 
@@ -240,6 +262,108 @@ func (r *ResourceReconciler) recordDefinitionPeerSlots(ctx context.Context, rdNa
 	err = r.Patch(ctx, &rd, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 	if err != nil {
 		return cerrors.Wrapf(client.IgnoreNotFound(err), "record the peer slots of %q", rdName)
+	}
+
+	return nil
+}
+
+// awaitingPeerSlotsReason is the reason of the Warning Event and of
+// the PeerSlotsKnown condition a new replica gets while it waits for the
+// peer slots of its definition's replicas.
+const awaitingPeerSlotsReason = "AwaitingPeerSlots"
+
+// awaitingPeerSlotsLimit is how long a new replica waits for the peer
+// slots of its definition's replicas before its status says so
+// (ConditionPeerSlotsKnown). Its satellite says only that its node id
+// is not allocated, after a minute, which does not say why.
+const awaitingPeerSlotsLimit = 5 * time.Minute
+
+// peerSlotsFieldOwner is the SSA field manager of the PeerSlotsKnown
+// condition, so the controller owns that entry alone and the
+// satellite's conditions on the same list stay as they are.
+const peerSlotsFieldOwner = "blockstor-controller-peer-slots"
+
+// awaitPeerSlots reports a new replica held back by errAwaitingPeerSlots
+// and returns when to look again. Every pass logs and raises a Warning
+// Event naming the replicas whose count is missing. Past
+// awaitingPeerSlotsLimit the replica's status carries
+// PeerSlotsKnown=False with the same message, and the pass is requeued
+// at the limit so that happens even when nothing else changes.
+//
+// The wait itself goes on: stamped with a guess, the replica would keep
+// the guess for good, and its metadata would be created with it.
+func (r *ResourceReconciler) awaitPeerSlots(
+	ctx context.Context, target *blockstoriov1alpha1.Resource, untold []string,
+) (ctrl.Result, error) {
+	message := "no DRBD node id until the peer slots of " + strings.Join(untold, ", ") +
+		" are known: their satellites read them from the superblock, which needs the satellite on this " +
+		"version, its node online and dump-md to succeed"
+
+	waited := time.Duration(0)
+	if !target.CreationTimestamp.IsZero() {
+		waited = time.Since(target.CreationTimestamp.Time)
+	}
+
+	logger := logf.FromContext(ctx).WithValues("resource", target.Name, "untold", untold, "waited", waited.String())
+	logger.Info("a new replica waits for the peer slots its definition's replicas hold")
+
+	if r.Recorder != nil {
+		r.Recorder.Eventf(target, nil, corev1.EventTypeWarning, awaitingPeerSlotsReason, "AllocateNodeID", message)
+	}
+
+	if waited < awaitingPeerSlotsLimit {
+		return ctrl.Result{RequeueAfter: awaitingPeerSlotsLimit - waited}, nil
+	}
+
+	logger.Error(errAwaitingPeerSlots, "a new replica waited past the limit for the peer slots of its definition's replicas",
+		"limit", awaitingPeerSlotsLimit.String())
+
+	err := r.applyPeerSlotsKnown(ctx, target, metav1.ConditionFalse, awaitingPeerSlotsReason,
+		message+"; waiting since "+target.CreationTimestamp.UTC().Format(time.RFC3339))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: awaitingPeerSlotsLimit}, nil
+}
+
+// settlePeerSlotsKnown turns the PeerSlotsKnown condition of a replica
+// that waited past the limit True once it has its count.
+func (r *ResourceReconciler) settlePeerSlotsKnown(ctx context.Context, target *blockstoriov1alpha1.Resource) error {
+	if !apimeta.IsStatusConditionFalse(target.Status.Conditions, blockstoriov1alpha1.ConditionPeerSlotsKnown) {
+		return nil
+	}
+
+	return r.applyPeerSlotsKnown(ctx, target, metav1.ConditionTrue, "PeerSlotsRecorded",
+		"the replica has its peer-slot count")
+}
+
+func (r *ResourceReconciler) applyPeerSlotsKnown(
+	ctx context.Context, target *blockstoriov1alpha1.Resource, status metav1.ConditionStatus, reason, message string,
+) error {
+	apply := &blockstoriov1alpha1.Resource{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Resource",
+			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{Name: target.Name},
+		Status: blockstoriov1alpha1.ResourceStatus{
+			Conditions: []metav1.Condition{{
+				Type:               blockstoriov1alpha1.ConditionPeerSlotsKnown,
+				Status:             status,
+				Reason:             reason,
+				Message:            message,
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+
+	err := r.Status().Patch(ctx, apply,
+		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available for our CRDs
+		client.FieldOwner(peerSlotsFieldOwner))
+	if err != nil {
+		return cerrors.Wrapf(client.IgnoreNotFound(err), "set the %s condition of %q",
+			blockstoriov1alpha1.ConditionPeerSlotsKnown, target.Name)
 	}
 
 	return nil

@@ -21,9 +21,14 @@ package controller_test
 import (
 	"context"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -148,6 +153,20 @@ func peerSlotsFixture(
 ) client.Client {
 	t.Helper()
 
+	cli, _ := peerSlotsFixtureRecorded(t, nil, definition, replicas, reconcile...)
+
+	return cli
+}
+
+// peerSlotsFixtureRecorded is peerSlotsFixture with the reconciler's
+// Events going to recorder, when it is not nil, and the reconciler
+// returned to run again.
+func peerSlotsFixtureRecorded(
+	t *testing.T, recorder *events.FakeRecorder, definition *int32, replicas []*blockstoriov1alpha1.Resource,
+	reconcile ...string,
+) (client.Client, *controllerpkg.ResourceReconciler) {
+	t.Helper()
+
 	ctx := context.Background()
 	scheme := newScheme(t)
 	minor := int32(1000)
@@ -173,11 +192,15 @@ func peerSlotsFixture(
 	cli := builder.Build()
 	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}
 
+	if recorder != nil {
+		rec.Recorder = recorder
+	}
+
 	for _, name := range reconcile {
 		reconcileToSteadyState(t, ctx, rec, name)
 	}
 
-	return cli
+	return cli, rec
 }
 
 func getReplica(t *testing.T, cli client.Client, name string) *blockstoriov1alpha1.Resource {
@@ -313,16 +336,105 @@ func TestNewReplicaOfAnAdoptedDefinitionGetsItsReplicasPeerSlots(t *testing.T) {
 	t.Run("no replica told its count yet", func(t *testing.T) {
 		t.Parallel()
 
-		cli := peerSlotsFixture(t, nil, []*blockstoriov1alpha1.Resource{
+		recorder := events.NewFakeRecorder(100)
+		cli, rec := peerSlotsFixtureRecorded(t, recorder, nil, []*blockstoriov1alpha1.Resource{
 			preexistingReplica("adopted", "n1", 0, nil), newReplica(),
-		}, "adopted.n3")
+		})
+
+		// The wait comes back on its own at the limit, so a reconcile
+		// never settles; one pass is what a sibling's report triggers.
+		result, err := rec.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "adopted.n3"}})
+		if err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+
+		if result.RequeueAfter == 0 {
+			t.Error("a waiting replica is not requeued for the limit")
+		}
 
 		got := getReplica(t, cli, "adopted.n3")
 		if got.Spec.DRBDNodeID != nil || got.Spec.PeerSlots != nil {
 			t.Errorf("node id %v, peer slots %s; want neither until the count is known",
 				got.Spec.DRBDNodeID, slotsString(got.Spec.PeerSlots))
 		}
+
+		// The wait says what it waits for from the first pass: a
+		// Warning on the new replica naming the replica whose count is
+		// missing. Its status stays clean until the limit.
+		if !recordedEvent(recorder, "AwaitingPeerSlots", "adopted.n1") {
+			t.Error("no AwaitingPeerSlots Warning naming adopted.n1 on the waiting replica")
+		}
+
+		if c := apimeta.FindStatusCondition(got.Status.Conditions, blockstoriov1alpha1.ConditionPeerSlotsKnown); c != nil {
+			t.Errorf("a replica that just started waiting carries %s=%s", c.Type, c.Status)
+		}
 	})
+
+	// A wait past the limit is in the replica's status, naming the
+	// replica whose count is missing, and the reconcile comes back to it
+	// on its own. Once the count arrives the replica is stamped and the
+	// condition turns True.
+	t.Run("waited past the limit", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		waiting := newReplica()
+		waiting.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
+
+		cli, rec := peerSlotsFixtureRecorded(t, nil, nil, []*blockstoriov1alpha1.Resource{
+			preexistingReplica("adopted", "n1", 0, nil), waiting,
+		})
+
+		result, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKey{Name: "adopted.n3"}})
+		if err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+
+		if result.RequeueAfter == 0 {
+			t.Error("a replica past the limit is not requeued")
+		}
+
+		got := getReplica(t, cli, "adopted.n3")
+
+		c := apimeta.FindStatusCondition(got.Status.Conditions, blockstoriov1alpha1.ConditionPeerSlotsKnown)
+		if c == nil || c.Status != metav1.ConditionFalse || c.Reason != "AwaitingPeerSlots" ||
+			!strings.Contains(c.Message, "adopted.n1") {
+			t.Fatalf("condition %+v; want PeerSlotsKnown=False, AwaitingPeerSlots, naming adopted.n1", c)
+		}
+
+		told := getReplica(t, cli, "adopted.n1")
+		told.Status.MetadataPeerSlots = &seven
+
+		if err := cli.Status().Update(ctx, told); err != nil {
+			t.Fatalf("report the count: %v", err)
+		}
+
+		reconcileToSteadyState(t, ctx, rec, "adopted.n3")
+
+		got = getReplica(t, cli, "adopted.n3")
+		if slotsString(got.Spec.PeerSlots) != "7" {
+			t.Errorf("peer slots %s once the count is known, want 7", slotsString(got.Spec.PeerSlots))
+		}
+
+		if !apimeta.IsStatusConditionTrue(got.Status.Conditions, blockstoriov1alpha1.ConditionPeerSlotsKnown) {
+			t.Errorf("conditions %+v; want PeerSlotsKnown=True once stamped", got.Status.Conditions)
+		}
+	})
+}
+
+// recordedEvent reports whether recorder holds a Warning with reason
+// whose message names want.
+func recordedEvent(recorder *events.FakeRecorder, reason, want string) bool {
+	for {
+		select {
+		case event := <-recorder.Events:
+			if strings.HasPrefix(event, "Warning "+reason+" ") && strings.Contains(event, want) {
+				return true
+			}
+		default:
+			return false
+		}
+	}
 }
 
 // A replica restored from a snapshot gets the count of the source's
