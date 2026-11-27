@@ -324,3 +324,39 @@ func TestSnapshotControllerGroupSiblingStaysFailedAfterTheFailedOneGoes(t *testi
 			getSnap(t, cli, ok.Name).Status.Flags)
 	}
 }
+
+// A multi-snapshot is recorded SUCCESSFUL on every member at once, as
+// LINSTOR marks every snapshot definition of the request in the same
+// transaction. Only the pass that sees the whole group complete can
+// record it, and that is the pass of whichever member got the last
+// resume ack; the other member was reconciled while the group was
+// still incomplete and gets no further event. With two in-use volumes
+// on different nodes that left the member reconciled first without
+// SUCCESSFUL, and the create waited for it until linstor-csi's
+// VolumeGroupSnapshot timed out.
+func TestSnapshotControllerRecordsEveryGroupMemberSuccessful(t *testing.T) {
+	t.Parallel()
+
+	done := func(node string) blockstoriov1alpha1.SnapshotPerNodeStatus {
+		return blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: node, Ready: true, CreateTimestamp: 1}
+	}
+
+	nodes := []string{"n0", "n1", "n2"}
+	block := b353GroupedSnapshot("rep-blk", "vgs-1", "grp-1", nodes, false, false,
+		[]blockstoriov1alpha1.SnapshotPerNodeStatus{done("n0"), done("n1"), done("n2")})
+	fs := b353GroupedSnapshot("rep-fs", "vgs-1", "grp-1", nodes, false, false,
+		[]blockstoriov1alpha1.SnapshotPerNodeStatus{done("n0"), done("n1"), done("n2")})
+	block.Spec.GroupSize = 2
+	fs.Spec.GroupSize = 2
+
+	r, cli := successfulFixture(t, block, fs)
+
+	// Only the member whose ack came last is reconciled.
+	reconcileSnapshot(t, r, fs.Name)
+
+	for _, name := range []string{fs.Name, block.Name} {
+		if !isMarkedSuccessful(t, cli, name) {
+			t.Errorf("%s: not recorded SUCCESSFUL: flags=%v", name, getSnap(t, cli, name).Status.Flags)
+		}
+	}
+}
