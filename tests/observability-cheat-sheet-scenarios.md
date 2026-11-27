@@ -310,20 +310,25 @@ satellite_exec <worker-1> drbdadm primary <rd> --force
 satellite_exec <worker-1> drbdadm status <rd>
 # Expected: role:Primary
 
-# Reconciler must NOT auto-demote — wait + recheck:
+# Open the device right away: the idle-Primary workaround demotes a
+# Primary nobody has open 30 to 60 s after the promote.
+satellite_exec <worker-1> mount /dev/drbd<N> /mnt/recovery
+satellite_exec <worker-1> bash -c "echo test > /mnt/recovery/file"
+
+# Reconciler must NOT demote a Primary in use — wait + recheck:
 sleep 30
 satellite_exec <worker-1> drbdadm status <rd>
 # Expected: still Primary
-
-# Mount + write to prove it's usable:
-satellite_exec <worker-1> mount /dev/drbd<N> /mnt/recovery
-satellite_exec <worker-1> bash -c "echo test > /mnt/recovery/file"
 ```
 
 **Assertion:** blockstor's reconciler treats Primary role as
 operator intent — it doesn't demote based on its Spec. (Spec's
 `Resource.Spec.Flags` doesn't include a Role field; role is
-satellite-observed state.)
+satellite-observed state.) The one exception is a Primary with no
+device open: `--drbd-workaround-idle-primary`, on by default, demotes
+it after two idle passes 30 s apart, whatever promoted it, as the
+LINSTOR-mode plunger does. Open the device within about 30 s of the
+promote, or turn the workaround off for the recovery.
 
 ---
 

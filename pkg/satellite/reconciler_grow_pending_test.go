@@ -246,3 +246,33 @@ func TestApplyStopsRetryingAResizeThatDoesNotGrowTheDevice(t *testing.T) {
 		t.Fatalf("after a peer grew the device: reported %d, want %d", got, growPendingNewKib)
 	}
 }
+
+// TestApplyResizesOnlyADeviceShortOfTheDefinition: a restore received
+// from another node at the snapshot's size grows its backing to the
+// definition before its first attach, and attaches at the new size.
+// Resizing it after the attach had nothing to grow, and DRBD refused
+// it while the replica resynced ("Resize not allowed during resync"),
+// so every such restore logged a failed apply. A device still short
+// of the definition after the grow is resized as before.
+func TestApplyResizesOnlyADeviceShortOfTheDefinition(t *testing.T) {
+	for _, tc := range []struct {
+		deviceKib int64
+		resizes   int
+	}{
+		{deviceKib: growPendingNewKib, resizes: 0},
+		{deviceKib: growPendingOldKib, resizes: 1},
+	} {
+		gf := newGrowFixture(t, growPendingOldKib, 0)
+		gf.deviceKib = tc.deviceKib
+
+		lines, _ := gf.pass(t)
+
+		if got := linesWithPrefix(lines, "lvextend "); len(got) != 1 {
+			t.Fatalf("device at %d: lvextend calls %v, want the backing grown once", tc.deviceKib, got)
+		}
+
+		if got := linesWithPrefix(lines, "drbdadm resize"); len(got) != tc.resizes {
+			t.Errorf("device at %d: drbdadm resize calls %v, want %d", tc.deviceKib, got, tc.resizes)
+		}
+	}
+}

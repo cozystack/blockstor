@@ -41,7 +41,7 @@ import (
 // StorDriver/ZPoolThin bogus-pool` returned 200 + MASK_INFO and the
 // catalog row flipped to "bogus-pool", silently desyncing the SPD
 // default from any per-node SP that hadn't materialised yet. Post-fix:
-// 400 + apiCallRcFailInvldStorPoolName (552), live row stays byte-
+// 400 + apiCallRcFailInvldStorPoolName (208), live row stays byte-
 // identical, operator gets actionable "drop + recreate the definition"
 // guidance.
 func TestBug375SPDfnModifyRefusesZPoolOverride(t *testing.T) {

@@ -60,15 +60,16 @@ type applyRetry struct {
 // next records one more failed apply of name and returns the delay
 // before its retry.
 func (b *applyBackoff) next(name string) time.Duration {
+	return b.after(name, applyFailureRequeue, applyFailureMaxRequeue)
+}
+
+// after is next with the first delay and the cap given, for a retry
+// that is cheaper or more likely to clear soon than an apply.
+func (b *applyBackoff) after(name string, first, limit time.Duration) time.Duration {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	clock := b.now
-	if clock == nil {
-		clock = time.Now
-	}
-
-	now := clock()
+	now := b.clock()
 
 	if b.pending == nil {
 		b.pending = map[string]applyRetry{}
@@ -87,11 +88,11 @@ func (b *applyBackoff) next(name string) time.Duration {
 		retry.retries++
 	}
 
-	delay := applyFailureRequeue
+	delay := first
 	for range retry.retries {
 		delay *= 2
-		if delay >= applyFailureMaxRequeue {
-			delay = applyFailureMaxRequeue
+		if delay >= limit {
+			delay = limit
 
 			break
 		}
@@ -101,6 +102,28 @@ func (b *applyBackoff) next(name string) time.Duration {
 	b.pending[name] = retry
 
 	return delay
+}
+
+// wait is how long until the retry of name is due, zero when name is
+// not failing or its retry is due already.
+func (b *applyBackoff) wait(name string) time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	retry, failing := b.pending[name]
+	if !failing {
+		return 0
+	}
+
+	return max(retry.due.Sub(b.clock()), 0)
+}
+
+func (b *applyBackoff) clock() time.Time {
+	if b.now == nil {
+		return time.Now()
+	}
+
+	return b.now()
 }
 
 // reset forgets the failures of name after an apply that went through,

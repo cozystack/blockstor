@@ -69,6 +69,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/rest"
 	"github.com/cozystack/blockstor/pkg/store"
 	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
+	"github.com/cozystack/blockstor/pkg/version"
 )
 
 // apiserverFlags collects every CLI knob the binary exposes.
@@ -306,6 +307,7 @@ func main() {
 	}
 
 	setupLog.Info("Starting apiserver",
+		version.LogKey, version.Version,
 		"rest_debug_http", flags.restAddr,
 		"rest_tls", flags.tlsAddr,
 		"tls_enabled", tlsOptions(flags) != nil,

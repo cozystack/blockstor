@@ -233,7 +233,7 @@ type drbdsetupStatusPeerDevice struct {
 //
 //nolint:nilnil // nil map IS the empty-result signal; sentinel error would force callers to branch on errors.Is without value.
 func (a *Adm) Show(ctx context.Context, resource string) (map[string]KernelSlot, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", "-j", resource)
+	out, err := a.status(ctx, "-j", resource)
 	if err != nil {
 		// "No currently configured DRBD found" / "Unknown resource"
 		// / "no resources defined" / "No such resource" are the
@@ -400,7 +400,7 @@ func (a *Adm) DisklessVolumes(ctx context.Context, resource string) map[int32]st
 // --json` reports, or nil when the probe fails or the kernel does not
 // hold the resource.
 func (a *Adm) statusDevices(ctx context.Context, resource string) []drbdsetupStatusDevice {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return nil
 	}

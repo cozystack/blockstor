@@ -216,8 +216,16 @@ func (s *OrphanSweeperRunnable) removeOrphanResFile(
 	// tearDownOrphans). IsLoaded folds any non-zero drbdsetup exit into
 	// "not loaded", so a transient probe hiccup biases toward "leave the
 	// slot, just remove the file" — acceptable: the next reconcile/sweep
-	// re-converges, and the goal is breaking the .res-collision.
-	loaded, _ := s.isSlotLoaded(ctx, rd)
+	// re-converges, and the goal is breaking the .res-collision. A
+	// probe that did not answer is an error instead: the slot may be
+	// loaded, and its file is the only config to recover it from.
+	loaded, err := s.isSlotLoaded(ctx, rd)
+	if err != nil {
+		logger.Error(err, "kernel slot state unknown; keeping orphan .res for retry", "resource", rd)
+
+		return
+	}
+
 	if loaded {
 		// Kernel still holds the slot the stale file described. Tear it
 		// down (kernel-direct `drbdsetup down`, bounded by
@@ -238,7 +246,7 @@ func (s *OrphanSweeperRunnable) removeOrphanResFile(
 
 	path := filepath.Join(s.StateDir, rd+resFileSuffix)
 
-	err := os.Remove(path)
+	err = os.Remove(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		logger.Error(err, "remove orphan .res file", "path", path)
 

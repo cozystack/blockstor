@@ -1059,6 +1059,27 @@ func TestDeleteResourceForgetsTheGIRecord(t *testing.T) {
 	}
 }
 
+// Deleting a resource takes the reconnect a DRBD workaround owed it, so
+// a replica created again under the name is not adjusted for a peer the
+// old one lost.
+func TestDeleteResourceDropsTheOwedReconnect(t *testing.T) {
+	rec := uncleanReconciler(t)
+
+	record := filepath.Join(rec.StateDir(), "pvc-unclean"+ReconnectPendingSuffix)
+	if err := os.WriteFile(record, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := rec.DeleteResource(context.Background(), &intent.DeleteResourceRequest{Name: "pvc-unclean"})
+	if err != nil || !resp.GetOk() {
+		t.Fatalf("DeleteResource: %v, %+v", err, resp)
+	}
+
+	if _, err := os.Stat(record); !os.IsNotExist(err) {
+		t.Errorf("the deleted resource kept its owed reconnect: %v", err)
+	}
+}
+
 // The record keeps the newest generations of a volume: a crash leaves the
 // last few in the metadata, and those are the ones a check needs.
 func TestRecordedGIsKeepTheNewest(t *testing.T) {

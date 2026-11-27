@@ -192,6 +192,21 @@ func IsBitmapDropBothDisksErr(err error) bool {
 	return strings.Contains(err.Error(), "Can not drop the bitmap")
 }
 
+// IsDeviceHeldOpenErr reports whether err is DRBD refusing a demote
+// because something still has the device open: `State change failed:
+// (-12) Device is held open by someone` (SS_DEVICE_IN_USE). The code is
+// negative, so drbdErrCodeRegex never sees it; the message is matched
+// as well for drbd-utils that print only the text.
+func IsDeviceHeldOpenErr(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	text := err.Error()
+
+	return strings.Contains(text, "(-12)") || strings.Contains(text, "held open by someone")
+}
+
 // bitmapDropCmdRegex picks the peer node-id out of the command line
 // drbdadm quotes for a failed `drbdsetup peer-device-options <res>
 // <peer-node-id> <vol> ... --bitmap=no`.

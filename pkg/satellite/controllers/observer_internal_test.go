@@ -2742,13 +2742,11 @@ func TestObserverSyncSourceStampDoesNotDowngradeRealFrame(t *testing.T) {
 
 	o.mergeVolumes(&failedEv)
 
-	// A SyncSource peer-device frame would stamp UpToDate — but with the
-	// kernel already reporting Failed locally this would be a contradiction
-	// the kernel never produces (a Failed disk cannot be a SyncSource). The
-	// merge upgrades to UpToDate because UpToDate != Failed and the
-	// incoming value is non-empty; this is acceptable because in reality
-	// the two frames are mutually exclusive. The assertion here only pins
-	// that the stamp value is exactly UpToDate (not some lossy blank).
+	// A SyncSource peer-device frame carries UpToDate for a volume whose
+	// disk state no frame reported yet; the merge keeps the Failed the
+	// device frame reported (TestObserverSyncSourceKeepsAnOutdatedSource).
+	// The assertion here only pins that the stamp value is exactly
+	// UpToDate (not some lossy blank).
 	syncSourceEv, ok := translatePeerDeviceEvent(drbd.Event{
 		Action: "change",
 		Kind:   eventKindPeerDevice,
@@ -2767,6 +2765,55 @@ func TestObserverSyncSourceStampDoesNotDowngradeRealFrame(t *testing.T) {
 	if len(syncSourceEv.Volumes) != 1 || syncSourceEv.Volumes[0].DiskState != "UpToDate" {
 		t.Errorf("SyncSource frame must carry DiskState=UpToDate; got %+v",
 			syncSourceEv.Volumes)
+	}
+}
+
+// TestObserverSyncSourceKeepsAnOutdatedSource: DRBD resyncs from an
+// Outdated source to an Inconsistent peer. A replica that went
+// `UpToDate -> Outdated` and then became SyncSource kept its device
+// frame's Outdated in status.drbdState, while the SyncSource peer-device
+// frame overwrote the volume's disk state with UpToDate: a volume with
+// every replica Outdated showed two of them UpToDate in `r l` and hid
+// from `r l --faulty` until the satellite restarted.
+func TestObserverSyncSourceKeepsAnOutdatedSource(t *testing.T) {
+	o := &ObserverRunnable{}
+
+	outdated, ok := translateDeviceEvent(drbd.Event{
+		Action: "change",
+		Kind:   eventKindDevice,
+		Fields: map[string]string{"name": "pvc-outdated-src", "volume": "0", "disk": "Outdated"},
+	})
+	if !ok {
+		t.Fatal("translateDeviceEvent rejected the Outdated frame")
+	}
+
+	o.mergeVolumes(&outdated)
+	o.mergeResource(&outdated)
+
+	syncSource, ok := translatePeerDeviceEvent(drbd.Event{
+		Action: "change",
+		Kind:   eventKindPeerDevice,
+		Fields: map[string]string{
+			"name": "pvc-outdated-src", "peer-node-id": "2", "volume": "0",
+			"conn-name": "node-c", "replication": "SyncSource", "out-of-sync": "68",
+		},
+	})
+	if !ok {
+		t.Fatal("translatePeerDeviceEvent rejected the SyncSource frame")
+	}
+
+	o.mergeConnections(&syncSource)
+	o.mergeVolumes(&syncSource)
+	o.mergeResource(&syncSource)
+
+	cached := o.snapshotFor("pvc-outdated-src")
+	if cached.DrbdState != "Outdated" {
+		t.Fatalf("drbdState = %q, want Outdated", cached.DrbdState)
+	}
+
+	out := buildObserverVolumeStatus(&cached, "")
+	if len(out) != 1 || out[0].DiskState != "Outdated" || out[0].OutOfSyncKib != 68 {
+		t.Fatalf("status volumes = %+v, want the Outdated source with its resync count", out)
 	}
 }
 

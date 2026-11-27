@@ -355,6 +355,9 @@ func TestGroupG(t *testing.T) {
 // of a deleted volume timed out.
 func testGroupGSnapSuccessfulOutlivesSource(t *testing.T, stack *harness.Stack, cli *harness.CLI) {
 	rd := seedRDWithVolume(t, stack, "outlives")
+	// The test acks, takes and resumes for the satellites itself.
+	stack.Satellite.StandInForSnapshots(rd)
+
 	cli.Run(t, "snapshot", "create", rd, "snap-1")
 	waitForSnapshotCRD(t, stack, rd, "snap-1")
 
@@ -496,6 +499,9 @@ func restSnapshotFlags(t *testing.T, stack *harness.Stack, rd, snapName string) 
 func testGroupGSnapAbortedTakeStaysOver(t *testing.T, stack *harness.Stack, cli *harness.CLI) {
 	ctx := context.Background()
 	rd := seedRDWithVolume(t, stack, "aborted")
+	// The test acks, takes and resumes for the satellites itself.
+	stack.Satellite.StandInForSnapshots(rd)
+
 	resKey := types.NamespacedName{Name: rd + "." + harness.NodeWorker1}
 
 	stack.Satellite.SimulateDRBDState(rd, harness.NodeWorker1, "Inconsistent")
@@ -1158,6 +1164,8 @@ func testGroupGSnapDeleteBlockedByLater(t *testing.T, stack *harness.Stack, cli 
 func testGroupGAutoSnapshotPeriodicTick(t *testing.T, stack *harness.Stack) {
 	ctx := context.Background()
 	rdName := seedRDWithVolume(t, stack, "auto-snap")
+	// The test acks, takes and resumes for the satellites itself.
+	stack.Satellite.StandInForSnapshots(rdName)
 
 	// Stamp `AutoSnapshot/RunEvery=1` (minutes) so the runnable
 	// considers this RD due. Keep defaults to 10 — prune is a

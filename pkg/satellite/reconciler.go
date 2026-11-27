@@ -425,6 +425,14 @@ type Reconciler struct {
 	// only; a restart resets the counter (at worst a few extra requeues).
 	restoreSnapshotMissingTries map[string]int
 
+	// demotes paces the retry of a demote this satellite still owes a
+	// replica it promoted itself; see auto_demote.go.
+	demotes demoteRetry
+
+	// inflight marks the resources an apply or delete is changing; see
+	// inflight.go.
+	inflight inFlight
+
 	// retryAt is, per resource name, when a pass put off work that is
 	// due again with no event to bring it: a dwell window, a throttle,
 	// a best-effort step that failed. The satellite runs no periodic
@@ -518,6 +526,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		lastRecoveryPromoteAt:       map[string]time.Time{},
 		firstLateAddStallAt:         map[string]time.Time{},
 		restoreSnapshotMissingTries: map[string]int{},
+		demotes:                     newDemoteRetry(),
 		adjustFailed:                map[string]bool{},
 		firstUnresolvedPoolAt:       map[string]time.Time{},
 		failedDRBDApply:             map[string]bool{},
@@ -967,6 +976,15 @@ const drbdRolePrimary = "Primary"
 // land in the response body so the controller can surface granular
 // status without aborting the rest of the cleanup.
 func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResourceRequest) (*intent.DeleteResourceResponse, error) {
+	defer r.inflight.enter(req.GetName())()
+
+	return r.deleteResource(ctx, req)
+}
+
+// deleteResource is DeleteResource while the resource is marked busy.
+//
+//nolint:unparam // DeleteResource's signature, error reserved for transport faults
+func (r *Reconciler) deleteResource(ctx context.Context, req *intent.DeleteResourceRequest) (*intent.DeleteResourceResponse, error) {
 	var downMsg string
 
 	if r.cfg.Adm != nil {
@@ -1159,6 +1177,7 @@ func (r *Reconciler) removeResourceState(name string) error {
 	// too: nothing reads it, but nothing else would remove it.
 	for _, suffix := range []string{
 		".res", ResFileCandidateSuffix, ".md-created", ".mkfs.done", ".owned", bornSoloSuffix, adjustFailedSuffix,
+		demotePendingSuffix, ReconnectPendingSuffix,
 	} {
 		err := os.Remove(filepath.Join(r.cfg.StateDir, name+suffix))
 		if err != nil && !os.IsNotExist(err) {
@@ -1192,6 +1211,13 @@ func failApply(res *intent.ResourceApplyResult, err error) {
 // enabled (cfg.Adm != nil), also renders the `.res` file and runs
 // drbdadm create-md / adjust.
 func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *intent.ResourceApplyResult {
+	defer r.inflight.enter(dr.GetName())()
+
+	return r.applyResource(ctx, dr)
+}
+
+// applyResource is applyOne while the resource is marked busy.
+func (r *Reconciler) applyResource(ctx context.Context, dr *intent.DesiredResource) *intent.ResourceApplyResult {
 	res := &intent.ResourceApplyResult{
 		Name:     dr.GetName(),
 		NodeName: dr.GetNodeName(),
@@ -1907,6 +1933,12 @@ func (r *Reconciler) detachIfStillAttached(ctx context.Context, dr *intent.Desir
 	}
 
 	loaded, err := r.cfg.Adm.IsLoaded(ctx, dr.GetName())
+	if errors.Is(err, drbd.ErrStatusTimeout) {
+		// The slot may still hold the disk the caller is about to
+		// reclaim; stop the toggle until the kernel answers.
+		return errors.Wrapf(err, "probe %s before detach", dr.GetName())
+	}
+
 	if err != nil || !loaded {
 		// Slot absent / netlink hiccup → nothing to detach; the LV
 		// reclaim path is safe to proceed without a detach.
@@ -3362,6 +3394,13 @@ func (r *Reconciler) reconcileKernelMyNodeID(ctx context.Context, dr *intent.Des
 // automatically when kern->disk=="none" but conf->disk points at a
 // real path. Matches upstream LINSTOR's DrbdLayer pipeline.
 func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredResource, diskless, firstActivation, resized, cloned bool, devices map[int32]string) error {
+	// A demote this satellite still owes the replica from an earlier
+	// auto-promote goes first: every promote below owes its own.
+	err := r.retryPendingDemote(ctx, dr.GetName())
+	if err != nil {
+		return err
+	}
+
 	// Pickup-time resize: the storage layer was just grown, drbdadm
 	// resize tells the kernel to extend the replicated device to
 	// match. Adjust on its own won't do this — only resize re-reads
@@ -3378,7 +3417,7 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 	// view catches up for free via the connection handshake once a
 	// diskful peer resizes; it does NOT need a local `drbdadm resize`.
 	// Pinned by TestApplyDisklessReplicaSkipsResizeFanout.
-	if resized {
+	if resized && r.deviceShortOfDefinition(ctx, dr) {
 		// Bug 395 (P1, data integrity): gate `--assume-clean` on whether
 		// the backing provider zero-fills the grown region. For thick
 		// `LVM` (non-zero-fill) we MUST omit `--assume-clean` so DRBD
@@ -5518,16 +5557,38 @@ func needsMkfs(dr *intent.DesiredResource) bool {
 }
 
 func (r *Reconciler) runAutoPromote(ctx context.Context, dr *intent.DesiredResource) error {
-	err := r.cfg.Adm.PrimaryForce(ctx, dr.GetName())
+	// The demote is owed from the moment the promote may have happened,
+	// so a demote that fails, or a satellite that dies before it, still
+	// leaves the replica to be demoted by a later apply.
+	owedBefore := r.demoteOwed(dr.GetName())
+
+	err := r.owePendingDemote(dr.GetName())
 	if err != nil {
+		return err
+	}
+
+	err = r.cfg.Adm.PrimaryForce(ctx, dr.GetName())
+	if err != nil {
+		// A refused role change leaves the role as it was: nothing
+		// new to demote.
+		if !owedBefore {
+			settleErr := r.settlePendingDemote(dr.GetName())
+			if settleErr != nil {
+				return settleErr
+			}
+		}
+
 		return errors.Wrapf(err, "auto-primary %s", dr.GetName())
 	}
 
 	// Demote whatever mkfs did, as LINSTOR's primaryAutoClose does: a
 	// refused or failed mkfs must not leave the replica Primary, where
-	// it blocks every other node from using the volume.
+	// it blocks every other node from using the volume. A demote that
+	// does not go through stays owed (owePendingDemote above) and a
+	// later apply retries it, so the mkfs error is what the apply
+	// reports.
 	mkfsErr := r.runAutoMkfs(ctx, dr, drbdDevicesForMkfs(dr))
-	err = r.cfg.Adm.Secondary(ctx, dr.GetName())
+	err = r.autoSecondary(ctx, dr.GetName())
 
 	if mkfsErr != nil {
 		if err != nil {
@@ -5537,11 +5598,7 @@ func (r *Reconciler) runAutoPromote(ctx context.Context, dr *intent.DesiredResou
 		return errors.Wrapf(mkfsErr, "auto-mkfs %s", dr.GetName())
 	}
 
-	if err != nil {
-		return errors.Wrapf(err, "auto-secondary %s", dr.GetName())
-	}
-
-	return nil
+	return err
 }
 
 // drbdDevicesForMkfs builds the {volNumber → /dev/drbd<minor>} map
@@ -6117,7 +6174,9 @@ func (r *Reconciler) adjustResource(ctx context.Context, dr *intent.DesiredResou
 //
 // Errors from the probe fall through to the prop-only gate (the
 // pre-Bug-280 behaviour) so a transient netlink hiccup doesn't
-// strand the reconciler.
+// strand the reconciler. A status that did not answer stops the
+// adjust instead: the disk state is unknown, and an adjust without
+// --skip-disk could reattach the disk this probe exists to keep off.
 //
 // Bug 287 / scenario 5.32 race: even when the FSM `KernelLoaded`
 // observation reads as true (or when this path runs on first
@@ -6142,6 +6201,10 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 	// suppress exactly the attach we just created the metadata for.
 	if !skipDisk && !diskfulFlip {
 		diskless, probeErr := r.cfg.Adm.HasDisklessVolume(ctx, dr.GetName())
+		if errors.Is(probeErr, drbd.ErrStatusTimeout) {
+			return errors.Wrapf(probeErr, "probe disk state of %s before adjust", dr.GetName())
+		}
+
 		if probeErr == nil && diskless {
 			skipDisk = true
 		}
@@ -7582,6 +7645,14 @@ func dropRejectedDiskOptions(schema *drbd.OptionSchema, resourceDisk map[string]
 	return dropped
 }
 
+// BuildResFile renders the resource file the satellite on localNode
+// writes for dr, with the storage paths guessed rather than read off the
+// local devices. It lets a test check what a definition change renders
+// on a node without a satellite running there.
+func BuildResFile(dr *intent.DesiredResource, localNode, localAddr string) (string, error) {
+	return buildResFile(dr, localNode, localAddr, nil, nil, nil)
+}
+
 // buildResConnections translates the DesiredResource's logical
 // connection overrides (scenario 3.7 multi-path) into the .res
 // renderer's drbd.ResourceConnection shape. Empty input returns nil
@@ -7615,10 +7686,23 @@ func buildResConnections(dr *intent.DesiredResource, hosts []drbd.Host) []drbd.R
 			NodeA: hostSpelling(hosts, conn.NodeA),
 			NodeB: hostSpelling(hosts, conn.NodeB),
 			Paths: paths,
+			// Only the net options are per connection in the .res;
+			// the connection's other DRBD props stay resource-wide.
+			Net: nilIfEmpty(splitDRBDOptions(conn.DrbdOptions).Net),
 		})
 	}
 
 	return out
+}
+
+// nilIfEmpty answers nil for an empty map, so a connection without
+// options compares equal to one that never had any.
+func nilIfEmpty(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+
+	return m
 }
 
 // hostSpelling answers the name of the host that node names, or node as it

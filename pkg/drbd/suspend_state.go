@@ -56,7 +56,7 @@ type SuspendState struct {
 // a netlink read that does not touch the data path, so it answers while
 // the resource is suspended.
 func (a *Adm) SuspendState(ctx context.Context, resource string) (SuspendState, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		if notLoadedErr(string(out), err) {
 			return SuspendState{}, nil
@@ -91,7 +91,7 @@ func (a *Adm) SuspendState(ctx context.Context, resource string) (SuspendState, 
 // entry lacks the suspended-user key is left out rather than reported
 // as not suspended. A kernel with no resources reports none.
 func (a *Adm) SuspendStates(ctx context.Context) (map[string]SuspendState, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", "--json")
+	out, err := a.status(ctx, "--json")
 	if err != nil {
 		if notLoadedErr(string(out), err) {
 			return map[string]SuspendState{}, nil
