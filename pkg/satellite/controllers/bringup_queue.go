@@ -115,6 +115,10 @@ type bringUpQueue struct {
 	priorityqueue.PriorityQueue[reconcile.Request]
 
 	tracker *bringUpTracker
+
+	// stopped is closed by ShutDown; see Done.
+	stopped  chan struct{}
+	stopOnce sync.Once
 }
 
 // newBringUpQueueFunc returns the controller's NewQueue: the priority
@@ -128,7 +132,56 @@ func newBringUpQueueFunc(
 			o.RateLimiter = limiter
 		})
 
-		return &bringUpQueue{PriorityQueue: inner, tracker: tracker}
+		return &bringUpQueue{PriorityQueue: inner, tracker: tracker, stopped: make(chan struct{})}
+	}
+}
+
+// ShutDown stops the queue and releases every Done still waiting on it.
+func (q *bringUpQueue) ShutDown() {
+	q.stopOnce.Do(func() {
+		if q.stopped != nil {
+			close(q.stopped)
+		}
+	})
+
+	q.PriorityQueue.ShutDown()
+}
+
+// ShutDownWithDrain is ShutDown, as for the queue it wraps.
+func (q *bringUpQueue) ShutDownWithDrain() {
+	q.ShutDown()
+}
+
+// Done marks item processed, or gives up once the queue is shut down.
+//
+// The priority queue of controller-runtime v0.23 can deadlock on
+// shutdown (kubernetes-sigs/controller-runtime#3540, fixed in v0.25). A
+// worker parked in Get returns when the queue shuts down without taking
+// itself off the count of waiters, so the queue's dispatcher, holding the
+// queue's locks, blocks forever handing the next ready item to a worker
+// that is no longer there. Every worker that finishes a pass after that
+// blocks in Done on the same locks, the controller waits for its workers,
+// and the manager does not stop. After shutdown nothing reads the queue
+// again, so a Done that has not returned by then is dropped rather than
+// waited for.
+func (q *bringUpQueue) Done(item reconcile.Request) {
+	select {
+	case <-q.stopped:
+		return
+	default:
+	}
+
+	finished := make(chan struct{})
+
+	go func() {
+		defer close(finished)
+
+		q.PriorityQueue.Done(item)
+	}()
+
+	select {
+	case <-finished:
+	case <-q.stopped:
 	}
 }
 
