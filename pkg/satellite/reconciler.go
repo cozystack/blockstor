@@ -368,6 +368,13 @@ type Reconciler struct {
 	// Process memory only: a restart allows another resizeRetryLimit.
 	resizeRetries map[string]resizeRetry
 
+	// metadataSlots records, per "<resource>/<volNumber>", the peer-slot
+	// count the volume's superblock holds, as this process created it
+	// or read it: a grow sizes the metadata for it before the read is
+	// published (Status.MetadataPeerSlots), and it is not read twice.
+	// Process memory only: after a restart the published count serves.
+	metadataSlots map[string]int32
+
 	// restoreClonedHere records, per "<resource>/<volNumber>", whether
 	// this process itself cloned or received the snapshot into a volume
 	// that was not on disk before (true), or first found the volume
@@ -522,6 +529,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		restoreBlankFallback:        map[string]bool{},
 		growSteps:                   map[string]growStep{},
 		resizeRetries:               map[string]resizeRetry{},
+		metadataSlots:               map[string]int32{},
 		restoreClonedHere:           map[string]bool{},
 		lastRecoveryPromoteAt:       map[string]time.Time{},
 		firstLateAddStallAt:         map[string]time.Time{},
@@ -657,7 +665,9 @@ func (r *Reconciler) Apply(ctx context.Context, res []*intent.DesiredResource) (
 			continue
 		}
 
-		results = append(results, r.applyOne(ctx, dr))
+		res := r.applyOne(ctx, dr)
+		res.MetadataPeerSlots = r.superblockPeerSlots(ctx, dr, res)
+		results = append(results, res)
 	}
 
 	return results, nil
@@ -1298,6 +1308,112 @@ func (r *Reconciler) applyResource(ctx context.Context, dr *intent.DesiredResour
 	res.Volumes, res.GrowPending = r.buildVolumeResults(ctx, dr, devices, diskless, withDRBD)
 
 	return res
+}
+
+// superblockPeerSlots reads the peer-slot count of the replica's
+// superblock when the dispatcher asks for it, once per diskful replica.
+// A grow sizes the metadata for it, so the device stays at the
+// definition. For a replica created before counts were recorded it is
+// the only way to tell whether blockstor created its metadata with 15 or
+// LINSTOR with its definition's count, 7 by default, before it was
+// adopted; the controller records what it reads.
+//
+// The volumes of a replica are created with one count. When they hold
+// different ones, nothing is reported: one count would undersize the
+// grow of a volume with more slots, and the grow keeps sizing for at
+// least 15. Zero also when any volume cannot be read, to be asked again
+// on a later pass, after a pass that failed, and on one that grows a
+// volume: dump-md is kept off a device in the middle of a resize
+// (BUG-048).
+func (r *Reconciler) superblockPeerSlots(ctx context.Context, dr *intent.DesiredResource, res *intent.ResourceApplyResult) int32 {
+	if !r.readsSuperblockPeerSlots(dr, res) {
+		return 0
+	}
+
+	var read int32
+
+	for _, vol := range dr.GetVolumes() {
+		if vol.GetAppliedSizeKib() > 0 && vol.GetSizeKib() > vol.GetAppliedSizeKib() {
+			return 0
+		}
+
+		slots, ok := r.superblockSlotsOf(ctx, dr, vol)
+		if !ok {
+			return 0
+		}
+
+		if read != 0 && slots != read {
+			log.FromContext(ctx).Info("the volumes' superblocks hold different peer-slot counts; not reported",
+				"resource", dr.GetName(), "counts", []int32{read, slots})
+
+			return 0
+		}
+
+		read = slots
+	}
+
+	return read
+}
+
+// superblockSlotsOf is the peer-slot count of vol's superblock: the one
+// this process created it with or read before, else read now with
+// dump-md and kept. A new replica's metadata is created here, so its
+// count is known without reading the disk again.
+func (r *Reconciler) superblockSlotsOf(ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume) (int32, bool) {
+	if slots, ok := r.knownMetadataSlots(dr.GetName(), vol.GetVolumeNumber()); ok {
+		return slots, true
+	}
+
+	target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
+
+	found, err := r.cfg.Adm.MetadataGeometry(ctx, target)
+	if err != nil {
+		log.FromContext(ctx).V(1).Info("cannot read the peer slots of the superblock yet", "volume", target, "error", err.Error())
+
+		return 0, false
+	}
+
+	slots, ok := drbd.PeerSlotCount(found.MaxPeers)
+	if !ok {
+		return 0, false
+	}
+
+	r.noteMetadataSlots(target, found.MaxPeers)
+
+	return slots, true
+}
+
+// noteMetadataSlots records the peer-slot count of the superblock of
+// target, "<resource>/<volNumber>", that this process created or read.
+func (r *Reconciler) noteMetadataSlots(target string, maxPeers int) {
+	slots, ok := drbd.PeerSlotCount(maxPeers)
+	if !ok {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.metadataSlots[target] = slots
+}
+
+// knownMetadataSlots is the count noteMetadataSlots recorded for a
+// volume, if any.
+func (r *Reconciler) knownMetadataSlots(rdName string, vn int32) (int32, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	slots, ok := r.metadataSlots[growKey(rdName, vn)]
+
+	return slots, ok
+}
+
+// readsSuperblockPeerSlots reports whether the pass that produced res
+// reads the superblock's peer slots: asked to, on a diskful DRBD replica
+// whose pass succeeded and grows nothing.
+func (r *Reconciler) readsSuperblockPeerSlots(dr *intent.DesiredResource, res *intent.ResourceApplyResult) bool {
+	return dr.GetReadMetadataPeerSlots() && r.cfg.Adm != nil && needsDRBD(dr.GetLayerStack()) &&
+		!isDiskless(dr.GetFlags()) && res.GetOk() && !res.GetGrowPending()
 }
 
 // maybeLUKS conditionally layers cryptsetup over the raw storage
@@ -2145,12 +2261,13 @@ func (r *Reconciler) growBacking(
 }
 
 // lowerDiskKib is the size, in KiB, of the lower disk a volume is
-// created at; a grow sizes it the same way (growBackingKib).
+// created at; a grow sizes it the same way (growBackingKib), for the
+// slots the superblock holds (Reconciler.grownPeerSlots).
 //
 // Under DRBD with internal metadata the lower disk holds the data area
 // and the metadata after it, so it is sized like LINSTOR sizes it: the
-// data area plus the metadata blockstor writes on it (DefaultGeometry,
-// the most peer slots blockstor creates). A lower disk the definition's
+// data area plus the metadata blockstor writes on it, for the replica's
+// peer slots (replicaGeometry). A lower disk the definition's
 // size exposes a DRBD device smaller than the volume, and the kernel
 // refuses to attach it to a resource whose device is already larger.
 //
@@ -2173,7 +2290,7 @@ func lowerDiskKib(dr *intent.DesiredResource, vol *intent.DesiredVolume) int64 {
 
 	if needsDRBD(dr.GetLayerStack()) && vol.GetMetaPool() == "" {
 		data := max(vol.GetSizeKib(), vol.GetDeviceSizeKib())
-		size = drbd.InternalMetadataGrossKiB(data, drbd.DefaultGeometry())
+		size = drbd.InternalMetadataGrossKiB(data, replicaGeometry(dr))
 	}
 
 	if needsLUKS(dr.GetLayerStack()) {
@@ -2181,6 +2298,13 @@ func lowerDiskKib(dr *intent.DesiredResource, vol *intent.DesiredVolume) int64 {
 	}
 
 	return size
+}
+
+// replicaGeometry is the layout metadata is created in on a lower disk
+// of the replica's own: its peer slots, which LINSTOR copies from the
+// definition when it creates the replica, and the default activity log.
+func replicaGeometry(dr *intent.DesiredResource) drbd.MetadataGeometry {
+	return drbd.GeometryForPeerSlots(int(drbd.EffectivePeerSlots(dr.GetPeerSlots())))
 }
 
 // deviceWaitTimeoutDefault/deviceWaitPollDefault back the same-named
@@ -2409,7 +2533,8 @@ func (r *Reconciler) forgetResource(rdName string, volNums []int32) {
 // forgetRestoreRecord drops what this process recorded about restoring a
 // volume once that volume is deleted here, so a definition re-created
 // under the same name starts clean instead of inheriting a blank fallback
-// or a clone that no longer exists.
+// or a clone that no longer exists, and the peer slots of the metadata
+// that went with it.
 func (r *Reconciler) forgetRestoreRecord(rdName string, volNum int32) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -2418,6 +2543,7 @@ func (r *Reconciler) forgetRestoreRecord(rdName string, volNum int32) {
 	delete(r.restoreBlankFallback, key)
 	delete(r.restoreClonedHere, key)
 	delete(r.restoreSnapshotMissingTries, key)
+	delete(r.metadataSlots, growKey(rdName, volNum))
 }
 
 // bumpRestoreSnapshotMissing increments and returns the consecutive
@@ -2563,8 +2689,8 @@ func restoreSeedKey(rdName string, volNum int32) string {
 // every diskful volume's on-disk metadata block. Without it,
 // DRBD-9 v09 metadata keeps the departed peer's slot occupied
 // for the lifetime of the resource — after enough node-replace
-// cycles the resource exhausts the MaxPeers-1 slot budget
-// `drbdadm create-md --max-peers=15` carved at first activation,
+// cycles the resource exhausts the peer-slot budget
+// `drbdadm create-md --max-peers` carved at first activation,
 // and the next replica add fails with drbdmeta running out of
 // room. Errors on individual forget-peer calls are logged and
 // not bubbled up: leaving a stale slot is a slow leak (recoverable
@@ -2601,7 +2727,7 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 		}
 
 		// forget-peer errors are non-fatal: a stale slot leaks one of
-		// the MaxPeers-1 budget entries but the resource keeps serving
+		// the peer-slot budget entries but the resource keeps serving
 		// I/O, and the next reconcile retries. del-peer errors still
 		// bubble (above): those leak a live kernel connection.
 		if r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), peerID) != nil {
@@ -2673,7 +2799,7 @@ func (r *Reconciler) tearDownReidentifiedPeers(ctx context.Context, dr *intent.D
 // no longer holds a connection under that node-id: the connection went
 // on its own between the read and the call, and drbdsetup answers
 // "unknown connection". A failed forget-peer alone is not fatal either;
-// a stale slot costs one of the MaxPeers-1 entries until a retry.
+// a stale slot costs one of the peer-slot entries until a retry.
 func (r *Reconciler) dropOldConnection(ctx context.Context, resource string, nodeID int32, withMetadata bool) error {
 	delErr := r.cfg.Adm.DelPeerByNodeID(ctx, resource, nodeID)
 
@@ -5001,14 +5127,14 @@ func anySameGeneration(onDisk, known []string) bool {
 // Metadata sits at the end of the lower disk and its size follows its peer
 // slots and activity log, so a disk that already holds a superblock has its
 // data laid out to end where that superblock begins. That is a clone of a
-// snapshot, and every replica adopted from LINSTOR, which sizes metadata
-// for 7 slots by default against the 15 used here. Larger metadata takes
+// snapshot, and every replica adopted from LINSTOR, whose metadata can
+// have fewer slots than the replica now has. Larger metadata takes
 // room from the end of the data: drbdmeta refuses that for a filesystem it
 // knows, and for anything else, a partition table, a VM disk, a bare block
 // volume, --force answers its question and the end of the data is gone.
 //
 // So a superblock that is there is re-initialised in its own layout, with
-// no more slots than blockstor creates, whatever made it: a restore, or a
+// no more slots than the replica has, whatever made it: a restore, or a
 // superblock under a recorded GI that turned out not to be this replica's.
 // An adopted replica with no GI recorded here is not re-initialised at all:
 // it is kept under its own node id and refused under another one
@@ -5018,9 +5144,12 @@ func anySameGeneration(onDisk, known []string) bool {
 // (DrbdLayer.createMetaData). A superblock whose layout cannot be read is
 // an error, so the apply is retried rather than sized blind: only drbdmeta
 // saying there is no metadata at all lets a volume take the full layout.
-func (r *Reconciler) createMDGeometry(ctx context.Context, target string, unclean bool) (drbd.MetadataGeometry, error) {
+func (r *Reconciler) createMDGeometry(
+	ctx context.Context, dr *intent.DesiredResource, target string, unclean bool,
+) (drbd.MetadataGeometry, error) {
+	own := replicaGeometry(dr)
 	if !unclean {
-		return drbd.DefaultGeometry(), nil
+		return own, nil
 	}
 
 	found, err := r.cfg.Adm.MetadataGeometry(ctx, target)
@@ -5029,7 +5158,7 @@ func (r *Reconciler) createMDGeometry(ctx context.Context, target string, unclea
 			"read the layout of the superblock on %s, which the metadata about to be created has to fit", target)
 	}
 
-	geometry := found.Clamped()
+	geometry := found.ClampedTo(own.MaxPeers)
 
 	log.FromContext(ctx).Info("re-initialising metadata in the layout of the superblock it replaces",
 		"volume", target, "maxPeers", geometry.MaxPeers, "superblockMaxPeers", found.MaxPeers,
@@ -5081,7 +5210,7 @@ func (r *Reconciler) foreignRestoredSuperblock(
 		"volume", target, "superblockNodeID", found.NodeID, "localNodeID", local,
 		"sourceSnapshot", vol.GetSourceSnapshot())
 
-	return found.Clamped(), true
+	return found.ClampedTo(replicaGeometry(dr).MaxPeers), true
 }
 
 // metadataPlan is what the metadata probe of one volume decided.
@@ -5129,7 +5258,7 @@ func (r *Reconciler) metadataToCreate(
 		return metadataPlan{geometry: geometry, create: foreign}, nil
 	}
 
-	geometry, err := r.createMDGeometry(ctx, target, unclean)
+	geometry, err := r.createMDGeometry(ctx, dr, target, unclean)
 	if err != nil {
 		return metadataPlan{}, err
 	}
@@ -5376,6 +5505,8 @@ func isLateAddWinner(dr *intent.DesiredResource) bool {
 func (r *Reconciler) createMDWithCollisionRecovery(ctx context.Context, selfRD, target string, geometry drbd.MetadataGeometry) error {
 	err := r.cfg.Adm.CreateMDWithGeometry(ctx, target, geometry)
 	if err == nil {
+		r.noteMetadataSlots(target, geometry.MaxPeers)
+
 		return nil
 	}
 
@@ -5416,7 +5547,14 @@ func (r *Reconciler) createMDWithCollisionRecovery(ctx context.Context, selfRD, 
 		return err //nolint:wrapcheck // caller wraps with create-md context
 	}
 
-	return r.cfg.Adm.CreateMDWithGeometry(ctx, target, geometry) //nolint:wrapcheck // caller wraps with create-md context
+	err = r.cfg.Adm.CreateMDWithGeometry(ctx, target, geometry)
+	if err != nil {
+		return err //nolint:wrapcheck // caller wraps with create-md context
+	}
+
+	r.noteMetadataSlots(target, geometry.MaxPeers)
+
+	return nil
 }
 
 // maybeStampMetadata is the create-md decision branch lifted out of
@@ -6709,10 +6847,10 @@ func (r *Reconciler) seedInitialGI(
 // N in 0..31 on a v09 block created with `create-md 15`
 // (--max-peers=15) and hard-errors `node-id out of range (0...31)`
 // for N>=32. So 0..31 covers every slot create-md sized AND every
-// id the allocator (0..MaxPeers-1) could ever hand out, while never
-// tripping the out-of-range failure. Stamping the 16..31 slots that
-// the allocator never uses is a harmless overwrite of an unused
-// zero-GI slot; the safety it buys is that a late-allocated node-id
+// id the allocator (0..NodeIDMax) could ever hand out, while never
+// tripping the out-of-range failure. Stamping a slot no replica uses
+// is a harmless overwrite of an unused zero-GI slot; the safety it
+// buys is that a late-allocated node-id
 // (Bug 87) or a peer whose Status.DRBDNodeID is not yet visible at
 // apply time can NEVER find its slot left stale.
 //

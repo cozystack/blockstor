@@ -82,8 +82,8 @@ func TestLowestFreeNodeID_DeterministicAcrossOrderings(t *testing.T) {
 func TestLowestFreeNodeID_Exhausted(t *testing.T) {
 	t.Parallel()
 
-	taken := make([]int32, drbd.MaxPeers)
-	for i := range int32(drbd.MaxPeers) {
+	taken := make([]int32, drbd.NodeIDMax+1)
+	for i := range int32(drbd.NodeIDMax + 1) {
 		taken[i] = i
 	}
 
@@ -96,7 +96,7 @@ func TestLowestFreeNodeID_Exhausted(t *testing.T) {
 func TestLowestFreeNodeID_IgnoresOutOfRange(t *testing.T) {
 	t.Parallel()
 
-	// 99 is past MaxPeers; the allocator must not let it block id 0.
+	// 99 is past NodeIDMax; the allocator must not let it block id 0.
 	got, err := drbd.LowestFreeNodeID([]int32{99})
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -104,5 +104,23 @@ func TestLowestFreeNodeID_IgnoresOutOfRange(t *testing.T) {
 
 	if got != 0 {
 		t.Errorf("got %d, want 0", got)
+	}
+}
+
+// DRBD 9 node ids run 0..31 whatever the peer slots, as LINSTOR hands
+// them out (NodeId.NODE_ID_MAX): a definition with more peer slots than
+// 15, or with diskless replicas beside its diskful ones, has replicas
+// past id 15. The allocator used to stop there.
+func TestLowestFreeNodeID_HandsOutIDsPastFifteen(t *testing.T) {
+	t.Parallel()
+
+	taken := make([]int32, 0, 16)
+	for i := range int32(16) {
+		taken = append(taken, i)
+	}
+
+	got, err := drbd.LowestFreeNodeID(taken)
+	if err != nil || got != 16 {
+		t.Errorf("with 0..15 taken: got %d, %v; want 16", got, err)
 	}
 }

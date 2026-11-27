@@ -1307,6 +1307,13 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 		logger.Error(err, "record apply failure")
 	}
 
+	err = r.recordMetadataPeerSlots(ctx, res, results)
+	if err != nil {
+		failed = true
+
+		logger.Error(err, "record the superblock's peer slots")
+	}
+
 	if !outcome.failed {
 		err = r.stampLiveMigrateApplied(ctx, res, rd)
 		if err != nil {
@@ -1351,6 +1358,53 @@ func (r *ResourceReconciler) stampLiveMigrateApplied(ctx context.Context, res *b
 	err = r.Patch(ctx, res, client.RawPatch(types.MergePatchType, body))
 	if err != nil {
 		return errors.Wrap(err, "merge-patch annotation "+blockstoriov1alpha1.ResourceAnnotationLiveMigrateApplied)
+	}
+
+	return nil
+}
+
+// recordMetadataPeerSlots publishes the peer-slot count the pass read
+// from the replica's superblock (Status.MetadataPeerSlots), for the
+// controller to record as the replica's count. Written once per
+// superblock: a value already there is the one the superblock holds.
+// A replica without a disk has no superblock, so the value is cleared
+// there; a toggle back to diskful creates new metadata, with the
+// replica's own count, and the next read publishes that. Left in
+// place, the old count would size the grows of the new metadata.
+func (r *ResourceReconciler) recordMetadataPeerSlots(
+	ctx context.Context, res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult,
+) error {
+	if slices.Contains(res.Spec.Flags, apiv1.ResourceFlagDiskless) || slices.Contains(res.Spec.Flags, apiv1.ResourceFlagTieBreaker) {
+		if res.Status.MetadataPeerSlots == nil {
+			return nil
+		}
+
+		base := res.DeepCopy()
+		res.Status.MetadataPeerSlots = nil
+
+		err := r.Status().Patch(ctx, res, client.MergeFrom(base))
+		if err != nil {
+			return errors.Wrap(err, "clear Status.MetadataPeerSlots")
+		}
+
+		return nil
+	}
+
+	if len(results) == 0 || res.Status.MetadataPeerSlots != nil {
+		return nil
+	}
+
+	slots := results[0].GetMetadataPeerSlots()
+	if slots == 0 {
+		return nil
+	}
+
+	base := res.DeepCopy()
+	res.Status.MetadataPeerSlots = &slots
+
+	err := r.Status().Patch(ctx, res, client.MergeFrom(base))
+	if err != nil {
+		return errors.Wrap(err, "patch Status.MetadataPeerSlots")
 	}
 
 	return nil
@@ -2138,8 +2192,8 @@ func (r *ResourceReconciler) refreshDefinitionForFirstApply(
 }
 
 // refreshTargetFromAPIReader does an uncached Get on the target
-// Resource and overwrites `res` in place when the APIReader reports
-// non-nil DRBD-IDs. Returns true iff every DRBD-ID is now populated,
+// Resource and replaces `res` with that revision when the APIReader
+// reports non-nil DRBD-IDs. Returns true iff every DRBD-ID is now populated,
 // signalling the caller to fall through the wait gate. Returns false
 // when the APIReader also reports nil (controller really hasn't
 // stamped yet) or on lookup error (caller falls back to the cached
@@ -2172,9 +2226,14 @@ func (r *ResourceReconciler) refreshTargetFromAPIReader(ctx context.Context, res
 		return false
 	}
 
-	res.Status.DRBDNodeID = fresh.Status.DRBDNodeID
-	res.Status.DRBDPort = fresh.Status.DRBDPort
-	res.Status.DRBDMinor = fresh.Status.DRBDMinor
+	// The whole revision, not the three ids: the controller writes the
+	// replica's peer slots and skip-initial-sync decision in the spec
+	// write before it mirrors the ids, so ids taken alone would sit next
+	// to a cached spec that has neither. The apply would then size the
+	// lower disk for 15 slots and create 7-slot metadata on it a pass
+	// later, leaving the device larger than the definition and larger
+	// than every replica the controller stamped first.
+	*res = fresh
 
 	return true
 }

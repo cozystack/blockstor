@@ -2263,6 +2263,9 @@ func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 	// definition pinned over data stays with that data: the shell has none.
 	clone.LayerStack = cloneShellLayerStack(src, req)
 	clone.Annotations = withoutUnappliedGroupStack(src.Annotations)
+	// The source's peer slots, as LINSTOR's clone carries the source's
+	// DRBD layer over (createRscDfnPayload).
+	clone.PeerSlots = store.ReplicaPeerSlots(0, src.PeerSlots)
 
 	if req.ResourceGroup != "" {
 		clone.ResourceGroupName = req.ResourceGroup

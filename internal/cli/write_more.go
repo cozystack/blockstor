@@ -528,6 +528,13 @@ func resourceCreate(ctx context.Context, run *runContext) error {
 			return poolErr
 		}
 
+		if !run.Flags.Diskless {
+			slotErr := checkPeerSlotFor(ctx, run, rdName, node)
+			if slotErr != nil {
+				return slotErr
+			}
+		}
+
 		err := createOrTakeOver(ctx, run.Store, res)
 		if err != nil {
 			return err

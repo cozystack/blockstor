@@ -837,6 +837,11 @@ func (in *ResourceDefinitionSpec) DeepCopyInto(out *ResourceDefinitionSpec) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.PeerSlots != nil {
+		in, out := &in.PeerSlots, &out.PeerSlots
+		*out = new(int32)
+		**out = **in
+	}
 	if in.Initialized != nil {
 		in, out := &in.Initialized, &out.Initialized
 		*out = new(bool)
@@ -1199,6 +1204,11 @@ func (in *ResourceSpec) DeepCopyInto(out *ResourceSpec) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.PeerSlots != nil {
+		in, out := &in.PeerSlots, &out.PeerSlots
+		*out = new(int32)
+		**out = **in
+	}
 	if in.SkipInitialSync != nil {
 		in, out := &in.SkipInitialSync, &out.SkipInitialSync
 		*out = new(bool)
@@ -1231,6 +1241,11 @@ func (in *ResourceStatus) DeepCopyInto(out *ResourceStatus) {
 	}
 	if in.DRBDMinor != nil {
 		in, out := &in.DRBDMinor, &out.DRBDMinor
+		*out = new(int32)
+		**out = **in
+	}
+	if in.MetadataPeerSlots != nil {
+		in, out := &in.MetadataPeerSlots, &out.MetadataPeerSlots
 		*out = new(int32)
 		**out = **in
 	}

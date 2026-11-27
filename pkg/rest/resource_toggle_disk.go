@@ -183,6 +183,27 @@ func (s *Server) migrateDiskCommon(w http.ResponseWriter, r *http.Request, pool 
 	}})
 }
 
+// cancelToggleDisk asks the satellite to unwind the conversion in
+// flight on rdName's replica on node (`r td --cancel`).
+func (s *Server) cancelToggleDisk(w http.ResponseWriter, r *http.Request, rdName, node string) {
+	err := s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node,
+		func(res *apiv1.Resource) error {
+			res.ToggleDiskCancel = true
+
+			return nil
+		})
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource '" + rdName + "' on '" + node + "' toggle-disk cancel requested",
+	}})
+}
+
 // handleResourceToggleDisk flips Spec.Flags["DISKLESS"] on the
 // named replica. Path-suffix `storage-pool/{pool}` (when present)
 // stamps that pool name on Spec.StoragePool when promoting to
@@ -215,22 +236,7 @@ func (s *Server) handleResourceToggleDisk(w http.ResponseWriter, r *http.Request
 	// rollback so an external observer sees DISKLESS reappear only
 	// AFTER drbdadm down + storage Delete succeed.
 	if queryFlag(r, "cancel") {
-		err := s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node,
-			func(res *apiv1.Resource) error {
-				res.ToggleDiskCancel = true
-
-				return nil
-			})
-		if err != nil {
-			writeStoreError(w, err)
-
-			return
-		}
-
-		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-			RetCode: maskInfo,
-			Message: "resource '" + rdName + "' on '" + node + "' toggle-disk cancel requested",
-		}})
+		s.cancelToggleDisk(w, r, rdName, node)
 
 		return
 	}
@@ -241,6 +247,10 @@ func (s *Server) handleResourceToggleDisk(w http.ResponseWriter, r *http.Request
 	if r.ContentLength != 0 {
 		s.toggleDiskByOperation(w, r)
 
+		return
+	}
+
+	if !s.refuseDiskfulWithoutPeerSlot(w, r, rdName, node) {
 		return
 	}
 
@@ -396,6 +406,10 @@ func (s *Server) handleResourceToggleDiskToDiskful(w http.ResponseWriter, r *htt
 	node := r.PathValue("node")
 	pool := r.PathValue("pool")
 
+	if !s.refuseDiskfulWithoutPeerSlot(w, r, rdName, node) {
+		return
+	}
+
 	// Bug 281: same Get → Update race as handleResourceToggleDisk.
 	err := s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node,
 		func(res *apiv1.Resource) error {
@@ -432,6 +446,34 @@ func (s *Server) handleResourceToggleDiskToDiskful(w http.ResponseWriter, r *htt
 		RetCode: maskInfo,
 		Message: "resource '" + rdName + "' on '" + node + "' toggled to diskful",
 	}})
+}
+
+// refuseDiskfulWithoutPeerSlot answers a toggle-disk or migrate-disk
+// that would give the replica on node a disk its definition has no DRBD
+// peer slot for, as LINSTOR refuses it with FAIL_INSUFFICIENT_PEER_SLOTS
+// (CtrlRscToggleDiskApiCallHandler.ensureAllPeersHavePeerSlotLeft). A
+// replica that already has a disk takes no new slot. True means the
+// caller may go on.
+func (s *Server) refuseDiskfulWithoutPeerSlot(w http.ResponseWriter, r *http.Request, rdName, node string) bool {
+	res, err := s.Store.Resources().Get(r.Context(), rdName, node)
+	if err == nil && !isDisklessReplica(&res) {
+		return true
+	}
+
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	err = store.CheckPeerSlotsForNewPeer(r.Context(), s.Store, rdName, node)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	return true
 }
 
 // stampStoragePool sets both the typed StoragePool field
@@ -537,6 +579,11 @@ func (s *Server) validateMigrateSrc(w http.ResponseWriter, r *http.Request, rdNa
 // watches; without it the controller has no way to know which src
 // to prune once dst reaches UpToDate.
 func (s *Server) promoteMigrateDst(w http.ResponseWriter, r *http.Request, rdName, dst, pool, src string) bool {
+	// The destination joins with a disk while the source still has one.
+	if !s.refuseDiskfulWithoutPeerSlot(w, r, rdName, dst) {
+		return false
+	}
+
 	dstRes, err := s.Store.Resources().Get(r.Context(), rdName, dst)
 	switch {
 	case errors.Is(err, store.ErrNotFound):

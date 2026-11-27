@@ -71,6 +71,7 @@ const (
 	patchKeyDRBDPort           = "drbdPort"
 	patchKeyDRBDMinor          = "drbdMinor"
 	patchKeySkipInitialSync    = "skipInitialSync"
+	patchKeyPeerSlots          = "peerSlots"
 	resourceDefinitionKindName = "ResourceDefinition"
 )
 
@@ -301,6 +302,10 @@ func (r *ResourceReconciler) ReconcilePass(ctx context.Context, req ctrl.Request
 		return result, err
 	}
 
+	// A replica waiting for its peer slots still gets its apply, and
+	// is looked at again when its wait reaches the limit.
+	awaitResult := result
+
 	// A freeze that fails is retried, but does not hold up the rest of
 	// the replica's housekeeping: the stamp only stops a later size
 	// change, and an in-use replica whose freeze keeps being refused
@@ -310,6 +315,10 @@ func (r *ResourceReconciler) ReconcilePass(ctx context.Context, req ctrl.Request
 	result, err = r.runApply(ctx, &target)
 	if freezeErr != nil {
 		return ctrl.Result{}, cerrors.Join(err, freezeErr)
+	}
+
+	if after := awaitResult.RequeueAfter; after > 0 && (result.RequeueAfter == 0 || after < result.RequeueAfter) {
+		result.RequeueAfter = after
 	}
 
 	return result, err
@@ -724,7 +733,7 @@ func (r *ResourceReconciler) lookupRD(ctx context.Context, name string) (*blocks
 // values on Status. Returns true when Status was changed; the caller
 // requeues so the next reconcile dispatches with the committed values.
 //
-// node-id allocation is the lowest free 0..MaxPeers-1 not held by
+// node-id allocation is the lowest free 0..NodeIDMax not held by
 // any sibling Resource of the same RD — sibling ids stay put, only
 // the unallocated target gets a new value. This is the load-bearing
 // invariant: re-using ids on a different node would re-map DRBD
@@ -786,6 +795,13 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 
 		return inner
 	})
+	// A replica held back for its peer slots is the caller's to report
+	// (awaitPeerSlots), so the error goes up unwrapped.
+	var awaiting *awaitingPeerSlotsError
+	if cerrors.As(err, &awaiting) {
+		return false, awaiting
+	}
+
 	if err != nil {
 		return false, cerrors.Wrap(err, "allocate DRBD ids")
 	}
@@ -803,7 +819,7 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 // cannot return, sends the caller down the uncached allocation path.
 func (r *ResourceReconciler) identitiesSettled(ctx context.Context, target *blockstoriov1alpha1.Resource) bool {
 	spec := &target.Spec
-	if spec.DRBDNodeID == nil || spec.DRBDPort == nil || spec.SkipInitialSync == nil {
+	if spec.DRBDNodeID == nil || spec.DRBDPort == nil || spec.SkipInitialSync == nil || spec.PeerSlots == nil {
 		return false
 	}
 
@@ -1041,6 +1057,22 @@ func backfillResourceSpecFromStatus(target *blockstoriov1alpha1.Resource) {
 func (r *ResourceReconciler) allocateResourceSpecFields(
 	ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition,
 ) error {
+	// Read before a node id is allocated below: one allocated now comes
+	// with the definition's count, one already there predates the record.
+	// Decided before the node id too: a new replica that has to wait for
+	// its count gets neither, since the satellite builds a replica with a
+	// node id and no count as one created with 15.
+	var peerSlots *int32
+
+	if target.Spec.PeerSlots == nil {
+		var err error
+
+		peerSlots, err = r.peerSlotsToStamp(ctx, target, rd, target.PeerSlotsPredateRecord())
+		if err != nil {
+			return err
+		}
+	}
+
 	if target.Spec.DRBDNodeID == nil {
 		id, err := r.allocateNodeIDLocked(ctx, target)
 		if err != nil {
@@ -1073,6 +1105,17 @@ func (r *ResourceReconciler) allocateResourceSpecFields(
 	if target.Spec.SkipInitialSync == nil && rd != nil {
 		v := !rdInitialized(rd)
 		target.Spec.SkipInitialSync = &v
+	}
+
+	// The replica's peer slots, copied from the definition as LINSTOR
+	// copies DrbdRscDfnData.peerSlots onto each DrbdRscData it creates,
+	// so a later `rd modify --peer-slots` leaves this replica's metadata
+	// and sizing alone. Stamped in the same patch as the node id, which
+	// the satellite waits for before it creates anything; a replica that
+	// had a node id before counts were recorded gets the count its
+	// superblock holds (peerSlotsToStamp). Set-if-nil.
+	if target.Spec.PeerSlots == nil {
+		target.Spec.PeerSlots = peerSlots
 	}
 
 	return nil
@@ -1118,6 +1161,7 @@ func (r *ResourceReconciler) patchResourceSpecIdentities(ctx context.Context, ta
 		patchKeyDRBDNodeID:      target.Spec.DRBDNodeID,
 		patchKeyDRBDPort:        target.Spec.DRBDPort,
 		patchKeySkipInitialSync: target.Spec.SkipInitialSync,
+		patchKeyPeerSlots:       target.Spec.PeerSlots,
 	}}
 
 	patchBytes, err := json.Marshal(body)
@@ -1161,7 +1205,8 @@ func (r *ResourceReconciler) patchResourceStatusIdentities(ctx context.Context, 
 func equalResourceIdentitySpec(a, b *blockstoriov1alpha1.ResourceSpec) bool {
 	return ptrEqI32(a.DRBDNodeID, b.DRBDNodeID) &&
 		ptrEqI32(a.DRBDPort, b.DRBDPort) &&
-		ptrEqBool(a.SkipInitialSync, b.SkipInitialSync)
+		ptrEqBool(a.SkipInitialSync, b.SkipInitialSync) &&
+		ptrEqI32(a.PeerSlots, b.PeerSlots)
 }
 
 func ptrEqBool(a, b *bool) bool {
@@ -2376,7 +2421,12 @@ func (r *ResourceReconciler) resolveEffectiveProps(ctx context.Context, target *
 // step, but the property tests live in package controller_test and
 // need a way in. Production callers use Reconcile.
 func (r *ResourceReconciler) EnsureDRBDIDsForTest(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) (bool, error) {
-	return r.ensureDRBDIDs(ctx, target, peers)
+	allocated, err := r.ensureDRBDIDs(ctx, target, peers)
+	if cerrors.Is(err, errAwaitingPeerSlots) {
+		return false, nil
+	}
+
+	return allocated, err
 }
 
 // CollectTakenNodeIDsForTest exposes the per-RD occupied node-id set
@@ -2541,7 +2591,7 @@ func (r *ResourceReconciler) allocateNodeIDLocked(ctx context.Context, target *b
 //
 // Tradeoff (acceptable): if a forget-peer is stuck, or a sibling is
 // offline with a stale Status still listing the id, that id stays
-// occupied longer — id-burn is bounded toward drbd.MaxPeers=16. This
+// occupied longer — id-burn is bounded toward drbd.NodeIDMax+1. This
 // is conservative and self-healing; strictly better than the
 // permanent wedge a premature reuse causes.
 func (r *ResourceReconciler) collectTakenNodeIDs(ctx context.Context, target *blockstoriov1alpha1.Resource) ([]int32, error) {

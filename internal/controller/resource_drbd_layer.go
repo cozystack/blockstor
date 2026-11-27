@@ -143,6 +143,30 @@ func (r *ResourceReconciler) allocateDRBDIDsIfUsed(
 	}
 
 	allocated, err := r.ensureDRBDIDs(ctx, target.DeepCopy(), nil)
+
+	var awaiting *awaitingPeerSlotsError
+	if cerrors.As(err, &awaiting) {
+		result, err := r.awaitPeerSlots(ctx, target, awaiting.untold)
+
+		return result, err != nil, err
+	}
+
+	if err != nil {
+		return ctrl.Result{}, true, err
+	}
+
+	// Settled on every pass, not only the one that allocates: after a
+	// restart or a failed patch between the stamp and this, the replica
+	// has its ids, the allocating pass never comes again, and the
+	// condition would keep saying it has none.
+	err = r.settlePeerSlotsKnown(ctx, target)
+	if err != nil {
+		return ctrl.Result{}, true, err
+	}
+
+	// A definition adopted or created before counts were recorded gets
+	// one once its replicas have told theirs.
+	err = r.recordDefinitionPeerSlots(ctx, target.Spec.ResourceDefinitionName)
 	if err != nil {
 		return ctrl.Result{}, true, err
 	}
