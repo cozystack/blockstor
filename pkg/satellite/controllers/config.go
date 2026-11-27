@@ -151,6 +151,11 @@ type Config struct {
 	// resources the kernel no longer runs as configured; zero means
 	// driftCheckInterval.
 	DriftCheckInterval time.Duration
+
+	// Workarounds turns the satellite's DRBD workarounds on and off
+	// (drbd_workarounds.go). The zero value turns them all off;
+	// cmd/satellite wires DefaultWorkaroundsConfig adjusted by its flags.
+	Workarounds WorkaroundsConfig
 }
 
 // DefaultResourceWorkers is how many local Resources the satellite applies
