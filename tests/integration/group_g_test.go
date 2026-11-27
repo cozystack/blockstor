@@ -1016,13 +1016,23 @@ func testGroupGSnapOrphanCleanup(t *testing.T, stack *harness.Stack, cli *harnes
 	// first Reconcile for this node — guarded against the race
 	// where apiserver removes the CRD before handleDelete runs,
 	// the failure mode Bug 64 documents).
-	var snap blockstoriov1alpha1.Snapshot
-	if err := stack.Env.Client.Get(ctx, key, &snap); err != nil {
-		t.Fatalf("Get snap: %v", err)
-	}
+	//
+	// The controller writes this Snapshot concurrently, so a single
+	// Get+Update can lose the resourceVersion race: re-read and retry.
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var snap blockstoriov1alpha1.Snapshot
+		if err := stack.Env.Client.Get(ctx, key, &snap); err != nil {
+			return fmt.Errorf("get snap: %w", err)
+		}
 
-	snap.Finalizers = append(snap.Finalizers, satelliteSnapshotFinalizer)
-	if err := stack.Env.Client.Update(ctx, &snap); err != nil {
+		if slices.Contains(snap.Finalizers, satelliteSnapshotFinalizer) {
+			return nil
+		}
+
+		snap.Finalizers = append(snap.Finalizers, satelliteSnapshotFinalizer)
+
+		return stack.Env.Client.Update(ctx, &snap)
+	}); err != nil {
 		t.Fatalf("stamp finalizer: %v", err)
 	}
 
@@ -1080,8 +1090,16 @@ func testGroupGSnapOrphanCleanup(t *testing.T, stack *harness.Stack, cli *harnes
 	default:
 	}
 
-	terminating.Finalizers = nil
-	if err := stack.Env.Client.Update(ctx, &terminating); err != nil {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var snap blockstoriov1alpha1.Snapshot
+		if err := stack.Env.Client.Get(ctx, key, &snap); err != nil {
+			return fmt.Errorf("get terminating snap: %w", err)
+		}
+
+		snap.Finalizers = nil
+
+		return stack.Env.Client.Update(ctx, &snap)
+	}); err != nil {
 		t.Fatalf("strip finalizer: %v", err)
 	}
 
