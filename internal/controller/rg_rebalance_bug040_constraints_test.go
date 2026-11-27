@@ -89,6 +89,8 @@ func seedBug040RebalanceFixture(
 		},
 		Annotations: map[string]string{
 			apiv1.AnnotationRGRebalancePending: "2026-06-13T00:00:00Z",
+			// The `rg modify` behind it raised the place count.
+			apiv1.AnnotationRGRebalancePlaceCount: "2026-06-13T00:00:00Z",
 		},
 	}); err != nil {
 		t.Fatalf("seed rg: %v", err)
@@ -191,17 +193,17 @@ func TestRGRebalanceRefillNeverExceedsPlaceCount(t *testing.T) {
 	}
 }
 
-// TestRGRebalanceRefillSkipsEvictedNode: place_count=3, replicas on
-// n1+n2+n3 with n3 EVICTED. The stranded replica must not mask the
-// deficit (placer accounting drops it) and the refill must land on the
-// healthy spare n4 — never back on the EVICTED node.
+// TestRGRebalanceRefillSkipsEvictedNode: place_count=4, replicas on
+// n1+n2+n3 with n3 EVICTED. The stranded replica must not count as a
+// healthy one in the placer's accounting, and the refill must land on
+// the healthy spare n4 — never back on the EVICTED node.
 func TestRGRebalanceRefillSkipsEvictedNode(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	st := store.NewInMemory()
 
-	seedBug040RebalanceFixture(t, ctx, st, 3,
+	seedBug040RebalanceFixture(t, ctx, st, 4,
 		map[string][]string{"n3": {apiv1.NodeFlagEvicted}},
 		nil,
 		[]string{"n1", "n2", "n3"})
@@ -218,5 +220,30 @@ func TestRGRebalanceRefillSkipsEvictedNode(t *testing.T) {
 	if len(byNode) != 4 {
 		t.Errorf("replica set after refill: got %d rows (%v), want 4 (n1+n2+stranded n3+refilled n4)",
 			len(byNode), byNode)
+	}
+}
+
+// TestRGModifyCountsTheReplicaOnAnEvictedNode: LINSTOR's `rg modify`
+// counts every replica of a child but its tiebreakers before it decides
+// to autoplace, the one stranded on an evicted node included. A
+// definition with three replicas, one of them there, is not short of a
+// place count of three, so the modify places nothing on it; replacing
+// that replica is the eviction path's job
+// (CtrlRscAutoRePlaceRscHelper), not the modify's.
+func TestRGModifyCountsTheReplicaOnAnEvictedNode(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewInMemory()
+
+	seedBug040RebalanceFixture(t, ctx, st, 3,
+		map[string][]string{"n3": {apiv1.NodeFlagEvicted}},
+		nil,
+		[]string{"n1", "n2", "n3"})
+
+	byNode := runBug040Rebalance(t, ctx, st)
+
+	if len(byNode) != 3 {
+		t.Errorf("rg modify placed on a definition at its place count: got %d rows (%v), want 3", len(byNode), byNode)
 	}
 }

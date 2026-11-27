@@ -79,7 +79,7 @@ func TestStampVolumeStatusCopiesStoragePool(t *testing.T) {
 			NodeName: node,
 			Ok:       true,
 			Volumes: []*intent.ResourceApplyVolumeResult{
-				{VolumeNumber: 0, DevicePath: "/dev/drbd1000"},
+				{VolumeNumber: 0, DevicePath: "/dev/drbd1000", AppliedSizeKib: 2048},
 			},
 		},
 	}
@@ -113,6 +113,12 @@ func TestStampVolumeStatusCopiesStoragePool(t *testing.T) {
 
 	if vol.StoragePool != pool {
 		t.Errorf("StoragePool: got %q, want %q (Bug 75)", vol.StoragePool, pool)
+	}
+
+	// The REST layer answers a resize once every diskful replica reports
+	// the new size here.
+	if vol.AppliedSizeKib != 2048 {
+		t.Errorf("AppliedSizeKib: got %d, want 2048", vol.AppliedSizeKib)
 	}
 }
 

@@ -68,6 +68,25 @@ type Snapshot struct {
 	// (Bug 046 / Bug-353 atomicity fix). Like GroupID it is an internal
 	// coordination field that never reaches the upstream LINSTOR wire.
 	GroupSize int32 `json:"group_size,omitempty"`
+
+	// AbortReason is why the controller aborted the take, when it did.
+	// The create endpoints answer a failed take with it, the way LINSTOR
+	// answers with the abort's error. LINSTOR's snapshot DTO has no such
+	// field, so it never reaches the wire.
+	AbortReason string `json:"-"`
+
+	// DeleteFailures carries the per-node errors the satellites hit
+	// deleting their copies of a deleting snapshot, so the delete call
+	// can answer with them. Internal: LINSTOR has no such field and
+	// reports the error only in the answer to the delete.
+	DeleteFailures []SnapshotDeleteFailure `json:"-"`
+}
+
+// SnapshotDeleteFailure is the error one node hit deleting its copy
+// of a snapshot.
+type SnapshotDeleteFailure struct {
+	NodeName string
+	Message  string
 }
 
 // SnapshotVolumeDef is one volume slot inside a Snapshot. F20:
@@ -95,6 +114,11 @@ type SnapshotPerNode struct {
 	Flags           []string         `json:"flags,omitempty"`
 	SnapshotVolumes []SnapshotVolume `json:"snapshot_volumes,omitempty"`
 	UUID            string           `json:"uuid,omitempty"`
+
+	// StoragePool is the pool holding this node's copy, as the satellite
+	// recorded it. A restore places its replica there. Not part of the
+	// LINSTOR wire shape, which keeps the pool off the snapshot view.
+	StoragePool string `json:"-"`
 }
 
 // SnapshotVolume is one per-node, per-volume slot inside a
@@ -119,12 +143,11 @@ type SnapshotVolume struct {
 //	(anything else)    -> "Incomplete"
 //
 // blockstor used to ship the `FAILED` shorthand (terminal-error stamp
-// from the satellite snapshot reconciler); we keep that one and ALSO
-// stamp `SUCCESSFUL` on the wire view once every diskful peer reports
-// Ready. TIE_BREAKER + DISKLESS replicas hold no data and never take
-// the snapshot, so they MUST be excluded from the "every replica is
-// ready" denominator — otherwise the State column hangs in Incomplete
-// forever on auto-placed 2-diskful + 1-tiebreaker topologies.
+// from the satellite snapshot reconciler); we keep that one. SUCCESSFUL
+// is the flag the controller persists on the Snapshot once the take
+// completed on every targeted node, as LINSTOR persists it on the
+// snapshot definition; the wire view serves it as stored, so it
+// survives the deletion of the source volume.
 const (
 	SnapshotFlagFailedDeployment = "FAILED_DEPLOYMENT"
 	SnapshotFlagFailedDisconnect = "FAILED_DISCONNECT"

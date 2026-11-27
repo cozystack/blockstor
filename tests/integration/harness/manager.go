@@ -39,6 +39,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/internal/controller"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/rest"
 	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 )
@@ -339,7 +340,7 @@ func wireResourceReconcilers(mgr manager.Manager, store *storek8s.Store) error {
 }
 
 func wireBackgroundRunnables(mgr manager.Manager, store *storek8s.Store) error {
-	err := (&controller.AutoSnapshotRunnable{Client: mgr.GetClient(), Store: store}).RegisterWithManager(mgr)
+	err := (&controller.AutoSnapshotRunnable{Client: mgr.GetClient(), Store: store, APIReader: mgr.GetAPIReader()}).RegisterWithManager(mgr)
 	if err != nil {
 		return fmt.Errorf("auto-snapshot: %w", err)
 	}
@@ -363,11 +364,20 @@ func mountREST(mgr manager.Manager, store *storek8s.Store) (string, error) {
 		return "", fmt.Errorf("pick free port: %w", err)
 	}
 
+	// As in cmd/apiserver: the passphrase verbs read by name, and the
+	// view derives the encryption state from the watches.
+	watches, err := passphrase.AddWatchedReader(mgr, restNamespace)
+	if err != nil {
+		return "", fmt.Errorf("add passphrase watches: %w", err)
+	}
+
 	err = mgr.Add(&rest.Server{
-		Addr:      addr,
-		Store:     store,
-		Client:    mgr.GetClient(),
-		Namespace: restNamespace,
+		Addr:         addr,
+		Store:        store,
+		Client:       mgr.GetClient(),
+		Namespace:    restNamespace,
+		SecretReader: mgr.GetAPIReader(),
+		StateReader:  watches,
 	})
 	if err != nil {
 		return "", fmt.Errorf("add REST: %w", err)

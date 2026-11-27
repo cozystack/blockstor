@@ -108,10 +108,14 @@ func newIndexedManager(cfg *rest.Config, opts ctrl.Options, budget time.Duration
 // retrying the whole set after a partial success would fail on the part that
 // worked.
 func registerFieldIndexesWithin(budget time.Duration, indexer ctrlclient.FieldIndexer) error {
+	return registerIndexesWithin(budget, indexer, fieldIndexes())
+}
+
+// registerIndexesWithin is registerFieldIndexesWithin over a given set.
+func registerIndexesWithin(budget time.Duration, indexer ctrlclient.FieldIndexer, pending []fieldIndex) error {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 
-	pending := fieldIndexes()
 	delay := indexRetryFirstDelay
 
 	var lastErr error
@@ -258,7 +262,7 @@ type fieldIndex struct {
 // back to listing every object, silently, on every call.
 //
 // Only the definition-scoped reads go through the cache (resources and
-// snapshots ListByDefinition). The node-scoped ones go to the API reader,
+// snapshots ListByDefinition, and the spellings ReplicasOf looks up). The node-scoped ones go to the API reader,
 // which sends the selector to the API server, so an index for spec.nodeName
 // would be maintained over every Resource and StoragePool in the cache and
 // read by nothing.
@@ -286,5 +290,6 @@ func fieldIndexes() []fieldIndex {
 				return []string{snap.Spec.ResourceDefinitionName}
 			},
 		},
+		replicaKeyIndex(),
 	}
 }

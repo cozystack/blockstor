@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/blocksize"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
@@ -38,7 +39,7 @@ import (
 // storPoolPropKey is the LINSTOR-wire property name pinning a Resource
 // to a specific storage pool. Mirrors upstream LINSTOR (`StorPoolName`
 // — CamelCase per the REST contract).
-const storPoolPropKey = "StorPoolName"
+const storPoolPropKey = apiv1.KeyStorPoolName
 
 // The corrections of restore refusals that clear on their own: the same
 // request sent again, or sent again once a delete in flight has finished.
@@ -365,7 +366,9 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 	// bad placement is rejected BEFORE any Store mutation, matching upstream
 	// LINSTOR (restoring to a snapshot-less node errors clearly rather than
 	// silently placing an empty replica).
-	if !validateRestoreNodesHoldSnapshot(w, srcRD, snapName, &req, &snap) {
+	// Nor onto a node with no storage pool to restore into.
+	if !validateRestoreNodesHoldSnapshot(w, srcRD, snapName, &req, &snap) ||
+		!s.validateRestorePools(r.Context(), w, &req, &snap) {
 		return
 	}
 
@@ -447,7 +450,7 @@ func (s *Server) adoptPreparedRestoreTarget(
 
 	prepared, err := store.PreparedRestoreTarget(ctx, s.Store, &existing, snap)
 	if err != nil {
-		writePreparedTargetRefusal(w, existing.Name, snap, err)
+		writePreparedTargetRefusal(w, existing.Name, err)
 
 		return false, true
 	}
@@ -471,7 +474,7 @@ func (s *Server) adoptPreparedRestoreTarget(
 	}
 
 	if err != nil {
-		writePreparedTargetRefusal(w, existing.Name, snap, err)
+		writePreparedTargetRefusal(w, existing.Name, err)
 
 		return false, true
 	}
@@ -483,22 +486,10 @@ func (s *Server) adoptPreparedRestoreTarget(
 }
 
 // writePreparedTargetRefusal answers a target that is prepared in every
-// respect but one that makes restoring into it wrong; see
+// respect but its replicas still being deleted; see
 // store.PreparedRestoreTarget. Anything else is the store error it is.
-func writePreparedTargetRefusal(w http.ResponseWriter, rdName string, snap *apiv1.Snapshot, err error) {
+func writePreparedTargetRefusal(w http.ResponseWriter, rdName string, err error) {
 	switch {
-	case errors.Is(err, store.ErrRestoreTargetLayers):
-		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
-			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
-			Message: "resource definition '" + rdName + "' cannot take the restore of '" +
-				snap.Name + "': " + scrubImplDetails(err.Error()),
-			Cause: "the restore puts the source's data under the target's layer stack, so a " +
-				"layer the source did not have writes its own metadata across it, and one it " +
-				"had is missing on read",
-			Correc: "create '" + rdName + "' with the layer stack of '" + snap.ResourceName +
-				"' (for linstor-csi, a StorageClass with the same layer list), or restore under " +
-				"a name that does not exist yet",
-		}})
 	case errors.Is(err, store.ErrRestoreTargetTearingDown):
 		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
 			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
@@ -565,7 +556,15 @@ func (s *Server) materializeRestore(
 		return
 	}
 
-	writeRestoreDone(w, restoreDoneMessage(resume, snap.Name, made.Name), uncheckedRG)
+	// LINSTOR answers a restore after the same wait as a resource create
+	// (CtrlSnapshotRestoreApiCallHandler → deployResources). linstor-csi
+	// restores onto the node the volume is attached on and autoplaces the
+	// rest after this answer; that autoplace waits only for what it placed.
+	// A resumed restore's replicas may not be built either, so every node
+	// the restore names is awaited, not only those this call stamped.
+	notReady := s.waitDeployedReplicasReady(ctx, made.Name, canonicalRestoreNodeList(req))
+
+	writeRestoreDone(w, restoreDoneMessage(resume, snap.Name, made.Name), uncheckedRG, notReady...)
 }
 
 // writeRestoreMaterialiseFailed answers a restore whose materialisation failed.
@@ -610,7 +609,10 @@ func (s *Server) writeRestoreMaterialiseFailed(
 //
 // A replica still being deleted, or one holding no data, carries no
 // FAIL_EXISTS band: the replica it names is not one that exists for the
-// caller to use, and the 409 is the retryable failure it is.
+// caller to use, and the 409 is the retryable failure it is. A definition
+// whose predecessor is still draining replicas does carry
+// FAIL_EXISTS_RSC_DFN: LINSTOR still holds that definition, flagged DELETE,
+// and answers a create of its name with that band.
 func materialiseRefusalKind(err error) (storeResourceKind, bool) {
 	var partial *materialiseAfterCreateError
 	if errors.As(err, &partial) {
@@ -620,7 +622,7 @@ func materialiseRefusalKind(err error) (storeResourceKind, bool) {
 	switch {
 	case errors.Is(err, errReplicaStillDeleting):
 		return storeKindUnknown, true
-	case errors.Is(err, errAdoptedLeftoverRollingBack):
+	case errors.Is(err, errAdoptedLeftoverRollingBack), errors.Is(err, store.ErrDefinitionReplicasDraining):
 		return storeKindResourceDfn, true
 	default:
 		return storeKindUnknown, true
@@ -653,7 +655,7 @@ func (s *Server) restoreReplayState(
 	}
 
 	if finished {
-		s.writeFinishedRestoreReplay(ctx, w, snap.Name, req.ToResource, !prepared)
+		s.writeFinishedRestoreReplay(ctx, w, snap.Name, req, !prepared)
 
 		return false, true
 	}
@@ -680,9 +682,15 @@ func (s *Server) restoreReplayState(
 // The leftover is adopted, not this request's, so the group guard over it
 // refuses rather than rolls back when its group is gone, the same answer the
 // resume of an unfinished one gets.
+//
+// Finished means written, not built: a client that gave up during the first
+// answer's deploy wait left replicas the satellites may still be building, so
+// the replay waits for them as the first answer does.
 func (s *Server) writeFinishedRestoreReplay(
-	ctx context.Context, w http.ResponseWriter, snapName, rdName string, resumed bool,
+	ctx context.Context, w http.ResponseWriter, snapName string, req *snapshotRestoreRequest, resumed bool,
 ) {
+	rdName := req.ToResource
+
 	existing, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
 	if err != nil {
 		writeStoreError(w, err)
@@ -712,7 +720,9 @@ func (s *Server) writeFinishedRestoreReplay(
 		return
 	}
 
-	writeRestoreDone(w, restoreDoneMessage(resumed, snapName, rdName), nil)
+	notReady := s.waitDeployedReplicasReady(ctx, rdName, canonicalRestoreNodeList(req))
+
+	writeRestoreDone(w, restoreDoneMessage(resumed, snapName, rdName), nil, notReady...)
 }
 
 // restoreLeftoverIsFinished answers a retry over a leftover of this restore
@@ -876,7 +886,7 @@ func (s *Server) replayWithoutSnapshot(
 	}
 
 	if finished {
-		s.writeFinishedRestoreReplay(ctx, w, snapName, req.ToResource, true)
+		s.writeFinishedRestoreReplay(ctx, w, snapName, req, true)
 
 		return
 	}
@@ -903,8 +913,9 @@ func restoreDoneMessage(resumed bool, snapName, rdName string) string {
 }
 
 // writeRestoreDone emits the restore's success envelope, with any warning the
-// post-write checks want to ride back alongside it.
-func writeRestoreDone(w http.ResponseWriter, message string, warn *apiv1.APICallRc) {
+// post-write checks want to ride back alongside it and those of the deploy
+// wait.
+func writeRestoreDone(w http.ResponseWriter, message string, warn *apiv1.APICallRc, notReady ...apiv1.APICallRc) {
 	rcs := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: message,
@@ -914,7 +925,7 @@ func writeRestoreDone(w http.ResponseWriter, message string, warn *apiv1.APICall
 		rcs = append(rcs, *warn)
 	}
 
-	writeJSON(w, http.StatusCreated, rcs)
+	writeJSON(w, http.StatusCreated, append(rcs, notReady...))
 }
 
 // restoreTargetState decides what an existing definition under the target
@@ -1081,6 +1092,65 @@ func validateRestoreNodesHoldSnapshot(w http.ResponseWriter, srcRD, snapName str
 	}})
 
 	return false
+}
+
+// validateRestorePools refuses, before anything is written, a restore onto a
+// node with no storage pool to restore into: the replica would be created,
+// its satellite would fail it on every pass, and its peers would wait on it
+// for good. See store.RestorePools. A bare restore places nothing, and a
+// node the target already has a replica on is not placed again (the replay
+// of a finished restore), so neither is refused here.
+func (s *Server) validateRestorePools(ctx context.Context, w http.ResponseWriter, req *snapshotRestoreRequest, snap *apiv1.Snapshot) bool {
+	nodes, err := s.nodesStillToPlace(ctx, req.ToResource, canonicalRestoreNodeList(req))
+	if err == nil && len(nodes) > 0 {
+		_, err = store.RestorePools(ctx, s.Store, snap, nodes)
+	}
+
+	if err == nil {
+		return true
+	}
+
+	if !errors.Is(err, store.ErrNoRestorePool) {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	writeJSON(w, http.StatusBadRequest, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailNotFoundStorPool,
+		Message: "cannot restore snapshot '" + snap.Name + "' into '" + req.ToResource + "': " + err.Error(),
+		Cause:   "a replica restored without the storage pool that holds the snapshot cannot be built on its node",
+		Correc:  "restore onto a node whose storage pool still holds the snapshot",
+	}})
+
+	return false
+}
+
+// restorePoolIfKnown is store.RestorePools for one node whose replica is
+// already there, where finding no pool is not a refusal.
+func (s *Server) restorePoolIfKnown(ctx context.Context, snap *apiv1.Snapshot, node string) string {
+	pools, err := store.RestorePools(ctx, s.Store, snap, []string{node})
+	if err != nil {
+		return ""
+	}
+
+	return pools[naming.Key(node)]
+}
+
+// nodesStillToPlace is nodes less those rdName already has a replica on.
+func (s *Server) nodesStillToPlace(ctx context.Context, rdName string, nodes []string) ([]string, error) {
+	if len(nodes) == 0 {
+		return nil, nil
+	}
+
+	placed, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	return slices.DeleteFunc(slices.Clone(nodes), func(node string) bool {
+		return slices.ContainsFunc(placed, func(res apiv1.Resource) bool { return naming.Same(res.NodeName, node) })
+	}), nil
 }
 
 // resolveSnapshotName picks the snapshot name from the three accepted
@@ -1433,7 +1503,7 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	// observed a Resource for the new RD, so the BlockstorRestoreFromSnapshot
 	// prop marker on the RD was dead code and the restored RD stayed an
 	// empty shell. Mirrors upstream CtrlSnapshotRestoreApiCallHandler.
-	made.Placed, err = s.placeRestoredResources(ctx, srcRD, &newRD, req, snap, eagerPlace)
+	made.Placed, err = s.placeRestoredResources(ctx, &newRD, req, snap, eagerPlace)
 	if err != nil {
 		return made, made.failedAfterWrite(err)
 	}
@@ -1483,7 +1553,10 @@ func (s *Server) createOrAdoptRestoredRD(ctx context.Context, newRD *apiv1.Resou
 		return true, "", nil
 	}
 
-	if !errors.Is(err, store.ErrAlreadyExists) {
+	// A name whose earlier definition is still draining replicas has no
+	// definition to adopt: read as a leftover, the refusal turned into a
+	// NotFound for a definition that is still being deleted.
+	if !errors.Is(err, store.ErrAlreadyExists) || errors.Is(err, store.ErrDefinitionReplicasDraining) {
 		return false, "", err //nolint:wrapcheck // surfaced via writeStoreError
 	}
 
@@ -1704,15 +1777,15 @@ func (e *materialiseAfterCreateError) Unwrap() error { return e.err }
 //     snapshot landed on exactly those 2 nodes, same pool, despite
 //     DfltRscGrp PlaceCount=2 and a third candidate node).
 //
-// Each stamped Resource pins Spec.Props["StorPoolName"] to the pool the
-// SOURCE replica uses on that node (fallback: the source's first
-// diskful pool), so the satellite materialises the clone in the same
-// pool — node-local RestoreVolumeFromSnapshot, same backend by
-// construction.
+// Each stamped Resource pins Spec.Props["StorPoolName"] to the pool that
+// holds the snapshot on that node (store.RestorePools), so the satellite
+// materialises the clone in the same pool — node-local
+// RestoreVolumeFromSnapshot, same backend by construction — whether or
+// not the source still has a replica there.
 //
 // The Nodes / NodeNames request fields are aliased — callers may use
 // either; we normalise to one canonical list before iterating.
-func (s *Server) placeRestoredResources(ctx context.Context, srcRDName string, newRD *apiv1.ResourceDefinition, req *snapshotRestoreRequest, snap *apiv1.Snapshot, eagerPlace bool) ([]string, error) {
+func (s *Server) placeRestoredResources(ctx context.Context, newRD *apiv1.ResourceDefinition, req *snapshotRestoreRequest, snap *apiv1.Snapshot, eagerPlace bool) ([]string, error) {
 	nodes := canonicalRestoreNodeList(req)
 
 	if len(nodes) == 0 {
@@ -1752,18 +1825,31 @@ func (s *Server) placeRestoredResources(ctx context.Context, srcRDName string, n
 	// would hang the restore until the client deadline whenever the
 	// snapshot is slow / never Ready (and deadlocks envtest, which has no
 	// satellite to stamp the timestamp at all) — so the handler does NOT
-	// wait.
-	return s.stampRestoredResourcesOnNodes(ctx, srcRDName, newRD.Name, nodes)
+	// wait for the snapshot. The bounded wait for the replica to be built
+	// comes after placement (materializeRestore), as a create's does.
+	return s.stampRestoredResourcesOnNodes(ctx, snap, newRD.Name, nodes)
 }
 
 // stampRestoredResourcesOnNodes iterates the node list and stamps one
-// Resource CRD per node, resolving the storage pool from the source
-// RD's replica on that same node (fallback: the source's first diskful
-// pool — pool names are cluster-wide in LINSTOR, so the fallback only
-// matters when the source replica on that node is already gone).
-// Idempotent on duplicates in the list (one Create per unique node).
-func (s *Server) stampRestoredResourcesOnNodes(ctx context.Context, srcRDName, newRDName string, nodes []string) ([]string, error) {
-	poolByNode, fallbackPool := storPoolsByNodeFromSourceRD(ctx, s.Store, srcRDName)
+// Resource CRD per node, in the pool that holds the snapshot on that node
+// (store.RestorePools). Every pool is settled before the first replica is
+// written, so a node with none refuses the restore instead of getting a
+// replica its satellite cannot build. Idempotent on duplicates in the list
+// (one Create per unique node).
+//
+// A node the target already has a replica on is not refused here: that
+// replica is the one an earlier attempt placed, or a witness, which
+// stampRestoredReplica promotes or refuses on its own terms.
+func (s *Server) stampRestoredResourcesOnNodes(ctx context.Context, snap *apiv1.Snapshot, newRDName string, nodes []string) ([]string, error) {
+	todo, err := s.nodesStillToPlace(ctx, newRDName, nodes)
+	if err != nil {
+		return nil, err
+	}
+
+	pools, err := store.RestorePools(ctx, s.Store, snap, todo)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // names the snapshot, the node and the pool itself
+	}
 
 	seen := make(map[string]struct{}, len(nodes))
 	placed := make([]string, 0, len(nodes))
@@ -1784,9 +1870,9 @@ func (s *Server) stampRestoredResourcesOnNodes(ctx context.Context, srcRDName, n
 			NodeName: node,
 		}
 
-		pool := poolByNode[naming.Key(node)]
-		if pool == "" {
-			pool = fallbackPool
+		pool, settled := pools[naming.Key(node)]
+		if !settled {
+			pool = s.restorePoolIfKnown(ctx, snap, node)
 		}
 
 		if pool != "" {
@@ -1950,45 +2036,6 @@ func canonicalRestoreNodeList(req *snapshotRestoreRequest) []string {
 	return req.NodeNames
 }
 
-// storPoolsByNodeFromSourceRD maps each of the source RD's diskful
-// replica nodes to the StorPoolName backing the replica there, plus
-// the first diskful pool as a fallback for nodes without a live
-// source replica (pool names are cluster-wide in LINSTOR, so the
-// fallback names the same pool on the other node in the common case).
-// Used to seed the restored Resources' Spec.Props["StorPoolName"] so
-// satellites stage the clone in the SAME pool as the source — the
-// restore data plane is a node-local RestoreVolumeFromSnapshot, never
-// a cross-backend stream (Bug 038). Best-effort: an empty result
-// falls through to the satellite-side pool resolution.
-func storPoolsByNodeFromSourceRD(ctx context.Context, st store.Store, srcRDName string) (map[string]string, string) {
-	resList, err := st.Resources().ListByDefinition(ctx, srcRDName)
-	if err != nil {
-		return nil, ""
-	}
-
-	byNode := make(map[string]string, len(resList))
-	fallback := ""
-
-	for i := range resList {
-		if slices.Contains(resList[i].Flags, apiv1.ResourceFlagDiskless) {
-			continue
-		}
-
-		pool := resList[i].Props["StorPoolName"]
-		if pool == "" {
-			continue
-		}
-
-		byNode[naming.Key(resList[i].NodeName)] = pool
-
-		if fallback == "" {
-			fallback = pool
-		}
-	}
-
-	return byNode, fallback
-}
-
 // hydrateVolumesFromSnapshot copies the snapshot's recorded
 // VolumeDefinitions onto the freshly-created restore-target RD.
 // Without this, the new RD has zero volumes and any subsequent
@@ -2005,11 +2052,36 @@ func storPoolsByNodeFromSourceRD(ctx context.Context, st store.Store, srcRDName 
 // retry. The volume-definition restore hydrates into a definition that is
 // not its own and accepts no existing volume at all.
 func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, snap *apiv1.Snapshot, ownTarget bool) error {
+	// The resource restore copies each volume definition's props from the
+	// snapshot, as LINSTOR's does for a target with no replica yet; the
+	// volume-definition restore copies none, as LINSTOR's copies only the
+	// GI and the LUKS password, which blockstor keeps elsewhere.
+	copyProps := false
+
+	var scope *restoreScope
+
+	if ownTarget {
+		placed, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+		if err != nil {
+			return err //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
+		}
+
+		copyProps = len(placed) == 0
+	}
+
+	if copyProps {
+		scope = loadRestoreScope(ctx, s.Store, rdName)
+	}
+
 	for i := range snap.VolumeDefinitions {
 		svd := &snap.VolumeDefinitions[i]
 		vd := apiv1.VolumeDefinition{
 			VolumeNumber: svd.VolumeNumber,
 			SizeKib:      svd.SizeKib,
+		}
+
+		if copyProps {
+			vd.Props = restoredVolumeProps(svd.VolumeDefinitionProps, scope.levels(svd.VolumeNumber)...)
 		}
 
 		err := s.Store.VolumeDefinitions().Create(ctx, rdName, &vd)
@@ -2030,9 +2102,10 @@ func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, s
 
 		// On this operation's own target, under its marker and the adoption
 		// handshake, AlreadyExists is the volume an earlier attempt hydrated,
-		// and tolerating it is what lets a retry finish an incomplete restore.
-		// The size still tells it apart: one at the snapshot's size, or grown
-		// since, is the restore's own; a smaller one is somebody else's.
+		// or the one linstor-csi's volume-definition restore wrote just
+		// before. The size still tells it apart: one at the snapshot's size,
+		// or grown since, is the restore's own; a smaller one is somebody
+		// else's.
 		existing, getErr := s.Store.VolumeDefinitions().Get(ctx, rdName, svd.VolumeNumber)
 		if getErr != nil {
 			return err //nolint:wrapcheck // the collision is the answer, not the read
@@ -2041,7 +2114,125 @@ func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, s
 		if existing.SizeKib < svd.SizeKib {
 			return err //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
 		}
+
+		if copyProps {
+			patchErr := copySnapshotVolumeProps(ctx, s, rdName, svd.VolumeNumber, vd.Props)
+			if patchErr != nil {
+				return patchErr
+			}
+		}
 	}
 
 	return nil
+}
+
+// copySnapshotVolumeProps lays a snapshot's volume definition props over
+// an existing volume definition, the snapshot's value winning, as
+// LINSTOR's copy into the restored definition does.
+func copySnapshotVolumeProps(ctx context.Context, s *Server, rdName string, volumeNumber int32, props map[string]string) error {
+	if len(props) == 0 {
+		return nil
+	}
+
+	return s.Store.VolumeDefinitions().PatchVolumeDefinitionSpec(ctx, rdName, volumeNumber, //nolint:wrapcheck // wrapped as materialiseAfterCreateError by the caller
+		func(vd *apiv1.VolumeDefinition) error {
+			if vd.Props == nil {
+				vd.Props = map[string]string{}
+			}
+
+			maps.Copy(vd.Props, props)
+
+			return nil
+		})
+}
+
+// restoredVolumeProps is what a restored volume definition starts with:
+// the snapshot's copy of its source's props. A source that carried no
+// block size ran at DRBD's default, and that is written down, so the
+// controller does not give the restored data the pool's size, a sector
+// size it was never written at, while the automatic size is on. With it
+// off anywhere above, as LINSTOR resolves it for the restored volume,
+// nothing is added: LINSTOR's restore writes no size of its own, and the
+// controller writes none for such a volume either.
+func restoredVolumeProps(snapshotProps map[string]string, above ...map[string]string) map[string]string {
+	props := store.TravellingProps(snapshotProps)
+	if props == nil {
+		props = map[string]string{}
+	}
+
+	_, has := props[blocksize.PropBlockSize]
+	if !has && blocksize.AutoEnabled(append([]map[string]string{props}, above...)...) {
+		props[blocksize.PropBlockSize] = blocksize.Format(blocksize.DefaultIoSize)
+	}
+
+	return props
+}
+
+// restoreScope is what lies above a restored volume definition, where
+// Linstor/Drbd/auto-block-size can also be set: the target resource
+// definition, its group and the controller.
+type restoreScope struct {
+	rdProps   map[string]string
+	rg        *apiv1.ResourceGroup
+	ctrlProps map[string]string
+}
+
+// loadRestoreScope reads the levels above the restored volumes. It is
+// best effort: a level that cannot be read is left out, which can only
+// make the restore write the 512 it wrote before the switch was read
+// there, and a hiccup in a read that decides that much must not undo a
+// restore that otherwise worked.
+func loadRestoreScope(ctx context.Context, st store.Store, rdName string) *restoreScope {
+	logger := log.FromContext(ctx)
+	scope := &restoreScope{}
+
+	rd, err := st.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		logger.Info("restore: target definition unreadable for auto-block-size; leaving it out", "rd", rdName, "err", err.Error())
+
+		return scope
+	}
+
+	scope.rdProps = rd.Props
+
+	if rd.ResourceGroupName != "" {
+		rg, rgErr := st.ResourceGroups().Get(ctx, rd.ResourceGroupName)
+
+		switch {
+		case rgErr == nil:
+			scope.rg = &rg
+		case !errors.Is(rgErr, store.ErrNotFound):
+			logger.Info("restore: resource group unreadable for auto-block-size; leaving it out",
+				"rd", rdName, "rg", rd.ResourceGroupName, "err", rgErr.Error())
+		}
+	}
+
+	scope.ctrlProps, err = st.ControllerProps().Get(ctx)
+	if err != nil {
+		logger.Info("restore: controller props unreadable for auto-block-size; leaving them out", "rd", rdName, "err", err.Error())
+	}
+
+	return scope
+}
+
+// levels lists the scope's levels for one volume, closest first, in
+// LINSTOR's order after the volume definition itself.
+func (s *restoreScope) levels(volumeNumber int32) []map[string]string {
+	if s == nil {
+		return nil
+	}
+
+	levels := []map[string]string{s.rdProps}
+
+	if s.rg != nil {
+		for i := range s.rg.VolumeGroups {
+			if s.rg.VolumeGroups[i].VolumeNumber == volumeNumber {
+				levels = append(levels, s.rg.VolumeGroups[i].Props)
+			}
+		}
+
+		levels = append(levels, s.rg.Props)
+	}
+
+	return append(levels, s.ctrlProps)
 }

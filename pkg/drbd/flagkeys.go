@@ -113,7 +113,6 @@ var flagNamespaces = map[string]string{
 	"before-resync-target": nsHandlers,
 	"after-resync-target":  nsHandlers,
 	"before-resync-source": nsHandlers,
-	"after-resync-source":  nsHandlers,
 	"pri-on-incon-degr":    nsHandlers,
 	"pri-lost-after-sb":    nsHandlers,
 	"local-io-error":       nsHandlers,
@@ -121,7 +120,6 @@ var flagNamespaces = map[string]string{
 	"split-brain":          nsHandlers,
 	"out-of-sync":          nsHandlers,
 	"quorum-lost":          nsHandlers,
-	"disconnected":         nsHandlers,
 }
 
 // FlagKey resolves a `drbd-options --<name>` flag to the LINSTOR

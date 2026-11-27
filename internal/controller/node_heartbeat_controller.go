@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/naming"
 )
 
@@ -45,8 +46,14 @@ const (
 
 	// NodeMonitorGracePeriod is the staleness window past which a
 	// Node's Ready Condition flips to Unknown. Matches
-	// `--node-monitor-grace-period=40s`.
-	NodeMonitorGracePeriod = 40 * time.Second
+	// `--node-monitor-grace-period=50s`, the default since
+	// Kubernetes 1.32. It was 40s before, which is shorter than the
+	// 45s an API client takes to drop a connection to an API server
+	// that died silently: a satellite whose connection sat on the
+	// failed node's API server went OFFLINE although its own node
+	// never stopped. The window has to outlast one API endpoint
+	// failover, not just one missed stamp.
+	NodeMonitorGracePeriod = 50 * time.Second
 
 	// HeartbeatWatchdogFieldOwner is the SSA manager the watchdog
 	// uses when it owns the Ready Condition + ConnectionStatus.
@@ -77,12 +84,23 @@ type NodeHeartbeatReconciler struct {
 	// Now is the time source; tests inject a deterministic clock.
 	// Production passes time.Now.
 	Now func() time.Time
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
-// Reconcile evaluates one Node CRD and reconciles its Ready
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
+func (r *NodeHeartbeatReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass evaluates one Node CRD and reconciles its Ready
 // condition / ConnectionStatus against LastHeartbeatTime. Always
 // requeues after NodeMonitorPeriod.
-func (r *NodeHeartbeatReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *NodeHeartbeatReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx).WithValues("node", req.Name)
 
 	var node blockstoriov1alpha1.Node

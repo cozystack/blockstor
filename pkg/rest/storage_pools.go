@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
 )
@@ -96,6 +97,10 @@ func (s *Server) handleNodeStoragePoolModify(w http.ResponseWriter, r *http.Requ
 	if msg, refused := refuseSPDriverPropMutation(&patch); refused {
 		writeSPDriverPropMutationRefusal(w, node, pool, msg)
 
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.StoragePool, patch.OverrideProps) {
 		return
 	}
 
@@ -247,9 +252,9 @@ func (s *Server) refuseSPDeleteIfReferenced(w http.ResponseWriter, r *http.Reque
 		return true
 	}
 
-	// A snapshot's copy on this node can only be deleted through the
-	// node's pool; with the pool gone the node's hold on the Snapshot is
-	// never released.
+	// A snapshot's copy can only be deleted through the pool that holds
+	// it; with the pool gone the node's hold on the Snapshot is never
+	// released.
 	snapRefs, err := store.SnapshotsInPool(r.Context(), s.Store, node, pool)
 	if err != nil {
 		writeStoreError(w, err)
@@ -268,7 +273,7 @@ func (s *Server) refuseSPDeleteIfReferenced(w http.ResponseWriter, r *http.Reque
 	}
 
 	if len(snapRefs) > 0 {
-		details = append(details, "Snapshots with a copy on the node: "+strings.Join(snapRefs, ", "))
+		details = append(details, "Snapshots that may have a copy in the storage pool: "+strings.Join(snapRefs, ", "))
 	}
 
 	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
@@ -392,7 +397,8 @@ func (s *Server) handleStoragePoolsView(w http.ResponseWriter, r *http.Request) 
 	// whole cluster's pools when only one node is asked about.
 	out, err := s.listFilteredStoragePools(r.Context(),
 		multiValueQuery(r, "nodes"),
-		multiValueQuery(r, "storage_pools"))
+		multiValueQuery(r, "storage_pools"),
+		propsQuery(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
@@ -425,7 +431,7 @@ func (s *Server) handleStoragePoolsView(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleNodeStoragePoolsList(w http.ResponseWriter, r *http.Request) {
 	node := r.PathValue("node")
 
-	out, err := s.listFilteredStoragePools(r.Context(), []string{node}, nil)
+	out, err := s.listFilteredStoragePools(r.Context(), []string{node}, nil, propsQuery(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
@@ -455,7 +461,7 @@ func redactStoragePoolsInPlace(pools []apiv1.StoragePool) {
 // them (naming.Same). Empty filters
 // mean "no constraint on this dimension". The slice is always non-nil so
 // JSON encoding yields [] instead of null — linstor-csi rejects null bodies.
-func (s *Server) listFilteredStoragePools(ctx context.Context, nodeFilter, poolFilter []string) ([]apiv1.StoragePool, error) {
+func (s *Server) listFilteredStoragePools(ctx context.Context, nodeFilter, poolFilter, propFilter []string) ([]apiv1.StoragePool, error) {
 	pools, err := s.Store.StoragePools().List(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "list storage pools")
@@ -469,6 +475,12 @@ func (s *Server) listFilteredStoragePools(ctx context.Context, nodeFilter, poolF
 		}
 
 		if !matchAnyName(poolFilter, pools[i].StoragePoolName) {
+			continue
+		}
+
+		// Matched against the props the caller is shown, so a filter
+		// cannot probe a secret's value.
+		if len(propFilter) > 0 && !matchProps(propFilter, redactedProps(pools[i].Props)) {
 			continue
 		}
 

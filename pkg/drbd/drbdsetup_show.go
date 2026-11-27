@@ -75,6 +75,13 @@ type KernelSlot struct {
 	// slot with NO peer-device registered for any volume — that's
 	// the Bug 342 signature.
 	PeerDevicesByVolNum map[int32]struct{}
+
+	// PeerDiskStates is the peer's disk state per volume as this node's
+	// kernel sees it (`peer-disk-state`). A connection that is not
+	// established keeps only Inconsistent or Outdated here (DRBD drops
+	// anything else to DUnknown), and a new-peer reads Outdated from
+	// the node-id's metadata slot.
+	PeerDiskStates map[int32]string
 }
 
 // IsConnectingOrStandalone reports whether the slot is in a state
@@ -127,6 +134,9 @@ type drbdsetupStatusRoot []drbdsetupStatusResource
 // -j. We model only the fields the v3 prune and the Bug 360 my-node-id
 // self-heal consume.
 type drbdsetupStatusResource struct {
+	// Name is the resource name. A status of every resource, the one
+	// the snapshot watchdog reads, is keyed by it.
+	Name string `json:"name"`
 	// NodeID is the kernel slot's OWN my-node-id, burned in at
 	// `drbdadm up`/`new-resource` time. Bug 360 reads it to detect a
 	// slot whose my-id diverged from the controller-allocated id.
@@ -137,10 +147,14 @@ type drbdsetupStatusResource struct {
 	// recovery-promote self-heal reads it to confirm the local node
 	// is not already Primary before re-arming the auto-primary seed.
 	Role string `json:"role"`
-	// The suspension reasons the kernel holds the resource's I/O for.
-	// RemoveMinorsKeepingQuorum relaxes the quorum policy only on a
-	// resource that has none of them.
-	SuspendedUser    bool `json:"suspended-user"`
+	// SuspendedUser is the `suspended-user` flag `drbdsetup
+	// suspend-io` sets and `resume-io` clears. SuspendState reads it
+	// so a snapshot's resume is only reported once the kernel agrees.
+	// Pointer so a drbd-utils that omits the key reads as unknown.
+	SuspendedUser *bool `json:"suspended-user"`
+	// The other suspension reasons the kernel holds the resource's I/O
+	// for. RemoveMinorsKeepingQuorum relaxes the quorum policy only on
+	// a resource that has none of them, nor SuspendedUser.
 	SuspendedNoData  bool `json:"suspended-no-data"`
 	SuspendedFencing bool `json:"suspended-fencing"`
 	SuspendedQuorum  bool `json:"suspended-quorum"`
@@ -230,7 +244,7 @@ type drbdsetupStatusPeerDevice struct {
 //
 //nolint:nilnil // nil map IS the empty-result signal; sentinel error would force callers to branch on errors.Is without value.
 func (a *Adm) Show(ctx context.Context, resource string) (map[string]KernelSlot, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", "-j", resource)
+	out, err := a.status(ctx, "-j", resource)
 	if err != nil {
 		// "No currently configured DRBD found" / "Unknown resource"
 		// / "no resources defined" / "No such resource" are the
@@ -322,8 +336,11 @@ func parseShowJSON(out []byte) map[string]KernelSlot {
 		}
 
 		pdv := make(map[int32]struct{}, len(c.PeerDevices))
+		pds := make(map[int32]string, len(c.PeerDevices))
+
 		for j := range c.PeerDevices {
 			pdv[c.PeerDevices[j].VolumeNumber] = struct{}{}
+			pds[c.PeerDevices[j].VolumeNumber] = c.PeerDevices[j].PeerDiskState
 		}
 
 		slots[c.PeerName] = KernelSlot{
@@ -331,6 +348,7 @@ func parseShowJSON(out []byte) map[string]KernelSlot {
 			NodeID:              c.PeerNodeID,
 			ConnectionState:     c.ConnectionStr,
 			PeerDevicesByVolNum: pdv,
+			PeerDiskStates:      pds,
 		}
 	}
 
@@ -364,7 +382,36 @@ func parseShowJSON(out []byte) map[string]KernelSlot {
 // possibly needing metadata and runs the (idempotent) per-volume pass — the
 // fail-toward-correctness direction (the pre-BUG-048 behaviour).
 func (a *Adm) AttachedVolumes(ctx context.Context, resource string) map[int32]struct{} {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	devices := a.statusDevices(ctx, resource)
+	if devices == nil {
+		return nil
+	}
+
+	return attachedVolumeSet(devices)
+}
+
+// DisklessVolumes returns the local volume numbers of resource the
+// kernel holds Diskless: the resource is up and the volume has no lower
+// disk attached. It is positive evidence, unlike AttachedVolumes: a
+// probe or parse failure, a resource the kernel does not hold, and a
+// volume mid-transition all leave the volume out.
+func (a *Adm) DisklessVolumes(ctx context.Context, resource string) map[int32]struct{} {
+	out := map[int32]struct{}{}
+
+	for _, dev := range a.statusDevices(ctx, resource) {
+		if DiskState(dev.DiskState) == DiskStateDiskless {
+			out[dev.VolumeNumber] = struct{}{}
+		}
+	}
+
+	return out
+}
+
+// statusDevices returns the local devices `drbdsetup status <res>
+// --json` reports, or nil when the probe fails or the kernel does not
+// hold the resource.
+func (a *Adm) statusDevices(ctx context.Context, resource string) []drbdsetupStatusDevice {
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return nil
 	}
@@ -376,7 +423,7 @@ func (a *Adm) AttachedVolumes(ctx context.Context, resource string) map[int32]st
 		return nil
 	}
 
-	return attachedVolumeSet(status[0].Devices)
+	return status[0].Devices
 }
 
 // attachedVolumeSet returns the volume numbers from `devices` whose

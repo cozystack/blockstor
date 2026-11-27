@@ -43,6 +43,23 @@ import (
 // Condition is absent.
 const ConditionMetadataCreated = "MetadataCreated"
 
+// Reasons of a true ConditionMetadataCreated. They tell a replica whose
+// metadata this satellite created apart from one whose metadata was
+// already on the volume, such as a replica adopted from LINSTOR, where
+// create-md never ran.
+const (
+	// MetadataCreatedReasonCreateMd: `drbdadm create-md` ran on at
+	// least one volume of the replica.
+	MetadataCreatedReasonCreateMd = "CreateMdSucceeded"
+
+	// MetadataCreatedReasonFound: `drbdadm dump-md` found metadata on
+	// every volume, so create-md was not run on that pass. The startup
+	// backfill also stamps it on a replica whose create-md stamp failed,
+	// since all it can see is that metadata is there; the satellite log
+	// of the create-md pass records which it was.
+	MetadataCreatedReasonFound = "MetadataFound"
+)
+
 // ConditionFilesystemFormatted is a Status Condition stamped by the
 // satellite after the RG-driven auto-mkfs path (scenario 9.W14)
 // reports every diskful volume of this Resource as carrying a
@@ -72,12 +89,39 @@ const ConditionFilesystemFormatted = "FilesystemFormatted"
 // yet destroyed. Cached from the observer's events2 stream so the
 // reconciler's hot path can skip the `drbdsetup status` round-trip.
 //
-// SAFETY: like other Phase 11.3 Conditions, this is a hot-path
-// optimisation. A stale True value can only cause an extra adjust
-// (idempotent); a stale False causes the legacy probe path which
-// is correct but slow. The authoritative source remains the
-// kernel-direct probe (drbdsetup status / drbdmeta dump-md).
+// SAFETY: for the reconciler, like other Phase 11.3 Conditions, this
+// is a hot-path optimisation. A stale True value can only cause an
+// extra adjust (idempotent); a stale False causes the legacy probe
+// path which is correct but slow. The authoritative source remains
+// the kernel-direct probe (drbdsetup status / drbdmeta dump-md).
+//
+// The reads also answer a replica with no satellite state when this
+// is False, as LINSTOR does a replica whose kernel resource is gone,
+// but only while the stored status carries no disk state and no peer
+// link either. Nothing rewrites the Condition between events2
+// resource frames, so a False that outlived its replica's return
+// stays; every status write the observer makes carries the replica's
+// disk states, which keeps a stale False from hiding a running replica.
 const ConditionKernelLoaded = "KernelLoaded"
+
+// ConditionEncryptionKeyIgnored is stamped True when the parent
+// ResourceDefinition pins its own LUKS key through
+// `spec.encryption.passphraseSecretRef`, a field blockstor declares
+// but does not implement (docs/encryption-keys.md). The volume's
+// password is wrapped under the CLUSTER master key instead, so the
+// operator holds a Secret that opens nothing.
+//
+// It is a Condition rather than a refusal on purpose. Refusing the
+// apply would wedge resource definitions that reconcile correctly
+// today: the field has always been inert, so a cluster may well carry
+// RDs that set it and run fine on the cluster key. Moving a working
+// volume to a failing one to punish a misleading field is the wrong
+// trade in a storage system. The volume keeps working; the object now
+// says why the operator's key is not the one in use.
+//
+// Cleared (False) when the reference is removed, so the Condition
+// tracks the live spec rather than latching on the first sighting.
+const ConditionEncryptionKeyIgnored = "EncryptionKeyIgnored"
 
 // ResourceAnnotationVolumeNumbers is the metadata.annotation key the
 // satellite reconciler stamps on a Resource CRD after every successful
@@ -100,6 +144,21 @@ const ConditionKernelLoaded = "KernelLoaded"
 // than JSON so a human operator can `kubectl get resource <r> -o
 // yaml | grep volume-numbers` and read it without parsing.
 const ResourceAnnotationVolumeNumbers = "blockstor.org/volume-numbers"
+
+// ResourceDefinitionAnnotationLiveMigrateToken is the token a live
+// migration's make-available writes onto the definition in the same patch
+// as its dual-Primary props. ResourceAnnotationLiveMigrateApplied is where
+// a satellite copies the token it found on the definition after an apply
+// pass that succeeded, so it has rendered and adjusted the .res those
+// props produce. make-available waits for both ends of the migration to
+// report the token before it answers, as LINSTOR waits for its
+// satellites, because linstor-csi starts the migration on the answer and
+// the target cannot become Primary before allow-two-primaries is in
+// effect on both ends.
+const (
+	ResourceDefinitionAnnotationLiveMigrateToken = "blockstor.org/live-migrate-token" //nolint:gosec // an annotation name, not a credential
+	ResourceAnnotationLiveMigrateApplied         = "blockstor.org/live-migrate-applied"
+)
 
 // ResourceSpec is the desired state of one replica of a ResourceDefinition
 // placed on a node. The composite key is (resourceDefinitionName, nodeName);
@@ -376,6 +435,12 @@ type ResourceStatus struct {
 	// +optional
 	Connections []ResourceConnectionStatus `json:"connections,omitempty"`
 
+	// satelliteIncarnation is the node's status.satelliteIncarnation of
+	// the satellite process that wrote the runtime state above. Written
+	// by the satellite observer with that state; do not hand-set.
+	// +optional
+	SatelliteIncarnation string `json:"satelliteIncarnation,omitempty"`
+
 	// conditions represent the current state of the Resource.
 	// +listType=map
 	// +listMapKey=type
@@ -408,6 +473,21 @@ type ResourceStatus struct {
 	// +optional
 	Suspended string `json:"suspended,omitempty"`
 
+	// promotionScore is the kernel-reported DRBD-9 promotion score of
+	// this replica, parsed from the `promotion_score:` token in
+	// `drbdsetup events2` resource frames. Upstream LINSTOR publishes
+	// it as `layer_object.drbd.promotion_score`, and linstor-csi
+	// reports a volume abnormal on every node whose score is 0 or
+	// missing. Unset until the satellite has observed the resource.
+	// +optional
+	PromotionScore *int32 `json:"promotionScore,omitempty"`
+
+	// mayPromote is the kernel-reported DRBD-9 `may_promote:` flag
+	// from the same frames, published upstream as
+	// `layer_object.drbd.may_promote`. Unset until observed.
+	// +optional
+	MayPromote *bool `json:"mayPromote,omitempty"`
+
 	// toggleDiskRetries counts how many times the satellite
 	// reconciler has failed mid-conversion while running the
 	// diskless→diskful chain (storage carve → drbdmeta create-md
@@ -438,6 +518,15 @@ type ResourceStatus struct {
 	// +listMapKey=volumeNumber
 	// +optional
 	DeletedVolumes []DeletedVolumeStatus `json:"deletedVolumes,omitempty"`
+
+	// applyFailure is the error of the satellite's last apply pass on
+	// this replica, with the volume sizes that pass was applying. The
+	// satellite sets it when a pass fails and removes it when one
+	// succeeds. A resize that waits for this replica to grow ends with
+	// this error instead of waiting for a pass that keeps failing, as
+	// LINSTOR returns its satellite's error.
+	// +optional
+	ApplyFailure *ResourceApplyFailure `json:"applyFailure,omitempty"`
 }
 
 // DeletedVolumeStatus is one replica's confirmation that it deleted the
@@ -451,6 +540,27 @@ type DeletedVolumeStatus struct {
 	// +optional
 	// +kubebuilder:validation:MaxLength=64
 	DeleteID string `json:"deleteID,omitempty"`
+}
+
+// ResourceApplyFailure is the error of a failed satellite apply pass.
+// +structType=atomic
+type ResourceApplyFailure struct {
+	// message is the error the pass failed with.
+	Message string `json:"message"`
+
+	// volumes lists the definition size of each volume the failed pass
+	// was applying.
+	// +optional
+	Volumes []ResourceApplyFailureVolume `json:"volumes,omitempty"`
+}
+
+// ResourceApplyFailureVolume is the size one volume had in a failed pass.
+type ResourceApplyFailureVolume struct {
+	// volumeNumber is the volume's number in the definition.
+	VolumeNumber int32 `json:"volumeNumber"`
+
+	// sizeKib is the volume definition size the pass was applying.
+	SizeKib int64 `json:"sizeKib"`
 }
 
 // ResourceConnectionStatus is the state of one DRBD peer connection
@@ -533,6 +643,27 @@ type PeerVolumeStatus struct {
 	// --statistics` peer-device frames.
 	// +optional
 	PeerDiskState string `json:"peerDiskState,omitempty"`
+
+	// done is the progress of the resync running with this peer, as
+	// the `done:<percent>` token of the peer-device frame carries it
+	// ("50.31"). DRBD measures it against that resync's own total,
+	// not the volume size, and prints it only while a resync with
+	// this peer runs; empty otherwise. It is what LINSTOR reports as
+	// the peer's `done_percentage` and renders in `SyncTarget(NN%)`.
+	// A string because a CRD has no portable float type.
+	// +optional
+	Done string `json:"done,omitempty"`
+
+	// replicationState is this volume's DRBD-9 replication state with
+	// this peer, the `replication:<state>` token of the volume's own
+	// peer-device frame. DRBD keeps it per peer and per volume, and
+	// so does LINSTOR (DrbdVolume.volReplState); the connection-level
+	// `replicationState` is whichever volume's frame came last. It is
+	// what `done` belongs to: a two-volume resource can have one
+	// volume in SyncTarget and the other Established or PausedSyncT
+	// on the same connection.
+	// +optional
+	ReplicationState string `json:"replicationState,omitempty"`
 }
 
 // ResourceVolumeStatus is the runtime state of one volume of a Resource.
@@ -548,6 +679,22 @@ type ResourceVolumeStatus struct {
 	UsableKib int64 `json:"usableKib,omitempty"`
 	// +optional
 	DiskState string `json:"diskState,omitempty"`
+
+	// appliedSizeKib is the volume definition size this replica has
+	// finished applying: the satellite writes it after a pass in which
+	// every layer, the backing volume, LUKS and `drbdadm resize`,
+	// succeeded at that size and the device the consumer sees reads at
+	// least that size. A grow is complete once every diskful replica
+	// reports the new size here. The last replica to grow its
+	// backing runs its `drbdadm resize` after all the others have
+	// grown theirs, and DRBD commits a resize on every connected peer
+	// before the command returns, so at that point the device has the
+	// new size wherever it is attached. The REST API answers a resize
+	// only then, as LINSTOR does, and the satellite reruns
+	// `drbdadm resize` while this lags the definition. Unset until
+	// the first such pass.
+	// +optional
+	AppliedSizeKib int64 `json:"appliedSizeKib,omitempty"`
 
 	// currentGi is the DRBD-9 current generation identifier reported
 	// by `drbdsetup events2` for this replica's local volume. The
@@ -566,16 +713,16 @@ type ResourceVolumeStatus struct {
 	// +optional
 	HistoryGI []string `json:"historyGI,omitempty"`
 
-	// outOfSyncKib is the worst-case "how many KiB this volume is
-	// behind any peer" reported by `drbdsetup events2 --statistics`
-	// peer-device frames. Combined with RD.Spec.VolumeDefinitions
-	// SizeKib, callers compute a sync-progress percentage:
-	//   progress = (1 - outOfSyncKib / sizeKib) * 100
+	// outOfSyncKib is the largest out-of-sync count over this
+	// volume's peers, as `drbdsetup events2 --statistics` peer-device
+	// frames report it. 0 means in sync with every peer. It is not a
+	// resync progress once the replica has more than one peer: the
+	// progress is connections[].peerVolumes[].done.
 	//
-	// 0 means fully in sync; sizeKib (or close to it) means fresh
-	// resync hasn't started yet. Surfaced via the REST view layer
-	// so `linstor r l` / piraeus dashboards can render a CDI-style
-	// progress bar without polling drbdsetup themselves.
+	// While the volume is UpToDate and no peer resyncs with this
+	// replica, a change that keeps the count non-zero can reach the
+	// status up to 5 minutes late. A change to or from 0, and any
+	// change during a resync, is written at once.
 	// +optional
 	OutOfSyncKib int64 `json:"outOfSyncKib,omitempty"`
 
@@ -591,6 +738,17 @@ type ResourceVolumeStatus struct {
 	// (refusing to mount a no-quorum volume) reads this signal.
 	// +optional
 	Quorum bool `json:"quorum,omitempty"`
+
+	// deviceSizeKib is the size of this replica's DRBD device in KiB,
+	// the `size:` token of `drbdsetup events2 --statistics --full`
+	// device frames. A diskless replica reports the size its peers
+	// agreed on. The controller hands the largest size any replica
+	// reports to a replica that is getting a new lower disk, which
+	// must hold at least that much: the kernel refuses to attach a
+	// disk smaller than the device, and a volume adopted from LINSTOR
+	// can be a few KiB larger than its definition.
+	// +optional
+	DeviceSizeKib int64 `json:"deviceSizeKib,omitempty"`
 }
 
 // +kubebuilder:object:root=true

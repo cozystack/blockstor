@@ -14,50 +14,69 @@ name: Release Images
 # github.com/cozystack/blockstor and the short image names used by the stand
 # manifests: blockstor-controller / blockstor-apiserver / blockstor-satellite).
 #
-# Tagging is handled by docker/metadata-action's `type=semver` rules:
-#   tag v1.33.2 → images tagged `1.33.2`, `1.33`, and `latest`.
-#   Pre-release tags (v1.33.0-rc.1) get `1.33.0-rc.1` only — no `latest`.
-# This matches the repo's `vMAJOR.MINOR.PATCH[-rc.N]` tag convention
-# (see `git tag -l`).
+# Each image is built once per architecture on a runner of that
+# architecture (linux/amd64 on ubuntu-latest, linux/arm64 on
+# ubuntu-24.04-arm), pushed by digest only, and then stitched into one
+# multi-arch index by a per-image merge job that applies the tags and the
+# index annotations. Building on native runners keeps the satellite's
+# debian apt install out of QEMU emulation, which made the arm64 leg the
+# slowest part of the release.
+#
+# A run on anything other than a tag (workflow_dispatch on a branch) is a
+# dry run: the per-arch images are still built and pushed by digest, so the
+# whole pipeline is exercised, but the merge job only prints the index it
+# would create, no tag is written, and no GitHub Release is cut.
+#
+# Alongside the images, the cli job cross-compiles the blockstor CLI
+# (cmd/blockstor) for linux, darwin and windows on amd64 and arm64. It is
+# pure Go with CGO off, so one runner builds every target. On a dry run
+# the binaries and their SHA256SUMS are kept as a workflow artifact only.
 #
 # After the images publish, the workflow ALSO cuts the GitHub Release object
-# for the tag (body taken from the matching CHANGELOG.md section).
+# for the tag (body taken from the matching CHANGELOG.md section) and
+# attaches the CLI binaries and SHA256SUMS to it.
 
 on:
   push:
     tags:
       - 'v*'
   # Manual trigger for re-publishing a tag (e.g. after a registry outage).
-  # The chosen ref must be a tag for the version stamping to be meaningful.
+  # Dispatched on a branch instead of a tag, the run is a dry run (above).
   workflow_dispatch:
 
-# GITHUB_TOKEN needs packages:write to push to ghcr.io; contents:read to
-# check out the tagged tree.
-permissions:
-  contents: read
-  packages: write
+permissions: {}
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  DRY_RUN: ${{ github.ref_type != 'tag' }}
+
 jobs:
-  build-push:
-    name: Build and push ${{ matrix.image }}
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.target }} (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    # packages:write to push the per-arch images to ghcr.io; contents:read
+    # to check out the tagged tree.
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
+        # `target` is the Dockerfile stage; the image is
+        # ghcr.io/${{ github.repository_owner }}/blockstor-<target>.
+        target: [controller, apiserver, satellite]
+        platform: [linux/amd64, linux/arm64]
         include:
-          # `target` is the Dockerfile stage; `image` is the ghcr.io repo
-          # suffix under ghcr.io/${{ github.repository_owner }}/.
-          - target: controller
-            image: blockstor-controller
-          - target: apiserver
-            image: blockstor-apiserver
-          - target: satellite
-            image: blockstor-satellite
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/blockstor-${{ matrix.target }}
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -67,11 +86,6 @@ jobs:
           # commit, not a shallow placeholder. The GIT_HASH build-arg below
           # is resolved on the runner where the .git tree exists.
           fetch-depth: 0
-
-      - name: Set up QEMU
-        # Enables cross-arch emulation so the satellite's debian apt install
-        # resolves arm64 packages during the linux/arm64 build leg.
-        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
@@ -83,16 +97,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Extract metadata (tags, labels)
+      # Same rules as the merge job, so the labels (version among them)
+      # match the tags the index gets.
+      - name: Extract metadata (labels)
         id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
-          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          images: ${{ env.IMAGE }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=ref,event=tag
-          # Tag `latest` only on a stable (non-pre-release) semver tag.
           flavor: |
             latest=auto
 
@@ -101,30 +116,195 @@ jobs:
         # Mirrors stand/build-images.sh + the top-level Makefile: the
         # Dockerfile excludes .git via .dockerignore, so the SHA/time are
         # resolved on the runner and passed in as --build-arg.
+        env:
+          PLATFORM: ${{ matrix.platform }}
         run: |
-          echo "git_hash=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "build_time=$(date -u +%FT%TZ)" >> "$GITHUB_OUTPUT"
+          {
+            echo "git_hash=$(git rev-parse HEAD)"
+            echo "build_time=$(date -u +%FT%TZ)"
+            echo "platform_pair=${PLATFORM//\//-}"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Build and push ${{ matrix.image }}
+      - name: Build and push ${{ matrix.target }} for ${{ matrix.platform }} by digest
+        id: build
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           file: ./Dockerfile
           target: ${{ matrix.target }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
+          # No tags here: the merge job tags the multi-arch index once both
+          # architectures are in.
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           # OCI labels from metadata-action include
           # org.opencontainers.image.source=<repo URL>, which lets GHCR
           # auto-link each published package to cozystack/blockstor and inherit
-          # the repo's visibility. `annotations` carries the same metadata onto
-          # the multi-arch image index manifest.
+          # the repo's visibility. The merge job puts the same metadata onto
+          # the multi-arch image index as annotations.
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
+          # VERSION is spelt as the cli job spells it, so the binaries
+          # of one release log the same version.
           build-args: |
             GIT_HASH=${{ steps.stamp.outputs.git_hash }}
             BUILD_TIME=${{ steps.stamp.outputs.build_time }}
+            VERSION=${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
           provenance: false
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-${{ matrix.target }}-${{ steps.stamp.outputs.platform_pair }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish ${{ matrix.target }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # packages:write to push the index and its tags; contents:read for the
+    # repository metadata metadata-action turns into annotations.
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [controller, apiserver, satellite]
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/blockstor-${{ matrix.target }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.target }}-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # Tagging is handled by docker/metadata-action's `type=semver` rules:
+      #   tag v1.33.2 → images tagged `1.33.2`, `1.33`, `v1.33.2` and `latest`.
+      #   Pre-release tags (v1.33.0-rc.1) get `1.33.0-rc.1` and `v1.33.0-rc.1`
+      #   only — no `latest`.
+      # This matches the repo's `vMAJOR.MINOR.PATCH[-rc.N]` tag convention
+      # (see `git tag -l`).
+      - name: Extract metadata (tags, annotations)
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+          # Tag `latest` only on a stable (non-pre-release) semver tag.
+          flavor: |
+            latest=auto
+
+      - name: Create the multi-arch index
+        env:
+          META: ${{ steps.meta.outputs.json }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          args=()
+          while IFS= read -r tag; do args+=(--tag "$tag"); done < <(jq -r '.tags[]' <<<"$META")
+          while IFS= read -r ann; do args+=(--annotation "$ann"); done < <(jq -r '.annotations[]' <<<"$META")
+
+          sources=()
+          for digest in "$RUNNER_TEMP"/digests/*; do
+            sources+=("$IMAGE@sha256:$(basename "$digest")")
+          done
+          printf 'source: %s\n' "${sources[@]}"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "::notice::Not a tag ($GITHUB_REF): printing the index instead of pushing it."
+            docker buildx imagetools create --dry-run --tag "$IMAGE:dry-run" "${args[@]}" "${sources[@]}" > index.json
+          else
+            if ! jq -e '.tags | length > 0' <<<"$META" >/dev/null; then
+              echo "::error::metadata-action produced no tags for $GITHUB_REF"
+              exit 1
+            fi
+            docker buildx imagetools create "${args[@]}" "${sources[@]}"
+            docker buildx imagetools inspect --raw "$IMAGE:$VERSION" > index.json
+          fi
+          cat index.json
+
+          platforms="$(jq -r '[.manifests[].platform | "\(.os)/\(.architecture)"] | sort | join(",")' index.json)"
+          echo "index platforms: $platforms"
+          if [ "$platforms" != "linux/amd64,linux/arm64" ]; then
+            echo "::error::$IMAGE index has platforms [$platforms], want [linux/amd64,linux/arm64]"
+            exit 1
+          fi
+
+  cli:
+    name: Build the blockstor CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Cross-compile
+        env:
+          # `blockstor controller version` prints this. A dry run has no tag,
+          # so it says which commit it came from instead.
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            ext=""
+            [ "$os" = windows ] && ext=".exe"
+            echo "building blockstor-$os-$arch$ext"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -buildvcs=false -trimpath \
+              -ldflags "-s -w -X github.com/cozystack/blockstor/internal/cli.Version=$VERSION" \
+              -o "dist/blockstor-$os-$arch$ext" ./cmd/blockstor
+          done
+          (cd dist && sha256sum blockstor-* > SHA256SUMS)
+          cat dist/SHA256SUMS
+          # Proves the stamp landed, on the one target this runner can execute.
+          ./dist/blockstor-linux-amd64 controller version
+
+      - name: Upload the binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: blockstor-cli
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
 
   github-release:
     name: Create GitHub Release
@@ -133,7 +313,9 @@ jobs:
     # CHANGELOG.md (the same content used for prior releases). Pre-release tags
     # (vMAJOR.MINOR.PATCH-rc.N / -alpha / -beta) are marked pre-release and not
     # "Latest". Idempotent: updates the release if it already exists (re-run).
-    needs: build-push
+    needs: [merge, cli]
+    # A dry run (not a tag) publishes nothing, so there is nothing to release.
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -142,6 +324,12 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Download the CLI binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: blockstor-cli
+          path: ${{ runner.temp }}/cli
 
       - name: Cut the GitHub Release from the CHANGELOG section
         env:
@@ -179,3 +367,6 @@ jobs:
             echo "::warning::CHANGELOG.md has no section for $TAG; using auto-generated notes."
             gh release create "$TAG" --title "$TAG" --verify-tag --generate-notes "${prerelease[@]}" "${latest[@]}"
           fi
+
+          # --clobber so a re-run replaces the assets of the release it updated.
+          gh release upload "$TAG" "$RUNNER_TEMP"/cli/* --clobber

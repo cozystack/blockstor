@@ -26,6 +26,7 @@ package storage
 import (
 	"context"
 	"io"
+	"strconv"
 
 	"github.com/cockroachdb/errors"
 )
@@ -92,6 +93,20 @@ type VolumeStatus struct {
 	UsableKib    int64
 	State        string // PROVISIONED / ERROR / NOT_PROVISIONED
 }
+
+// SizeArg is a volume size in KiB as the LVM CLI takes it. LVM rounds a
+// size up to a whole extent of the volume group, which is the allocation
+// unit LINSTOR rounds an LVM volume up to (LvmProvider.getExtentSize):
+// a lower disk sized for DRBD metadata comes out the size LINSTOR gives
+// it, not a whole MiB larger. At least 1 KiB, which LVM raises to one
+// extent.
+func SizeArg(kib int64) string {
+	return strconv.FormatInt(max(kib, 1), 10) + "k"
+}
+
+// StateNotProvisioned is the VolumeStatus.State of a volume that is not on
+// disk.
+const StateNotProvisioned = "NOT_PROVISIONED"
 
 // PoolStatus mirrors `linstor sp l` output for one pool on this node.
 type PoolStatus struct {
@@ -161,6 +176,16 @@ type SuffixedDeleter interface {
 	DeleteVolumeWithSuffix(ctx context.Context, vol Volume, deletedSuffix string) error
 }
 
+// SnapshotProber is the optional "does this pool hold the snapshot"
+// capability. A satellite records which of its pools holds its copy of a
+// snapshot, since a restore has to be placed in that pool after the
+// replica the copy was taken from is gone; for a copy taken before that
+// record existed it asks the pools themselves, because the pool a replica
+// is in now need not be the one an older copy of it was taken in.
+type SnapshotProber interface {
+	HasSnapshot(ctx context.Context, snap Snapshot) (bool, error)
+}
+
 // SnapshotShipper is the optional cross-node-clone capability — a
 // provider that implements it can stream a snapshot to a peer
 // satellite and reconstitute it on the receiving side. ZFS / LVM
@@ -183,8 +208,10 @@ type SnapshotShipper interface {
 	// SendSnapshot on a peer satellite. After this returns, target
 	// is fully populated with the snapshot's bytes; the caller
 	// wires drbdmeta drop-md + create-md to stamp fresh DRBD
-	// metadata for the local node-id.
-	RecvSnapshot(ctx context.Context, target Volume, src io.Reader) error
+	// metadata for the local node-id. source is the snapshot the
+	// stream was sent from, so a backend whose receive also leaves a
+	// copy of that snapshot behind can remove it.
+	RecvSnapshot(ctx context.Context, target Volume, source Snapshot, src io.Reader) error
 }
 
 // ResizeZeroFiller is the optional "grown region reads back as zeros"

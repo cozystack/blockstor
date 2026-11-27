@@ -73,11 +73,6 @@ func (p *Provider) Kind() string {
 func (*Provider) ResizeZeroFills() bool { return true }
 
 // Pool returns the underlying ZFS pool name (`zpool list` identifier).
-// The satellite Reconciler's FlushBackingDevices uses this to issue
-// `zpool sync <pool>` between drbdadm suspend-io and `zfs snapshot`
-// — without that TXG-commit barrier the snapshot captures a
-// pre-commit dataset state and misses up to one TXG (default 5s)
-// worth of writes (P0 stale-snapshot bug, 2026-05-23).
 func (p *Provider) Pool() string {
 	return p.cfg.Pool
 }
@@ -102,14 +97,14 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 		return p.ensureRefreservation(ctx, dataset)
 	}
 
-	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
+	sizeKib := alignUpKib(vol.SizeKib, p.defaultVolblocksizeKib(ctx))
 
 	args := []string{"create"}
 	if p.cfg.Thin {
 		args = append(args, "-s")
 	}
 
-	args = append(args, "-V", strconv.FormatInt(sizeMiB, 10)+"M", dataset)
+	args = append(args, "-V", strconv.FormatInt(sizeKib, 10)+"K", dataset)
 
 	_, err := p.exec.Run(ctx, "zfs", args...)
 	if err != nil {
@@ -130,8 +125,8 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	return nil
 }
 
-// ResizeVolume sets the zvol's volsize to vol.SizeKib (rounded up
-// to MiB). zfs is happy to set the same size twice, so the call is
+// ResizeVolume sets the zvol's volsize to vol.SizeKib rounded up to the
+// zvol's own volblocksize, which `zfs set volsize` requires. zfs is happy to set the same size twice, so the call is
 // idempotent. Shrinks are rejected by ZFS itself when the existing
 // volume already holds more data — the CSI grow-only contract makes
 // the no-shrink invariant a non-issue here.
@@ -143,11 +138,11 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 // grow, call ensureRefreservation so the refreservation tracks the
 // new volsize. Thin mode no-ops inside the helper.
 func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
-	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
 	dataset := p.volumeDataset(vol)
+	sizeKib := alignUpKib(vol.SizeKib, p.volblocksizeKib(ctx, dataset))
 
 	_, err := p.exec.Run(ctx, "zfs", "set",
-		"volsize="+strconv.FormatInt(sizeMiB, 10)+"M",
+		"volsize="+strconv.FormatInt(sizeKib, 10)+"K",
 		dataset)
 	if err != nil {
 		return errors.Wrapf(err, "zfs set volsize %s", dataset)
@@ -270,7 +265,20 @@ func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) er
 	dataset := p.snapshotDataset(snap)
 
 	if p.datasetExists(ctx, dataset) {
-		return nil
+		// A receive interrupted before its cleanup left the source's
+		// snapshot on the zvol, and it may carry this name: skipping
+		// would keep the restore's data under the new snapshot.
+		zvol, _, _ := strings.Cut(dataset, "@")
+
+		received, err := p.receivedSnapshot(ctx, zvol)
+		if err != nil || received != dataset {
+			return err
+		}
+
+		err = p.finishReceive(ctx, zvol)
+		if err != nil {
+			return err
+		}
 	}
 
 	_, err := p.exec.Run(ctx, "zfs", "snapshot", dataset)
@@ -279,6 +287,23 @@ func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) er
 	}
 
 	return nil
+}
+
+// HasSnapshot reports whether this pool holds the snapshot, under its
+// resource's zvol or under one a delete renamed (locateSnapshot), so a copy
+// whose source volume is gone is still found. Several renamed copies of one
+// name still mean the pool holds it.
+func (p *Provider) HasSnapshot(ctx context.Context, snap storage.Snapshot) (bool, error) {
+	dataset, err := p.locateSnapshot(ctx, snap)
+	if errors.Is(err, errAmbiguousSnapshot) {
+		return true, nil
+	}
+
+	if err != nil {
+		return false, err
+	}
+
+	return dataset != "", nil
 }
 
 // RestoreVolumeFromSnapshot materialises target as a `zfs clone` of
@@ -312,6 +337,13 @@ func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage
 	tgtDS := p.volumeDataset(target)
 
 	if p.datasetExists(ctx, tgtDS) {
+		// A cross-node receive into this zvol may have stopped before it
+		// removed the snapshot it brought.
+		err := p.finishReceive(ctx, tgtDS)
+		if err != nil {
+			return err
+		}
+
 		// Bug 253 fix: do NOT short-circuit before ensuring refreservation.
 		// A prior crash may have left the dataset sparse-thick.
 		return p.ensureRefreservation(ctx, tgtDS)
@@ -461,7 +493,18 @@ func (r *zfsSendReader) Close() error {
 // permanently sparse-thick across reconciles. Even on the
 // idempotent-skip path, ensureRefreservation is called so the thick
 // guarantee is restored on every reconcile.
-func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src io.Reader) error {
+//
+// The stream is a full send of the source snapshot, so `zfs recv` leaves a
+// copy of that snapshot on the new zvol. No Snapshot of the restored
+// resource names it, so nothing would ever delete it, and a zvol that has a
+// snapshot is renamed rather than destroyed when its replica goes: the
+// restored volume's delete left `_deleted_<zvol>_<time>` and its snapshot
+// behind for good. It is removed once the receive is done, as LINSTOR's
+// clone service removes every snapshot of a volume it filled by send and
+// receive (CloneService.doZFSCloneTargetCleanup). The zvol records its name
+// in receivedSnapshotProp until then, so a receive that stopped half way is
+// finished by the next restore, receive or snapshot of that name.
+func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, source storage.Snapshot, src io.Reader) error {
 	tgtDS := p.volumeDataset(target)
 
 	// Strict probe: `zfs recv -F` over a dataset that exists, and the
@@ -473,12 +516,21 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src 
 	}
 
 	if present {
+		err = p.finishReceive(ctx, tgtDS)
+		if err != nil {
+			return err
+		}
+
 		// Bug 254 fix: do NOT short-circuit before ensuring refreservation.
 		// A prior crash may have left the recv'd dataset sparse-thick.
 		return p.ensureRefreservation(ctx, tgtDS)
 	}
 
-	out, err := p.exec.RunWithStdin(ctx, src, "zfs", "recv", "-F", tgtDS)
+	// The zvol is created already carrying the name of the snapshot to
+	// remove, so a receive that stops after `zfs recv` still says what it
+	// brought, and a retry finishes the cleanup instead of keeping it.
+	out, err := p.exec.RunWithStdin(ctx, src, "zfs", "recv", "-F",
+		"-o", receivedSnapshotProp+"="+source.SnapshotName, tgtDS)
 	if err != nil {
 		// On failure leave nothing behind — `zfs recv -F` may have
 		// partially created the dataset; destroy it so the next
@@ -487,6 +539,11 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src 
 		_, _ = p.exec.Run(ctx, "zfs", "destroy", "-r", tgtDS)
 
 		return errors.Wrapf(err, "zfs recv %s: %s", tgtDS, strings.TrimSpace(string(out)))
+	}
+
+	err = p.finishReceive(ctx, tgtDS)
+	if err != nil {
+		return err
 	}
 
 	// THICK mode: restore the space guarantee even if the peer sender
@@ -523,6 +580,61 @@ func (p *Provider) datasetVolsize(ctx context.Context, dataset string) (int64, e
 	}
 
 	return bytes, nil
+}
+
+// volblocksizeProbe is the name a dry-run `zfs create` is asked about
+// to learn the volblocksize a new zvol in the pool gets. Nothing is
+// created under it.
+const volblocksizeProbe = "blockstor-volblocksize-probe"
+
+// defaultVolblocksizeKib is the volblocksize, in KiB, a zvol created in
+// the pool gets: the size a dry-run creation of a 1 KiB zvol reports,
+// which ZFS rounds up to it. LINSTOR learns its ZFS extent size the same
+// way (ZfsUtils.getZfsExtentSize) and rounds every volume up to it. A
+// ZFS that cannot answer is given whole MiB, which every volblocksize up
+// to 1 MiB divides.
+func (p *Provider) defaultVolblocksizeKib(ctx context.Context) int64 {
+	out, err := p.exec.Run(ctx, "zfs", "create", "-n", "-P", "-V", "1K", p.cfg.Pool+"/"+volblocksizeProbe)
+	if err != nil {
+		return fallbackAllocationKib
+	}
+
+	for line := range strings.Lines(string(out)) {
+		fields := strings.Fields(line)
+		if len(fields) == dryRunPropertyCols && fields[0] == "property" && fields[1] == "volsize" {
+			return bytesToAllocationKib(fields[2])
+		}
+	}
+
+	return fallbackAllocationKib
+}
+
+// volblocksizeKib is the volblocksize, in KiB, of an existing zvol. A
+// zvol adopted from LINSTOR or cloned from a snapshot keeps the one it
+// was created with, whatever the pool default is now.
+func (p *Provider) volblocksizeKib(ctx context.Context, dataset string) int64 {
+	out, err := p.exec.Run(ctx, "zfs", "get", "-Hp", "-o", "value", "volblocksize", dataset)
+	if err != nil {
+		return fallbackAllocationKib
+	}
+
+	return bytesToAllocationKib(strings.TrimSpace(string(out)))
+}
+
+// bytesToAllocationKib reads a volblocksize in bytes as KiB, or the MiB
+// fallback for anything that is not a whole, positive number of KiB.
+func bytesToAllocationKib(value string) int64 {
+	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || n < bytesPerKib || n%bytesPerKib != 0 {
+		return fallbackAllocationKib
+	}
+
+	return n / bytesPerKib
+}
+
+// alignUpKib rounds kib up to a whole number of unitKib, at least one.
+func alignUpKib(kib, unitKib int64) int64 {
+	return max((kib+unitKib-1)/unitKib, 1) * unitKib
 }
 
 // datasetRefreservation reads the zvol's `refreservation` property in
@@ -647,9 +759,14 @@ func (p *Provider) snapshotDataset(snap storage.Snapshot) string {
 }
 
 const (
-	stateNotProvisioned = "NOT_PROVISIONED"
-	mibPerKib           = 1024
+	stateNotProvisioned = storage.StateNotProvisioned
 	bytesPerKib         = 1024
-	zfsListCols         = 3
-	zpoolListCols       = 2
+	// fallbackAllocationKib is the unit a size is rounded to when the
+	// volblocksize cannot be read.
+	fallbackAllocationKib = 1024
+	// dryRunPropertyCols are the fields of a `property <name> <value>`
+	// line of `zfs create -n -P`.
+	dryRunPropertyCols = 3
+	zfsListCols        = 3
+	zpoolListCols      = 2
 )

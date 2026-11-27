@@ -60,7 +60,9 @@ func TestApplyCreatesVolumeViaProvider(t *testing.T) {
 	}
 
 	if !slices.Contains(fx.CommandLines(),
-		"lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize 1024MiB --name pvc-1_00000 vg/tp") {
+		// 1 GiB of data plus the internal metadata for 15 peer slots,
+		// in KiB: LVM rounds it up to a whole extent, as LINSTOR does.
+		"lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize 1049096k --name pvc-1_00000 vg/tp") {
 		t.Errorf("expected lvcreate; got %v", fx.CommandLines())
 	}
 }

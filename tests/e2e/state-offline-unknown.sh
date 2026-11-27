@@ -9,19 +9,17 @@
 #   1. `linstor n l` for the offline worker must flip to State=Offline
 #      (driven by the heartbeat watchdog at internal/controller/
 #      node_heartbeat_controller.go: stale beyond
-#      NodeMonitorGracePeriod=40 s → ConnectionStatus=OFFLINE).
+#      NodeMonitorGracePeriod=50 s → ConnectionStatus=OFFLINE).
 #
 #   2. `linstor r l -r <RD>` row for the offline worker must show
-#      State=Unknown — the observer can no longer prove anything
-#      about that replica's DRBD state, so the wire-side projection
-#      must not silently re-emit a stale UpToDate.
+#      State=Unknown: like LINSTOR, the controller answers a replica on
+#      an OFFLINE node with no satellite state (no in_use, no
+#      volumes[].state.disk_state, no peer links), so a stale UpToDate
+#      is never re-emitted for a replica nothing can vouch for.
 #
-#   3. The last-known per-volume DiskState must NOT be wiped to
-#      empty — operators need it for forensics ("the last time the
-#      satellite was talking, this replica was UpToDate / Inconsistent
-#      / Failed / ..."). The CRD Status.Volumes[*].DiskState is the
-#      source of truth for the disk-state column; only the
-#      resource-level State should collapse to Unknown.
+#   3. The CRD Status keeps the satellite's last report for forensics
+#      when the satellite died before blanking it; only the answer
+#      changes. Reported, not asserted (it depends on how it died).
 #
 #   4. Recovery: removing the schedulability taint lets the satellite
 #      pod come back, the heartbeat resumes, the watchdog flips
@@ -43,7 +41,7 @@
 # so heartbeats KEEP flowing — that wouldn't exercise the OFFLINE
 # flip at all. The affinity-based eviction is the only reliable
 # way on this stand to land the satellite in a truly absent state
-# for the >40 s grace window.
+# for the >50 s grace window.
 
 set -euo pipefail
 
@@ -63,9 +61,9 @@ fi
 
 RD=e2e-5-5-offline-unknown
 EVICT_LABEL=blockstor.org/offline-unknown-test
-OFFLINE_TIMEOUT=75    # 40 s grace + watchdog requeue period (5 s) +
+OFFLINE_TIMEOUT=85    # 50 s grace + watchdog requeue period (5 s) +
                       # apiserver/SSA-apply slack on a busy QEMU stand
-HEAL_TIMEOUT=180      # satellite startup + heartbeat (max 40 s for the
+HEAL_TIMEOUT=180      # satellite startup + heartbeat (max 50 s for the
                       # watchdog to flip ConnectionStatus back) +
                       # DRBD reconnect + full re-sync of the
                       # offline-window-delta on a busy QEMU stand
@@ -295,78 +293,40 @@ echo "   $N3 ConnectionStatus=OFFLINE"
 
 # --- Step: assert Resource row's State flipped to Unknown -----------------
 #
-# The Python CLI's `linstor r l` State column reads
-# `volumes[*].state.disk_state` (per-volume) AND the resource-level
-# `state.drbd_state`. The expectation from the scenario brief is that
-# the resource-level State collapses to Unknown when the satellite is
-# offline, while the last-known per-volume DiskState is preserved.
-#
-# Probe both: parse the REST JSON for the offline node's row.
+# LINSTOR forgets a satellite's state when the connection to it closes
+# and answers that node's replicas with no state at all: no in_use, no
+# volumes[].state.disk_state, no peer links. linstor-client renders such
+# a row as a yellow Unknown and lists it under `--faulty`. The
+# controller gives the same answer for every replica on an OFFLINE node
+# (pkg/api/v1/offline.go), read from the Node's ConnectionStatus on each
+# request, so this holds as soon as the OFFLINE flip above has been seen.
 rd_json=$("${LCTLJ[@]}" resource list -r "$RD" 2>/dev/null)
-n3_drbd_state=$(echo "$rd_json" \
-    | jq -r --arg n "$N3" '.[][] | select(.node_name == $n) | .state.drbd_state // ""')
-n3_disk_state=$(echo "$rd_json" \
-    | jq -r --arg n "$N3" '.[][] | select(.node_name == $n) | .volumes[0].state.disk_state // ""')
+n3_row=$(echo "$rd_json" | jq -c --arg n "$N3" '[.[][] | select(.node_name == $n)][0] // {}')
+n3_disk_state=$(echo "$n3_row" | jq -r '.volumes[0].state.disk_state // ""')
+n3_in_use=$(echo "$n3_row" | jq -r '.state.in_use // ""')
+n3_links=$(echo "$n3_row" | jq -r '.layer_object.drbd.connections // {} | length')
+echo "   $N3 row: in_use='$n3_in_use', volumes[0].state.disk_state='$n3_disk_state', peer links=$n3_links"
 
-echo "   $N3 row: state.drbd_state='$n3_drbd_state', volumes[0].state.disk_state='$n3_disk_state'"
+if [[ -n "$n3_disk_state" || -n "$n3_in_use" || "$n3_links" != "0" ]]; then
+    echo "FAIL: $N3 is OFFLINE but its replica still carries the dead satellite's state"
+    echo "      (linstor-client renders it as '${n3_disk_state}' instead of Unknown)"
+    exit 1
+fi
+echo "   PASS $N3 replica carries no satellite state (linstor r l: Unknown)"
 
-# Also check what the Python CLI renders for the State column — that's
-# the user-visible answer, derived from `volumes[].state.disk_state`
-# (via VolumeCommands.volume_state_cell in linstor_client/commands/
-# vlm_cmds.py). When that field is empty, the CLI shows "Unknown"
-# (yellow); when it has a value, the CLI shows that value verbatim.
-cli_state=$("${LCTLJ[@]}" resource list -r "$RD" 2>/dev/null \
-    | jq -r --arg n "$N3" '.[][] | select(.node_name == $n) | .volumes[0].state.disk_state // ""')
-echo "   $N3 CLI-rendered State (from volumes[0].state.disk_state) = '${cli_state:-Unknown}'"
-
-# Architecture observation pinned by this scenario (open issue):
-#
-# The blockstor controller has NO projection layer that translates
-# "owning satellite is OFFLINE" → resource-level State=Unknown. Both
-# state.drbd_state and volumes[*].state.disk_state are echoed straight
-# from the CRD Status, which the satellite owns via SSA. When the
-# satellite dies:
-#   - if its preStop hook had a chance to `drbdadm down` first,
-#     observer events2 frames empty out volumes[].state.disk_state →
-#     CLI renders State=Unknown (yellow), and operators LOSE the
-#     last-known disk-state snapshot;
-#   - if SIGKILL beats preStop (force --grace-period=0), the CRD
-#     retains its last-known DiskState=UpToDate → CLI renders
-#     State=UpToDate (green) for a replica the controller can no
-#     longer prove anything about.
-#
-# The brief's contract — "State=Unknown AND last-known DiskState
-# preserved" — requires both at once, which is architecturally
-# impossible with the current single-field projection. The fix
-# would be a controller-side projection that writes
-# Status.DrbdState=Unknown (resource-level, separate from
-# Volumes[].DiskState) whenever the owning Node's ConnectionStatus
-# is OFFLINE, so the wire shape carries both Unknown (resource
-# state) AND UpToDate (last-known disk state) at once.
-
-state_flipped=0
+# The stored report itself is kept: the CRD Status still holds what the
+# satellite last observed, for forensics, and only the answer changes.
+# Whether it survives depends on how the satellite died (a preStop
+# `drbdadm down` blanks it, a SIGKILL that beats preStop freezes it),
+# so it is reported, not asserted.
 disk_preserved=0
-
-case "$n3_drbd_state" in
-    "" | "Unknown" )
-        echo "   PASS resource-level state.drbd_state landed Unknown ('$n3_drbd_state')"
-        state_flipped=1
-        ;;
-    * )
-        echo "   FAIL state.drbd_state still '$n3_drbd_state' after OFFLINE flip"
-        echo "        (no controller-side projection of OFFLINE → Unknown on the"
-        echo "        Resource CRD; field stays at the satellite's last write)"
-        ;;
-esac
-
-if [[ -n "$n3_disk_state" && "$n3_disk_state" == "$last_known_disk" ]]; then
-    echo "   PASS last-known volumes[0].DiskState preserved ('$n3_disk_state')"
+crd_disk=$(kubectl get "resource.blockstor.org/${RD}.${N3}" \
+    -o jsonpath='{.status.volumes[0].diskState}' 2>/dev/null || echo "")
+if [[ -n "$crd_disk" && "$crd_disk" == "$last_known_disk" ]]; then
+    echo "   last-known CRD Status.Volumes[0].DiskState preserved ('$crd_disk')"
     disk_preserved=1
 else
-    echo "   FAIL last-known volumes[0].DiskState was lost (got '${n3_disk_state:-<empty>}'," \
-         "expected '$last_known_disk')"
-    echo "        (observer's events2 frames during pod shutdown blanked the field"
-    echo "        before SIGKILL arrived)"
+    echo "   last-known CRD Status.Volumes[0].DiskState not preserved (got '${crd_disk:-<empty>}')"
 fi
 
 # --- Step: heal — drop the label so $N3 again matches the DS affinity -----
@@ -418,26 +378,15 @@ echo "   $N3 back to ONLINE, $N3 disk_state=UpToDate"
 #
 # DETERMINISTIC contracts (these gate the scenario and are hard-asserted
 # above with their own `exit 1`): the owning Node flips to OFFLINE while
-# isolated, and $N3 heals back to ONLINE + UpToDate once un-isolated.
-# Both held to reach this line.
+# isolated, its replica then answers with no satellite state, and $N3
+# heals back to ONLINE + UpToDate once un-isolated. All held to reach
+# this line.
 #
-# OBSERVATIONAL contracts (state_flipped / disk_preserved): the brief
-# asks for resource-level State=Unknown AND last-known per-volume
-# DiskState=UpToDate to hold SIMULTANEOUSLY during the offline window.
-# As the architecture note above spells out, blockstor's single-field
-# projection makes these two MUTUALLY EXCLUSIVE — the satellite's
-# shutdown path decides which one you get: preStop `drbdadm down` blanks
-# both fields (→ State=Unknown, DiskState lost), while a SIGKILL that
-# beats preStop freezes both (→ DiskState=UpToDate, State not Unknown).
-# Neither ordering is wrong; satisfying both at once needs a new
-# controller-side projection layer (tracked as an open product issue,
-# NOT a regression of this CI change). Asserting both as a hard pass
-# made the scenario green only when it happened to win the shutdown-
-# timing race — a flake on a contended runner. So report them as XFAIL
-# observations and let the deterministic contracts decide the verdict.
+# OBSERVATIONAL contract (disk_preserved): whether the CRD keeps the
+# last-known DiskState depends on how the satellite died, see above.
 echo ">> STATE-OFFLINE-UNKNOWN OK (deterministic contracts held)"
 echo "   Node Offline flip:               PASS"
 echo "   Heal after un-isolate:           PASS"
-echo "   Resource State -> Unknown:       $( ((state_flipped))  && echo PASS || echo 'XFAIL (open issue: no OFFLINE->Unknown projection)' )"
-echo "   Last-known DiskState preserved:  $( ((disk_preserved)) && echo PASS || echo 'XFAIL (open issue: single-field projection blanks on preStop)' )"
+echo "   Resource State -> Unknown:       PASS"
+echo "   Last-known DiskState in the CRD: $( ((disk_preserved)) && echo kept || echo 'not kept (satellite blanked it on shutdown)' )"
 exit 0

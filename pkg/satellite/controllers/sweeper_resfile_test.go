@@ -32,6 +32,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 )
 
 // fakeDirEntry is a minimal os.DirEntry so orphanResForRemoval can be
@@ -41,9 +42,15 @@ type fakeDirEntry struct {
 	dir  bool
 }
 
-func (f fakeDirEntry) Name() string      { return f.name }
-func (f fakeDirEntry) IsDir() bool       { return f.dir }
-func (f fakeDirEntry) Type() os.FileMode { return 0 }
+func (f fakeDirEntry) Name() string { return f.name }
+func (f fakeDirEntry) IsDir() bool  { return f.dir }
+func (f fakeDirEntry) Type() os.FileMode {
+	if f.dir {
+		return os.ModeDir
+	}
+
+	return 0
+}
 
 // Info is never called by orphanResForRemoval (it only reads Name/IsDir);
 // return a sentinel so the contract is satisfied without the nilnil lint.
@@ -294,6 +301,35 @@ func TestSweepOrphanResFilesKeepsFileWhenDownFails(t *testing.T) {
 
 	if _, err := os.Stat(stalePath); err != nil {
 		t.Errorf("stale .res removed despite failed down (would strand kernel slot): %v", err)
+	}
+}
+
+// TestSweepOrphanResFilesKeepsFileWhenTheKernelDoesNotAnswer: a slot
+// probe that timed out says nothing about the slot, so its `.res` stays
+// for the next cycle rather than leaving a possibly loaded slot with no
+// config.
+func TestSweepOrphanResFilesKeepsFileWhenTheKernelDoesNotAnswer(t *testing.T) {
+	t.Parallel()
+
+	stateDir := t.TempDir()
+
+	stalePath := filepath.Join(stateDir, "pvc-unknown.res")
+	if err := os.WriteFile(stalePath, []byte("resource pvc-unknown {}\n"), 0o600); err != nil {
+		t.Fatalf("seed stale .res: %v", err)
+	}
+
+	sweeper, _ := sweeperFixture(t, "n1", "", nil)
+	sweeper.StateDir = stateDir
+	sweeper.isLoadedFn = func(_ context.Context, _ string) (bool, error) {
+		return false, drbd.ErrStatusTimeout
+	}
+
+	if err := sweeper.sweepOnce(t.Context(), logr.Discard()); err != nil {
+		t.Fatalf("sweepOnce: %v", err)
+	}
+
+	if _, err := os.Stat(stalePath); err != nil {
+		t.Errorf("stale .res removed while the slot state was unknown: %v", err)
 	}
 }
 

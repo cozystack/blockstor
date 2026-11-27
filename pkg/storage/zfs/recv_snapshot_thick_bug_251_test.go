@@ -72,6 +72,7 @@ func TestRecvSnapshotThickSetsRefreservation(t *testing.T) {
 			VolumeNumber: 0,
 			SizeKib:      1024 * 1024, // 1 GiB
 		},
+		storage.Snapshot{ResourceName: "pvc-1", SnapshotName: "s1"},
 		src,
 	)
 	if err != nil {
@@ -130,6 +131,7 @@ func TestRecvSnapshotThinNoRefreservation(t *testing.T) {
 			VolumeNumber: 0,
 			SizeKib:      1024 * 1024,
 		},
+		storage.Snapshot{ResourceName: "pvc-1", SnapshotName: "s1"},
 		src,
 	)
 	if err != nil {

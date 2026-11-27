@@ -25,6 +25,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -48,11 +50,39 @@ const drbdmetaNoMinor = "-"
 // storage.FakeExec and assert the exact command lines.
 type Adm struct {
 	exec storage.Exec
+
+	// schemaMu guards schemas, the per-section schemas read once from
+	// this node's drbdsetup (OptionSchema), and schemaFailures, the last
+	// failed read of each, kept for schemaRetryAfter.
+	schemaMu       sync.Mutex
+	schemas        map[string]*OptionSchema
+	schemaFailures map[string]schemaFailure
+
+	// now is the clock schemaFailures are aged by; time.Now unless a
+	// test sets it.
+	now func() time.Time
+
+	// statusTimeout bounds each `drbdsetup status` call (status);
+	// DefaultStatusTimeout when zero.
+	statusTimeout time.Duration
 }
+
+// schemaFailure is a failed schema read and when it failed.
+type schemaFailure struct {
+	at  time.Time
+	err error
+}
+
+// schemaRetryAfter is how long a failed schema read is answered from
+// memory before drbdsetup is asked again. Every .res render reads each
+// section's schema, so without it a node whose drbdsetup cannot answer
+// runs the failing xml-help calls again on every render of every
+// resource, adding their latency to each create.
+const schemaRetryAfter = time.Minute
 
 // NewAdm constructs an Adm with the given Exec.
 func NewAdm(ex storage.Exec) *Adm {
-	return &Adm{exec: ex}
+	return &Adm{exec: ex, now: time.Now}
 }
 
 // Up activates the resource: `drbdadm up <res>`. Idempotent on the DRBD
@@ -101,6 +131,91 @@ func (a *Adm) SetupDown(ctx context.Context, resource string) error {
 // changes (added/removed peers, new options).
 func (a *Adm) Adjust(ctx context.Context, resource string) error {
 	return a.run(ctx, "adjust", resource)
+}
+
+// CheckResFile asks drbdadm whether the node's configuration still parses
+// with candidate in place of live: `drbdadm --config-to-test <candidate>
+// --config-to-exclude <live> sh-nop`.
+//
+// LINSTOR's satellite does not run it: its DrbdAdm.checkResFile has no
+// caller, and DrbdResourceFileUtils moves a new body into place
+// unchecked. blockstor checks deliberately, which is stricter, and
+// docs/cli-parity-known-deltas.md lists it as a divergence.
+//
+// It matters beyond the one resource because drbdadm reads every .res
+// on the node for any command. A file it cannot parse stops adjust,
+// dump-md and every other drbdadm call for all resources there, not just
+// its own, so it has to be caught before it lands under its real name.
+// live need not exist: a resource's first .res excludes nothing.
+func (a *Adm) CheckResFile(ctx context.Context, candidate, live string) error {
+	_, err := a.exec.Run(ctx, "drbdadm", "--config-to-test", candidate, "--config-to-exclude", live, "sh-nop")
+	if err != nil {
+		return errors.Wrapf(err, "drbdadm refuses %s", candidate)
+	}
+
+	return nil
+}
+
+// DiskOptionSchema returns what this node's drbd-utils accepts inside a
+// `disk { }` section; see OptionSchema.
+func (a *Adm) DiskOptionSchema(ctx context.Context) (*OptionSchema, error) {
+	return a.OptionSchema(ctx, SectionDisk)
+}
+
+// OptionSchema returns what this node's drbd-utils accepts inside one
+// `.res` section, read from `drbdsetup xml-help` for each of its
+// SectionCommands, the way LINSTOR's satellite builds its option
+// whitelist when it starts. The answer is kept for the life of the
+// process: drbd-utils ships in the image, so it cannot change under a
+// running satellite.
+//
+// A failure is kept only for schemaRetryAfter, so a drbdsetup that could
+// not answer once is asked again a minute later, not on every render; it
+// returns a nil schema, which
+// accepts every option: the render then goes ahead unfiltered, as it did
+// before the schema existed, and CheckResFile still stands between a
+// body drbdadm refuses and the live file. A section xml-help does not
+// describe has a nil schema too.
+func (a *Adm) OptionSchema(ctx context.Context, section string) (*OptionSchema, error) {
+	commands := SectionCommands(section)
+	if len(commands) == 0 {
+		return nil, nil //nolint:nilnil // a nil schema is the documented "check nothing"
+	}
+
+	a.schemaMu.Lock()
+	defer a.schemaMu.Unlock()
+
+	// The disk and peer-device sections share their commands, so they
+	// share one schema and one round of drbdsetup calls.
+	cacheKey := strings.Join(commands, ",")
+
+	if schema, ok := a.schemas[cacheKey]; ok {
+		return schema, nil
+	}
+
+	if failed, ok := a.schemaFailures[cacheKey]; ok && a.now().Sub(failed.at) < schemaRetryAfter {
+		return nil, failed.err
+	}
+
+	schema, err := a.readOptionSchema(ctx, commands)
+	if err != nil {
+		if a.schemaFailures == nil {
+			a.schemaFailures = map[string]schemaFailure{}
+		}
+
+		a.schemaFailures[cacheKey] = schemaFailure{at: a.now(), err: err}
+
+		return nil, err
+	}
+
+	if a.schemas == nil {
+		a.schemas = map[string]*OptionSchema{}
+	}
+
+	a.schemas[cacheKey] = schema
+	delete(a.schemaFailures, cacheKey)
+
+	return schema, nil
 }
 
 // InvalidateVolume runs `drbdadm invalidate <resource>/<vol>` — marks the
@@ -195,11 +310,7 @@ func (a *Adm) AdjustSkipNetSkipDisk(ctx context.Context, resource string) error 
 // `runFirstActivation` gates the call behind a `HasMD` pre-check so
 // this stays safe across satellite restarts / failed first attempts.
 func (a *Adm) CreateMD(ctx context.Context, resource string) error {
-	return a.run(ctx,
-		"create-md",
-		"--force",
-		fmt.Sprintf("--max-peers=%d", MaxPeers-1),
-		resource)
+	return a.CreateMDWithMaxPeers(ctx, resource, MaxPeers-1)
 }
 
 // HasMD reports whether DRBD-9 metadata already exists for the
@@ -323,6 +434,16 @@ var metadataAbsentMarkers = []string{
 // crashed with real data on it. Only the caller knows which one it is
 // looking at, so the probe names the state and refuses to guess.
 var ErrMetadataUnclean = errors.New("metadata is present but its activity log needs applying")
+
+// ErrUncleanMetadataUnrecorded reports metadata under an unapplied
+// activity log on a volume that its replica holds no record of: no GI
+// was ever seen on it, it is not the destination of a restore, and its
+// superblock does not carry this replica's node id, or that cannot be
+// read. Re-creating it could throw away the GI and dirty bitmap of a
+// replica that holds data, and LINSTOR never re-creates metadata that is
+// there; an operator decides instead.
+var ErrUncleanMetadataUnrecorded = errors.New(
+	"refusing to re-create metadata under an unapplied activity log on a volume with no recorded GI")
 
 // metadataUncleanMarkers are the exits that positively state that.
 //
@@ -540,6 +661,20 @@ func (a *Adm) ForgetPeer(ctx context.Context, resource string, peerNodeID int32)
 	return nil
 }
 
+// DelPeerByNodeID removes the kernel's connection to the peer with the
+// given node-id, through `drbdsetup del-peer <resource> <node-id>`, the
+// call LINSTOR's satellite makes for a peer being deleted. Unlike
+// DelPeer it does not resolve the peer through the .res, which by then
+// may name the same node under a different node-id.
+func (a *Adm) DelPeerByNodeID(ctx context.Context, resource string, peerNodeID int32) error {
+	_, err := a.exec.Run(ctx, "drbdsetup", "del-peer", resource, strconv.Itoa(int(peerNodeID)))
+	if err != nil {
+		return errors.Wrapf(err, "drbdsetup del-peer %s %d", resource, peerNodeID)
+	}
+
+	return nil
+}
+
 // DelPeer disconnects and forgets a peer node for the given resource.
 // Run this BEFORE rewriting the .res file with the peer removed —
 // drbdadm needs the peer's `on <peer>` block in the .res to resolve
@@ -653,7 +788,7 @@ func (a *Adm) NewCurrentUUID(ctx context.Context, resource string) error {
 // failure is best-effort-ignored (a peer already StandAlone is fine); a
 // clear-bitmap or adjust failure surfaces.
 func (a *Adm) MintLateAddSource(ctx context.Context, resource string) ([]int32, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return nil, errors.Wrapf(err, "drbdsetup status %s", resource)
 	}
@@ -897,12 +1032,42 @@ func (a *Adm) CurrentGI(ctx context.Context, resource string, volume int32, devi
 		return "", err
 	}
 
-	current, _, found := strings.Cut(tuple, ":")
-	if !found || current == "" {
-		return "", nil
+	return currentOfGITuple(tuple), nil
+}
+
+// KernelCurrentGI returns the current-UUID the kernel holds for one
+// volume, through `drbdsetup get-gi <resource> <peer-node-id>
+// <volume>`. drbdsetup answers from the device statistics over
+// netlink; it does not open the backing device, so udev sees no close
+// and sends no change uevent. drbdmeta does, for the device and each
+// of its partitions.
+//
+// The kernel copy is also the one DRBD acts on. A write that mints a
+// new current UUID syncs it to disk at once, but other GI changes
+// reach the disk only with md_sync_timer, up to 5 s later.
+//
+// drbdsetup needs a peer device to name the volume by, so a replica
+// with no peer has to be read with CurrentGI. Empty string (not an
+// error) when the tuple can't be parsed, as CurrentGI.
+func (a *Adm) KernelCurrentGI(ctx context.Context, resource string, peerNodeID, volume int32) (string, error) {
+	out, err := a.exec.Run(ctx, "drbdsetup", "get-gi", resource,
+		strconv.Itoa(int(peerNodeID)), strconv.Itoa(int(volume)))
+	if err != nil {
+		return "", errors.Wrapf(err, "drbdsetup get-gi %s/%d peer %d", resource, volume, peerNodeID)
 	}
 
-	return strings.ToUpper(current), nil
+	return currentOfGITuple(strings.TrimSpace(string(out))), nil
+}
+
+// currentOfGITuple returns the current-UUID of a get-gi tuple, upper
+// case, or empty when the tuple has none.
+func currentOfGITuple(tuple string) string {
+	current, _, found := strings.Cut(tuple, ":")
+	if !found || current == "" {
+		return ""
+	}
+
+	return strings.ToUpper(current)
 }
 
 // StatusResources runs `drbdsetup status` and returns the names of
@@ -922,7 +1087,7 @@ func (a *Adm) CurrentGI(ctx context.Context, resource string, volume int32, devi
 // defined" message returns an empty slice + nil error: a kernel
 // with no DRBD resources is a valid steady state, not a failure.
 func (a *Adm) StatusResources(ctx context.Context) ([]string, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status")
+	out, err := a.status(ctx)
 	if err != nil {
 		// `No currently configured DRBD found.` (kernel module loaded
 		// but zero resources) and friends all bubble up non-zero. Treat
@@ -989,11 +1154,16 @@ func (a *Adm) StatusResources(ctx context.Context) ([]string, error) {
 //     present but the named resource isn't.
 //
 // Returning false + nil error is the dominant "absent" signal so
-// callers don't need to branch on the error type; a true error
-// surfaces only for genuinely-unexpected failures (binary
-// missing, exec/IO error) that the caller should bubble up.
+// callers don't need to branch on the error type. A status that did
+// not answer is the exception and fails with ErrStatusTimeout: the
+// slot may well be loaded and holding its backing disk, and a caller
+// that read it as absent would go on to reclaim that disk.
 func (a *Adm) IsLoaded(ctx context.Context, resource string) (bool, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource)
+	out, err := a.status(ctx, resource)
+	if errors.Is(err, ErrStatusTimeout) {
+		return false, err
+	}
+
 	if err != nil {
 		// Any non-zero exit is treated as "absent": the dominant
 		// failure mode is `drbdsetup status` returning exit 10 +
@@ -1024,7 +1194,7 @@ func (a *Adm) IsLoaded(ctx context.Context, resource string) (bool, error) {
 // fix is `down` + re-`up`; the self-heal path needs this reader to
 // detect the mismatch (kernel my-id != allocated Status.DRBDNodeID).
 func (a *Adm) KernelMyNodeID(ctx context.Context, resource string) (int32, bool) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return -1, false
 	}
@@ -1065,15 +1235,22 @@ func (a *Adm) KernelMyNodeID(ctx context.Context, resource string) (int32, bool)
 // cache-trail that can leave a freshly-recreated replica's peer Status
 // looking empty/Inconsistent at BuildDesired time.
 //
-// Conservative: returns false on any probe/parse failure (kernel slot
+// Conservative: returns false on any other probe/parse failure (kernel slot
 // absent, status non-zero, malformed JSON) so a genuinely-fresh RD
 // — where no peer has data and the probe legitimately finds nothing —
 // still force-primaries (Bug 77 / first-replica seed preserved). The
 // only states that gate the promote are the three committed-data ones;
 // a fresh, never-promoted peer reports Inconsistent (or no connection
 // yet) and does NOT block.
+//
+// A status that did not answer reports true: it says nothing about the
+// peers, and the only caller forces primary on false.
 func (a *Adm) AnyConnectedPeerHasData(ctx context.Context, resource string) bool {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
+	if errors.Is(err, ErrStatusTimeout) {
+		return true
+	}
+
 	if err != nil {
 		return false
 	}
@@ -1121,7 +1298,7 @@ func (a *Adm) AnyConnectedPeerHasData(ctx context.Context, resource string) bool
 // is connected with the new minor yet — that is the "fresh
 // volume" steady state, no peer holds data for it).
 func (a *Adm) AnyConnectedPeerHasDataForVolume(ctx context.Context, resource string, volNumber int32) bool {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return false
 	}
@@ -1186,7 +1363,7 @@ func (a *Adm) AnyConnectedPeerHasDataForVolume(ctx context.Context, resource str
 // Conservative on any probe / parse failure: returns false, the retry
 // just waits for the next reconcile.
 func (a *Adm) SafeForMkfsRetryPromote(ctx context.Context, resource string) bool {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return false
 	}
@@ -1263,7 +1440,7 @@ func (a *Adm) SafeForMkfsRetryPromote(ctx context.Context, resource string) bool
 //
 // Conservative on any probe / parse failure: returns false.
 func (a *Adm) Day0SiblingSetConnected(ctx context.Context, resource string, disklessPeers map[string]bool) bool {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return false
 	}
@@ -1350,7 +1527,7 @@ func (a *Adm) Day0SiblingSetConnected(ctx context.Context, resource string, disk
 // re-fires. Conservative on any probe/parse failure (returns false) —
 // a missed promote just retries on the next reconcile.
 func (a *Adm) NeedsRecoveryPromote(ctx context.Context, resource string) bool {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return false
 	}
@@ -1506,7 +1683,7 @@ func peerDeviceActivelySyncing(peerDev drbdsetupStatusPeerDevice) bool {
 // probe/parse failure (returns false) — a missed promote just retries on
 // the next reconcile.
 func (a *Adm) NeedsSoloPromote(ctx context.Context, resource string) bool {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return false
 	}
@@ -1649,7 +1826,7 @@ func localIsUpToDate(devices []drbdsetupStatusDevice) bool {
 // Self-limiting: once the peers reach UpToDate the predicate stops
 // holding. Conservative on any probe/parse failure → false.
 func (a *Adm) NeedsLateAddPromote(ctx context.Context, resource string) bool {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return false
 	}
@@ -1880,7 +2057,7 @@ func lateAddVolumeNeedsLocalPromote(conns []drbdsetupStatusConnection, vol, myID
 // volume reaches UpToDate it no longer qualifies, so the predicate stops
 // returning it.
 func (a *Adm) LateAddResyncKickVolumes(ctx context.Context, resource string) []int32 {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		return nil
 	}
@@ -2064,7 +2241,7 @@ const (
 //   - parsed, some peer-device SyncSource/SyncTarget → DownVetoResync.
 //   - parsed, all peer-devices quiescent → DownAllowed.
 func (a *Adm) EvaluateDownVeto(ctx context.Context, resource string) DownVeto {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	out, err := a.status(ctx, resource, "--json")
 	if err != nil {
 		// Conclusive absence (clean not-loaded) → down is a no-op, allow
 		// it so a genuinely idle/downed resource is never deferred
@@ -2098,6 +2275,49 @@ func (a *Adm) EvaluateDownVeto(ctx context.Context, resource string) DownVeto {
 	}
 
 	return DownAllowed
+}
+
+// HasAttachedDisk reports whether any of the named resource's local
+// volumes has a disk attached in the kernel: a `disk:` state other
+// than Diskless, Detaching or Failed in `drbdsetup status --verbose`.
+// A slot with no volume at all, which a diskless replica's slot is
+// between `new-resource` and its minors, has none, where
+// HasDisklessVolume finds no not-attached volume either and so cannot
+// tell it from an attached one. A detach is only for an attached disk:
+// drbdadm refuses one on a resource whose configuration has no disk.
+//
+// The convention matches HasDisklessVolume, except that a failed
+// probe is returned: the caller decides what an unknown state means.
+// A slot that is not loaded is not a failed probe: drbdsetup says so
+// in words ("No such resource" while a down is in flight), and a
+// resource the kernel no longer holds has no disk attached, whatever
+// the replica's configuration says.
+func (a *Adm) HasAttachedDisk(ctx context.Context, resource string) (bool, error) {
+	out, err := a.status(ctx, "--verbose", resource)
+	if isResourceNotLoadedErr(err, out) {
+		return false, nil
+	}
+
+	if err != nil {
+		return false, errors.Wrapf(err, "drbdsetup status --verbose %s", resource)
+	}
+
+	for line := range strings.SplitSeq(string(out), "\n") {
+		for field := range strings.FieldsSeq(line) {
+			state, local := strings.CutPrefix(field, "disk:")
+			if !local {
+				continue
+			}
+
+			switch state {
+			case "Diskless", "Detaching", "Failed":
+			default:
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
 }
 
 // HasDisklessVolume reports whether any of the named resource's
@@ -2168,10 +2388,16 @@ func (a *Adm) EvaluateDownVeto(ctx context.Context, resource string) DownVeto {
 // Convention (matches IsLoaded):
 //   - non-zero exit from drbdsetup → false + nil (slot absent;
 //     not our race window)
+//   - no answer → ErrStatusTimeout: the disk state is unknown, and
+//     "not diskless" would let the caller release SkipDisk
 //   - parses each indented volume line (`disk:<state>`) and returns
 //     true on the first match for any of the not-attached states.
 func (a *Adm) HasDisklessVolume(ctx context.Context, resource string) (bool, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", "--verbose", resource)
+	out, err := a.status(ctx, "--verbose", resource)
+	if errors.Is(err, ErrStatusTimeout) {
+		return false, err
+	}
+
 	if err != nil {
 		// Slot absent / netlink hiccup → not in the race window we
 		// care about. Same convention IsLoaded uses (zero value +
@@ -2361,7 +2587,7 @@ type minorDevice struct {
 }
 
 func (a *Adm) minorDevice(ctx context.Context, minor int32) (minorDevice, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", "--verbose")
+	out, err := a.status(ctx, "--verbose")
 	if err != nil {
 		// `No currently configured DRBD found.` — kernel has no
 		// resources, so no minor is owned. Surface "" + nil.
@@ -2428,4 +2654,21 @@ func (a *Adm) run(ctx context.Context, args ...string) error {
 	}
 
 	return nil
+}
+
+// readOptionSchema asks drbdsetup to describe commands and parses the
+// answers into one schema.
+func (a *Adm) readOptionSchema(ctx context.Context, commands []string) (*OptionSchema, error) {
+	docs := make([][]byte, 0, len(commands))
+
+	for _, cmd := range commands {
+		out, err := a.exec.Run(ctx, "drbdsetup", "xml-help", cmd)
+		if err != nil {
+			return nil, errors.Wrapf(err, "drbdsetup xml-help %s", cmd)
+		}
+
+		docs = append(docs, out)
+	}
+
+	return ParseOptionSchema(docs...)
 }

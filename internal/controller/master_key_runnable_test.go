@@ -184,7 +184,7 @@ func TestMasterKeyRunnableRemovesSupersededSlots(t *testing.T) {
 
 // Once the keyring exists and no slot is superseded, a pass reads no
 // passphrase, so it runs no Argon2id: the steady state costs two Secret
-// reads every period and no derivation.
+// reads from Reader every period and no derivation.
 func TestMasterKeyRunnableSteadyPassDerivesNothing(t *testing.T) {
 	t.Parallel()
 
@@ -240,5 +240,141 @@ func TestMasterKeyRunnableSteadyPassDerivesNothing(t *testing.T) {
 
 	if passReads != 0 {
 		t.Fatalf("steady passes read the passphrase %d times, want none", passReads)
+	}
+}
+
+// A pass with nothing to do reads only through Reader, which production
+// serves from watches, so an idle controller sends no request; Direct, the
+// API reader, is left for the reads before a write.
+func TestMasterKeyRunnableIdlePassReadsNothingDirect(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+
+	const ns = "blockstor-system"
+
+	watched := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&blockstoriov1alpha1.ControllerConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
+			Spec:       blockstoriov1alpha1.ControllerConfigSpec{PassphraseSecretRef: &blockstoriov1alpha1.PassphraseSecretRef{Name: "p"}},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: ns},
+			Data:       map[string][]byte{"MASTER_PASSPHRASE": []byte("piraeus")},
+		},
+	).Build()
+
+	directReads := 0
+
+	direct := interceptor.NewClient(watched, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			directReads++
+
+			return c.Get(ctx, key, obj, opts...)
+		},
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			directReads++
+
+			return c.List(ctx, list, opts...)
+		},
+	})
+
+	r := &controllerpkg.MasterKeyRunnable{Client: watched, Reader: watched, Direct: direct, Namespace: ns}
+
+	// The first pass creates the keyring.
+	r.Pass(t.Context())
+
+	ring, _, err := passphrase.Secrets{Reader: watched, Namespace: ns}.Keyring(t.Context())
+	if err != nil || ring == nil {
+		t.Fatalf("no keyring after the first pass: %v", err)
+	}
+
+	directReads = 0
+
+	for range 3 {
+		r.Pass(t.Context())
+	}
+
+	if directReads != 0 {
+		t.Errorf("idle passes read %d times past the watches, want none", directReads)
+	}
+}
+
+// Reader trails the API server, so the read-modify-write that removes a
+// superseded slot reads through Direct: from a keyring Reader holds at an
+// old resourceVersion, every update would conflict.
+func TestMasterKeyRunnableRemovesSupersededSlotsPastAStaleReader(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+
+	const ns = "blockstor-system"
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&blockstoriov1alpha1.ControllerConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
+			Spec:       blockstoriov1alpha1.ControllerConfigSpec{PassphraseSecretRef: &blockstoriov1alpha1.PassphraseSecretRef{Name: "p"}},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: ns},
+			Data:       map[string][]byte{"MASTER_PASSPHRASE": []byte("old")},
+		},
+	).Build()
+
+	(&controllerpkg.MasterKeyRunnable{Client: cli, Reader: cli, Namespace: ns}).Pass(t.Context())
+
+	ops := &passphrase.Ops{Client: cli, Secrets: passphrase.Secrets{Reader: cli, Namespace: ns}}
+
+	_, err := ops.Modify(t.Context(), []byte("old"), []byte("new"))
+	if err != nil {
+		t.Fatalf("modify: %v", err)
+	}
+
+	var sec corev1.Secret
+
+	_ = cli.Get(t.Context(), client.ObjectKey{Namespace: ns, Name: "p"}, &sec)
+	sec.Data["MASTER_PASSPHRASE"] = []byte("new")
+
+	if err := cli.Update(t.Context(), &sec); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	// The keyring as a watch that has not caught up holds it: the same
+	// content under an older resourceVersion.
+	stale := interceptor.NewClient(cli, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			err := c.Get(ctx, key, obj, opts...)
+			if err == nil && key.Name == passphrase.KeyringSecretName {
+				obj.SetResourceVersion("1")
+			}
+
+			return err
+		},
+	})
+
+	r := &controllerpkg.MasterKeyRunnable{Client: cli, Reader: stale, Direct: cli, Namespace: ns}
+	r.Pass(t.Context())
+
+	ring, _, err := ops.Secrets.Keyring(t.Context())
+	if err != nil || ring == nil {
+		t.Fatalf("keyring: %v", err)
+	}
+
+	if got := len(ring.Slots); got != 1 {
+		t.Fatalf("%d slots after the Secret moved, want 1: the write read the stale keyring", got)
 	}
 }

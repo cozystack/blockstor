@@ -21,6 +21,7 @@ package rest
 import (
 	"net/http"
 	"slices"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -101,9 +102,12 @@ func (s *Server) registerResourceToggleDisk(mux *http.ServeMux) {
 // new diskful copy lands in on the destination node, and the
 // optional `layer_list` is forwarded through Spec.LayerStack so the
 // satellite assembles the same stack as the source replica. Both
-// fields are optional: an empty `storage_pool` falls through to the
-// controller's auto-diskful pool picker on the destination node,
-// matching upstream LINSTOR's behaviour when no pool is supplied.
+// fields are optional: with an empty `storage_pool` the destination
+// replica takes the resource definition's StorPoolName, and without
+// one it has no pool, which the satellite reports as a failed apply
+// once its short wait for a pool is over. Nothing picks a pool for it
+// later: the auto-diskful controller stamps a pool only on the
+// replicas it promotes itself.
 type migrateDiskBody struct {
 	StoragePool string   `json:"storage_pool,omitempty"`
 	LayerList   []string `json:"layer_list,omitempty"`
@@ -116,8 +120,7 @@ type migrateDiskBody struct {
 //
 // An absent body is tolerated — the empty pool is forwarded to the
 // migrate helper, which leaves Spec.StoragePool unset on the
-// destination and lets the controller's auto-diskful path pick a
-// pool from the hosting node during the next reconcile.
+// destination (see migrateDiskBody for what that replica gets).
 func (s *Server) handleResourceMigrateDiskBodyless(w http.ResponseWriter, r *http.Request) {
 	var body migrateDiskBody
 
@@ -183,8 +186,10 @@ func (s *Server) migrateDiskCommon(w http.ResponseWriter, r *http.Request, pool 
 // handleResourceToggleDisk flips Spec.Flags["DISKLESS"] on the
 // named replica. Path-suffix `storage-pool/{pool}` (when present)
 // stamps that pool name on Spec.StoragePool when promoting to
-// diskful — without it, the controller's auto-diskful path picks
-// a pool from the hosting node.
+// diskful. Without it the replica keeps whatever pool it carries, or
+// takes the resource definition's StorPoolName; nothing picks one for
+// it later, and the satellite reports a diskful replica without a pool
+// as a failed apply once its short wait for a pool is over.
 //
 // Idempotent: toggling a diskful replica when no pool argument
 // was given drops the DISKLESS flag if currently set; toggling
@@ -230,6 +235,15 @@ func (s *Server) handleResourceToggleDisk(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// REST 1.28 says what to toggle into in the body; python-linstor sends
+	// every `r td` there once the controller advertises it. A request
+	// without a body is the flip this route did before.
+	if r.ContentLength != 0 {
+		s.toggleDiskByOperation(w, r)
+
+		return
+	}
+
 	var wasDiskless bool
 
 	err := s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node,
@@ -258,6 +272,80 @@ func (s *Server) handleResourceToggleDisk(w http.ResponseWriter, r *http.Request
 		RetCode: maskInfo,
 		Message: "resource '" + rdName + "' on '" + node + "' toggled to " + state,
 	}})
+}
+
+// toggleDiskRequest is LINSTOR's ToggleDiskRequest (REST 1.28).
+type toggleDiskRequest struct {
+	Operation   string   `json:"operation,omitempty"`
+	StoragePool string   `json:"storage_pool,omitempty"`
+	MigrateFrom string   `json:"migrate_from,omitempty"`
+	LayerList   []string `json:"layer_list,omitempty"`
+}
+
+// The operations of a toggle-disk request, matched case-insensitively as
+// LINSTOR's ToggleOp.parse does.
+const (
+	toggleIntoDiskful  = "into_drbd_diskful"
+	toggleIntoDiskless = "into_drbd_diskless"
+	toggleIntoClient   = "into_drbd_client"
+)
+
+// toggleDiskByOperation serves the REST 1.28 form of
+// `PUT .../resources/{node}/toggle-disk`: the body names the operation,
+// the storage pool and, for a migration, the node to migrate from. It
+// does what the older path forms do: `toggle-disk/diskful[/{pool}]`,
+// `toggle-disk/diskless` and `migrate-disk/{from}[/{pool}]`.
+//
+// INTO_DRBD_CLIENT, a diskless replica without a quorum vote, is refused:
+// blockstor renders no such replica. So is a layer list, which no toggle
+// here changes. A diskless storage pool is accepted and has no effect, as
+// blockstor keeps no diskless pools.
+func (s *Server) toggleDiskByOperation(w http.ResponseWriter, r *http.Request) {
+	var req toggleDiskRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if len(req.LayerList) > 0 {
+		writeError(w, http.StatusNotImplemented,
+			"toggle-disk with a layer list is not supported: the replica keeps the layers of its definition")
+
+		return
+	}
+
+	operation := strings.ToLower(req.Operation)
+
+	if req.MigrateFrom != "" {
+		if operation != "" && operation != toggleIntoDiskful {
+			writeError(w, http.StatusBadRequest,
+				"toggle-disk: migrate_from moves a disk, it needs operation INTO_DRBD_DISKFUL, not "+req.Operation)
+
+			return
+		}
+
+		r.SetPathValue("dst", r.PathValue("node"))
+		r.SetPathValue("src", req.MigrateFrom)
+		s.migrateDiskCommon(w, r, req.StoragePool)
+
+		return
+	}
+
+	switch operation {
+	case toggleIntoDiskful:
+		r.SetPathValue("pool", req.StoragePool)
+		s.handleResourceToggleDiskToDiskful(w, r)
+	case toggleIntoDiskless:
+		s.handleResourceToggleDiskToDiskless(w, r)
+	case toggleIntoClient:
+		writeError(w, http.StatusNotImplemented,
+			"toggle-disk INTO_DRBD_CLIENT is not supported: blockstor has no diskless replica without a "+
+				"quorum vote, use INTO_DRBD_DISKLESS")
+	case "":
+		writeError(w, http.StatusBadRequest, "No toggle operation type was specified")
+	default:
+		writeError(w, http.StatusBadRequest, "Could not parse '"+req.Operation+"'. Valid operations: "+
+			"INTO_DRBD_DISKFUL, INTO_DRBD_CLIENT, INTO_DRBD_DISKLESS")
+	}
 }
 
 // handleResourceToggleDiskToDiskless forces the replica to diskless,
@@ -296,8 +384,11 @@ func (s *Server) handleResourceToggleDiskToDiskless(w http.ResponseWriter, r *ht
 //
 // When {pool} is present we stamp it on Spec so the satellite picks
 // the requested pool when reattaching storage. When absent the
-// controller's auto-diskful path picks a pool on the hosting node
-// during the next reconcile. Idempotent: a replica that's already
+// replica keeps the pool it carries (a demote keeps it), or takes the
+// resource definition's StorPoolName. Nothing picks a pool for it
+// later: the auto-diskful controller stamps one only on the replicas
+// it promotes itself, so a replica left without one fails its apply
+// on the satellite once the satellite's short wait for a pool is over. Idempotent: a replica that's already
 // diskful stays diskful (and gets its pool re-stamped if one was
 // supplied).
 func (s *Server) handleResourceToggleDiskToDiskful(w http.ResponseWriter, r *http.Request) {

@@ -104,37 +104,6 @@ func TestAFailedParentReadNeverLetsADeletePassItsSnapshots(t *testing.T) {
 	}
 }
 
-// My_Node and my_node are outside RFC 1123: they hash to two CR names and are
-// two nodes. A snapshot targeting both is not successful on one entry.
-func TestSnapshotSuccessKeepsTwoNodesOfOneLowercaseApart(t *testing.T) {
-	t.Parallel()
-
-	diskful := map[string]struct{}{naming.Key("My_Node"): {}, naming.Key("my_node"): {}}
-	snap := &apiv1.Snapshot{
-		Nodes:     []string{"My_Node", "my_node"},
-		Snapshots: []apiv1.SnapshotPerNode{{NodeName: "my_node", CreateTimestamp: 1}},
-	}
-
-	if isSnapshotSuccessful(snap, diskful) {
-		t.Error("a snapshot reported on my_node alone reads as successful on My_Node too")
-	}
-}
-
-// An entry reported under the node's CR name matches the node as registered.
-func TestSnapshotSuccessMatchesAnEntryUnderTheCRName(t *testing.T) {
-	t.Parallel()
-
-	diskful := map[string]struct{}{naming.Key("My_Node"): {}}
-	snap := &apiv1.Snapshot{
-		Nodes:     []string{"My_Node"},
-		Snapshots: []apiv1.SnapshotPerNode{{NodeName: naming.Key("My_Node"), CreateTimestamp: 1}},
-	}
-
-	if !isSnapshotSuccessful(snap, diskful) {
-		t.Error("an entry under My_Node's CR name does not count for My_Node")
-	}
-}
-
 // A restore takes the pool of the source's replica on the node it lands on,
 // and My_Node's replica is not my_node's.
 func TestRestorePoolKeepsTwoNodesOfOneLowercaseApart(t *testing.T) {
@@ -158,9 +127,19 @@ func TestRestorePoolKeepsTwoNodesOfOneLowercaseApart(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("seed replica on %s: %v", node, err)
 		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{StoragePoolName: pool, NodeName: node}); err != nil {
+			t.Fatalf("seed pool on %s: %v", node, err)
+		}
 	}
 
-	byNode, _ := storPoolsByNodeFromSourceRD(ctx, st, "pvc-two")
+	snap := &apiv1.Snapshot{Name: "snap", ResourceName: "pvc-two", Nodes: []string{"My_Node", "my_node"}}
+
+	byNode, err := store.RestorePools(ctx, st, snap, snap.Nodes)
+	if err != nil {
+		t.Fatalf("restore pools: %v", err)
+	}
+
 	if got := byNode[naming.Key("My_Node")]; got != "pool-upper" {
 		t.Errorf("pool for My_Node = %q, want pool-upper", got)
 	}

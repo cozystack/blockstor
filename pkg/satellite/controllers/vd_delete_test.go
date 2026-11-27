@@ -48,8 +48,8 @@ const (
 )
 
 var (
-	errDatasetBusy = errors.New("dataset is busy")
-	errHeldOpen    = errors.New("device is held open by someone")
+	errVolumeBusy = errors.New("dataset is busy")
+	errHeldOpen   = errors.New("device is held open by someone")
 )
 
 // recordingProvider records the volumes deleted through it.
@@ -283,7 +283,7 @@ func TestDeleteFlaggedVolumesDoesNotConfirmAFailedDelete(t *testing.T) {
 	t.Parallel()
 
 	for name, providers := range map[string]map[string]storage.Provider{
-		"provider fails":    {vdDelPool: &recordingProvider{fail: errDatasetBusy}},
+		"provider fails":    {vdDelPool: &recordingProvider{fail: errVolumeBusy}},
 		"pool unregistered": {},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -424,7 +424,7 @@ func TestAFailedVolumeDeleteIsAWarningEvent(t *testing.T) {
 	f.rec.Config.Recorder = recorder
 
 	ok := []*intent.ResourceApplyResult{{Name: vdDelRD, Ok: true}}
-	if !f.rec.afterApply(t.Context(), f.res, f.rd, ok, logr.Discard()) {
+	if !f.rec.afterApply(t.Context(), f.res, f.rd, ok, logr.Discard()).failed {
 		t.Fatal("afterApply reported success for a delete that failed")
 	}
 
@@ -450,7 +450,7 @@ func TestAfterApplyDeletesNothingWhenTheApplyFailed(t *testing.T) {
 		})
 
 	failed := []*intent.ResourceApplyResult{{Name: vdDelRD, Ok: false, Message: "drbdadm adjust failed"}}
-	if !f.rec.afterApply(t.Context(), f.res, f.rd, failed, logr.Discard()) {
+	if !f.rec.afterApply(t.Context(), f.res, f.rd, failed, logr.Discard()).failed {
 		t.Error("afterApply reported success for a failed apply")
 	}
 
@@ -459,7 +459,7 @@ func TestAfterApplyDeletesNothingWhenTheApplyFailed(t *testing.T) {
 	}
 
 	ok := []*intent.ResourceApplyResult{{Name: vdDelRD, Ok: true}}
-	if f.rec.afterApply(t.Context(), f.res, f.rd, ok, logr.Discard()) {
+	if f.rec.afterApply(t.Context(), f.res, f.rd, ok, logr.Discard()).failed {
 		t.Error("afterApply reported a failure for an apply that went through")
 	}
 
@@ -523,7 +523,7 @@ func TestAfterAFailedApplyTheRemovedMinorsQuorumIsRechecked(t *testing.T) {
 				})
 
 			failed := []*intent.ResourceApplyResult{{Name: vdDelRD, Ok: false, Message: "drbdadm adjust failed"}}
-			if !f.rec.afterApply(t.Context(), f.res, f.rd, failed, logr.Discard()) {
+			if !f.rec.afterApply(t.Context(), f.res, f.rd, failed, logr.Discard()).failed {
 				t.Fatal("afterApply reported success for a failed apply")
 			}
 

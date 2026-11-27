@@ -20,6 +20,7 @@ package drbd
 
 import (
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -164,13 +165,12 @@ func IsUnknownResourceErr(err error) bool {
 // declarative form `drbdadm adjust` runs for any `disk none`
 // peer in the .res.
 //
-// Triggered when the controller re-allocates DRBDNodeID for a
-// returning TIE_BREAKER onto a peer-slot whose v09 metadata has
-// never been used (default-initialised non-zero bitmap-uuid
-// reads back as `peer-disk:Outdated`). A single full bring-up
-// cycle (`drbdadm down` + `drbdadm up`) flushes the in-memory
-// peer-disk state so the next `drbdadm adjust` accepts
-// `--bitmap=no` cleanly.
+// Triggered when a diskless replica (a TIE_BREAKER, typically)
+// comes up under a node-id whose metadata slot still holds a
+// diskful predecessor that was never forgotten: new-peer reads
+// the slot's peer-outdated flag and starts the peer device as
+// `peer-disk:Outdated`, so the kernel will not drop its bitmap.
+// BitmapDropPeerNodeIDs names the node-ids the refusal was for.
 //
 // The first failed adjust leaves a StandAlone slot with
 // peer-device entries registered (kernel allocated them via
@@ -190,4 +190,47 @@ func IsBitmapDropBothDisksErr(err error) bool {
 	// translations of surrounding kernel diagnostics don't
 	// false-match.
 	return strings.Contains(err.Error(), "Can not drop the bitmap")
+}
+
+// IsDeviceHeldOpenErr reports whether err is DRBD refusing a demote
+// because something still has the device open: `State change failed:
+// (-12) Device is held open by someone` (SS_DEVICE_IN_USE). The code is
+// negative, so drbdErrCodeRegex never sees it; the message is matched
+// as well for drbd-utils that print only the text.
+func IsDeviceHeldOpenErr(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	text := err.Error()
+
+	return strings.Contains(text, "(-12)") || strings.Contains(text, "held open by someone")
+}
+
+// bitmapDropCmdRegex picks the peer node-id out of the command line
+// drbdadm quotes for a failed `drbdsetup peer-device-options <res>
+// <peer-node-id> <vol> ... --bitmap=no`.
+var bitmapDropCmdRegex = regexp.MustCompile(`peer-device-options \S+ (\d+) \d+ [^'\n]*--bitmap=no`)
+
+// BitmapDropPeerNodeIDs returns the node-ids of the peers whose bitmap
+// the kernel refused to drop in err, in the order drbdadm reported
+// them and without repeats. Empty when err is not that refusal or does
+// not quote the command.
+func BitmapDropPeerNodeIDs(err error) []int32 {
+	if !IsBitmapDropBothDisksErr(err) {
+		return nil
+	}
+
+	var ids []int32
+
+	for _, m := range bitmapDropCmdRegex.FindAllStringSubmatch(err.Error(), -1) {
+		id, convErr := strconv.ParseInt(m[1], 10, 32)
+		if convErr != nil || slices.Contains(ids, int32(id)) {
+			continue
+		}
+
+		ids = append(ids, int32(id))
+	}
+
+	return ids
 }

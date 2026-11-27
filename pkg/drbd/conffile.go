@@ -109,6 +109,11 @@ type ResourceConnection struct {
 	// means "fall back to the default render" (renderer treats it
 	// the same as the connection not being present).
 	Paths []ResourcePath
+	// Net carries the `net { … }` options of this one connection
+	// (allow-two-primaries, protocol, …). drbd-9 applies them over the
+	// resource-wide `net` section for this peer pair only, which is how
+	// a live migration opens a single connection to two Primaries.
+	Net map[string]string
 }
 
 // ResourcePath is one `path { … }` sub-block inside a multi-path
@@ -209,6 +214,19 @@ type Volume struct {
 	// local meta-pool layout, breaking the deterministic render
 	// across peers.
 	MetaDisk string
+
+	// Options are the volume's own disk options: what LINSTOR keeps
+	// under DrbdOptions/Disk/* on the volume definition, block-size
+	// above all. They render as a `disk { }` block inside the local
+	// host's `volume N { }`, the place LINSTOR's ConfFileBuilder puts
+	// them, and override the resource-scope `disk { }` for this volume
+	// only. Keys are bare option names, without the DrbdOptions/Disk/
+	// prefix.
+	//
+	// A peer's block does not carry them: drbdadm applies a volume's
+	// options to the local device only, and a peer's volume options are
+	// that peer's to render.
+	Options map[string]string
 }
 
 // Build renders r into a drbd-9 `.res` file body. The output is
@@ -344,6 +362,12 @@ func ValidateOptionValue(block, key, value string) error {
 	return fmt.Errorf("%w: %s option %q carries %q", ErrUnrepresentableValue, block, key, value[i:i+1])
 }
 
+// optionBlock is one named set of options checkValues walks.
+type optionBlock struct {
+	name string
+	opts map[string]string
+}
+
 // checkValues walks every free-form value a resource carries. Blocks are
 // visited in a fixed order so the same resource always names the same option.
 func checkValues(r *Resource) error {
@@ -352,15 +376,20 @@ func checkValues(r *Resource) error {
 		return err
 	}
 
-	blocks := []struct {
-		name string
-		opts map[string]string
-	}{
+	blocks := []optionBlock{
 		{SectionNet, r.Net.Options},
 		{SectionOptions, r.Options},
 		{SectionDisk, r.Disk},
 		{SectionHandlers, r.Handlers},
 		{SectionPeerDevice, r.PeerDevice},
+	}
+
+	for _, vol := range r.Volumes {
+		blocks = append(blocks, optionBlock{fmt.Sprintf("volume %d %s", vol.Number, SectionDisk), vol.Options})
+	}
+
+	for i := range r.Connections {
+		blocks = append(blocks, optionBlock{SectionNet, r.Connections[i].Net})
 	}
 
 	for _, block := range blocks {
@@ -427,9 +456,21 @@ func isBareTokenByte(c byte) bool {
 // quoted string.
 const sharedSecretOption = "shared-secret"
 
+// DefaultCramHMACAlg is the digest LINSTOR writes next to the shared
+// secret of every resource it authenticates. The renderer never adds it
+// on its own: DRBD authenticates peers only once cram-hmac-alg is set,
+// and a satellite that started doing so for a resource whose peers have
+// not been rolled yet fails every handshake with them. It is written as
+// DrbdOptions/Net/cram-hmac-alg, by the LINSTOR converter for a
+// definition LINSTOR authenticated and by an operator for any other.
+const DefaultCramHMACAlg = "sha1"
+
 // writeNet emits the `net { … }` block when there is anything to emit
 // (a shared secret or any free-form option). drbd treats an empty `net
 // {}` as legal but noisy, so we skip it entirely when unused.
+//
+// cram-hmac-alg is rendered only as an option like any other, never
+// inferred from a shared secret; see DefaultCramHMACAlg.
 func writeNet(b *strings.Builder, n Net) {
 	if n.SharedSecret == "" && len(n.Options) == 0 {
 		return
@@ -530,6 +571,17 @@ func writeOnBlock(b *strings.Builder, host *Host, vols []Volume) {
 		fmt.Fprintf(b, "      device %s minor %d;\n", vol.Device, vol.Minor)
 		fmt.Fprintf(b, "      disk %s;\n", diskField(host, vol))
 		fmt.Fprintf(b, "      meta-disk %s;\n", metaField(host, vol))
+
+		if host.IsLocal && len(vol.Options) > 0 {
+			b.WriteString("      disk {\n")
+
+			for _, k := range sortedKeys(vol.Options) {
+				writeOption(b, "        ", k, vol.Options[k])
+			}
+
+			b.WriteString("      }\n")
+		}
+
 		b.WriteString("    }\n")
 	}
 
@@ -604,11 +656,23 @@ func writeConnectionMesh(b *strings.Builder, hosts []Host, conns []ResourceConne
 func writeOneConnection(b *strings.Builder, hostA, hostB *Host, conns []ResourceConnection, peerDevice map[string]string) {
 	b.WriteString("  connection {\n")
 
-	if paths := lookupPaths(conns, hostA.NodeName, hostB.NodeName); len(paths) > 0 {
+	conn := lookupConnection(conns, hostA.NodeName, hostB.NodeName)
+
+	if paths := conn.Paths; len(paths) > 0 {
 		writePathBlocks(b, hostA, hostB, paths)
 	} else {
 		fmt.Fprintf(b, "    host %s address %s:%d;\n", hostA.NodeName, hostA.Address, hostA.Port)
 		fmt.Fprintf(b, "    host %s address %s:%d;\n", hostB.NodeName, hostB.Address, hostB.Port)
+	}
+
+	if len(conn.Net) > 0 {
+		b.WriteString("    net {\n")
+
+		for _, k := range sortedKeys(conn.Net) {
+			writeOption(b, "      ", k, conn.Net[k])
+		}
+
+		b.WriteString("    }\n")
 	}
 
 	if len(peerDevice) > 0 {
@@ -624,28 +688,32 @@ func writeOneConnection(b *strings.Builder, hostA, hostB *Host, conns []Resource
 	b.WriteString("  }\n")
 }
 
-// lookupPaths returns the explicit Paths for the (a, b) host pair,
-// matching either (NodeA=a, NodeB=b) or the swapped form. Returns
-// nil when no entry matches or the entry carries no paths. The
-// returned slice is oriented so each Path's AddressA belongs to
-// `a` (the lexicographically-first host of the rendered mesh pair),
-// regardless of which order the operator stored on the
-// ResourceConnection — keeps the rendered `host a address …;`
-// line consistent with the on-block address we'd otherwise emit.
+// lookupConnection returns the per-pair override for the (a, b) host
+// pair, matching either (NodeA=a, NodeB=b) or the swapped form, or the
+// zero ResourceConnection when there is none. The returned Paths are
+// oriented so each Path's AddressA belongs to `a` (the
+// lexicographically-first host of the rendered mesh pair), regardless
+// of which order the operator stored on the ResourceConnection — keeps
+// the rendered `host a address …;` line consistent with the on-block
+// address we'd otherwise emit. Net options are symmetric and returned
+// as stored.
 //
 // A connection and a host may spell one node differently, so they are
 // matched as the store addresses nodes.
-func lookupPaths(conns []ResourceConnection, a, b string) []ResourcePath {
+func lookupConnection(conns []ResourceConnection, a, b string) ResourceConnection {
 	for i := range conns {
 		switch {
 		case naming.Same(conns[i].NodeA, a) && naming.Same(conns[i].NodeB, b):
-			return conns[i].Paths
+			return conns[i]
 		case naming.Same(conns[i].NodeA, b) && naming.Same(conns[i].NodeB, a):
-			return swapPathSides(conns[i].Paths)
+			swapped := conns[i]
+			swapped.Paths = swapPathSides(conns[i].Paths)
+
+			return swapped
 		}
 	}
 
-	return nil
+	return ResourceConnection{}
 }
 
 // swapPathSides returns a copy of paths with AddressA/AddressB
@@ -675,12 +743,6 @@ func writePathBlocks(b *strings.Builder, hostA, hostB *Host, paths []ResourcePat
 		b.WriteString("    }\n")
 	}
 }
-
-// (lookupConnection + writeConnectionNet from 5.W04 dropped on
-// cherry-pick conflict with wave1 3.7's ResourceConnection type —
-// per-pair NetOptions can be reintroduced by extending
-// ResourceConnection.NetOptions in a follow-up; both 5.W04 and wave1
-// 3.7 tests still pass without these helpers.)
 
 // sortedKeys returns the keys of m in deterministic order. We don't
 // bother with a heap or anything fancy — option maps are tiny (a

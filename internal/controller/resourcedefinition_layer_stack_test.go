@@ -152,10 +152,10 @@ func TestPinLayerStackGivesAFreshRDItsGroupsStack(t *testing.T) {
 	}
 }
 
-// Nothing watches a group's stack on an RD's behalf: an RD whose group
-// has no stack yet picks one up only on its next reconcile, which the
-// controller schedules every time.
-func TestPinLayerStackComesBackForAGroupWithoutAStack(t *testing.T) {
+// An RD whose group has no stack yet is left unpinned and waits for the
+// group's change (groupLayerStackChanged) rather than coming back on a
+// timer.
+func TestPinLayerStackWaitsForAGroupWithoutAStack(t *testing.T) {
 	t.Parallel()
 
 	got := reconcilePin(t, pinClient(t, pinGroup(), pinRD("rg-pin")))
@@ -163,8 +163,12 @@ func TestPinLayerStackComesBackForAGroupWithoutAStack(t *testing.T) {
 		t.Fatalf("reconcile: %v", got.err)
 	}
 
-	if got.result.RequeueAfter != controllerpkg.RDReconcileRequeue {
-		t.Errorf("requeue after %v, want %v", got.result.RequeueAfter, controllerpkg.RDReconcileRequeue)
+	if len(got.rd.Spec.LayerStack) != 0 {
+		t.Errorf("pinned %v from a group with no stack", got.rd.Spec.LayerStack)
+	}
+
+	if got.result.RequeueAfter != 0 {
+		t.Errorf("requeue after %v, want none", got.result.RequeueAfter)
 	}
 }
 
@@ -402,8 +406,8 @@ func TestPinLayerStackDoesNotOverwriteARacingWriter(t *testing.T) {
 	})
 
 	got := reconcilePin(t, cli)
-	if got.err == nil {
-		t.Fatal("reconcile succeeded over a racing writer")
+	if got.err != nil || !got.result.Requeue { //nolint:staticcheck // the rate-limited retry an error would get
+		t.Fatalf("reconcile: %+v, %v, want the lost race retried without an error", got.result, got.err)
 	}
 
 	if !slices.Equal(got.rd.Spec.LayerStack, []string{"DRBD", "STORAGE"}) {
@@ -514,5 +518,41 @@ func TestUnappliedGroupStackSurvivesAGroupFlap(t *testing.T) {
 
 	if len(got.events) != 1 || !strings.HasPrefix(got.events[0], "Warning LayerStackNotInherited") {
 		t.Errorf("events %v, want one LayerStackNotInherited warning", got.events)
+	}
+}
+
+// A storage-only copy in a group that replicates, which is what a storage-only
+// snapshot restored into a replicated class becomes, is flagged with a warning
+// that says its further replicas will not sync; a copy short only of LUKS is
+// not told that.
+func TestUnappliedGroupStackWarnsAStorageOnlyCopyItDoesNotReplicate(t *testing.T) {
+	t.Parallel()
+
+	const note = "does not receive this one's writes"
+
+	for name, tc := range map[string]struct {
+		group, rd []string
+		wantNote  bool
+	}{
+		"storage-only copy in a DRBD group": {group: []string{"DRBD", "STORAGE"}, rd: []string{"STORAGE"}, wantNote: true},
+		"plaintext copy in a LUKS group":    {group: luksStack, rd: []string{"DRBD", "STORAGE"}},
+		"storage-only copy in a LUKS group": {group: []string{"LUKS", "STORAGE"}, rd: []string{"STORAGE"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got := reconcilePin(t, pinClient(t, pinGroup(tc.group...), pinRD("rg-pin", tc.rd...)))
+			if got.err != nil {
+				t.Fatalf("reconcile: %v", got.err)
+			}
+
+			if len(got.events) != 1 || !strings.HasPrefix(got.events[0], "Warning LayerStackNotInherited") {
+				t.Fatalf("events %v, want one LayerStackNotInherited warning", got.events)
+			}
+
+			if strings.Contains(got.events[0], note) != tc.wantNote {
+				t.Errorf("event %q, want the note that replicas do not sync: %v", got.events[0], tc.wantNote)
+			}
+		})
 	}
 }

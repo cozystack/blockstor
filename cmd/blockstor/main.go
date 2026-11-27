@@ -48,6 +48,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -105,8 +107,8 @@ func openStore(ctx context.Context) (store.Store, error) {
 // openKube builds the raw client plus the namespace the controller
 // runs in, for the few commands that reach objects outside the CRD
 // surface (the cluster passphrase lives in a Secret).
-func openKube(context.Context) (ctrlclient.Client, string, error) {
-	cfg, err := config.GetConfig()
+func openKube(ctx context.Context) (ctrlclient.Client, string, error) {
+	cfg, err := restConfig(cli.KubeTargetFrom(ctx))
 	if err != nil {
 		return nil, "", fmt.Errorf("load kubeconfig: %w", err)
 	}
@@ -129,6 +131,22 @@ func openKube(context.Context) (ctrlclient.Client, string, error) {
 	}
 
 	return c, namespace(), nil
+}
+
+// restConfig loads the cluster configuration. Without --kubeconfig or
+// --context it is the ambient one, in-cluster fallback included. With
+// either, it is that file or context and nothing else, so a workstation
+// with several clusters configured reads the one the operator named.
+func restConfig(target cli.KubeTarget) (*rest.Config, error) {
+	if target == (cli.KubeTarget{}) {
+		return config.GetConfig() //nolint:wrapcheck // the caller wraps it
+	}
+
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	rules.ExplicitPath = target.Kubeconfig
+
+	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig( //nolint:wrapcheck // the caller wraps it
+		rules, &clientcmd.ConfigOverrides{CurrentContext: target.Context}).ClientConfig()
 }
 
 // namespace resolves where the controller's own objects live — the

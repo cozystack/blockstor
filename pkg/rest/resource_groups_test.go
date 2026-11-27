@@ -319,18 +319,76 @@ func TestRGModifyStampsRebalanceAnnotationOnPlaceCountIncrease(t *testing.T) {
 	}
 }
 
-// TestRGModifyNoAnnotationOnPlaceCountDecrease: scale-DOWN is not a
-// rebalance trigger. Upstream LINSTOR's rebalance is strictly
-// additive — shedding replicas requires explicit `linstor r d`. So a
-// PUT that lowers PlaceCount must NOT stamp the rebalance annotation
-// (no churn of the reconciler, no surprise replica deletions).
-func TestRGModifyNoAnnotationOnPlaceCountDecrease(t *testing.T) {
+// TestRGModifyMarksANamedPlaceCount: the rebalance pass places
+// without the balance checks only for a modify whose request names a
+// place count, the one LINSTOR's own `rg modify` places replicas for.
+// LINSTOR does so whether the count went up, down or stayed the same:
+// it autoplaces every child below the named count. A modify that
+// changes a placement constraint alone still schedules a rebalance,
+// but without the place-count marker, so a definition kept only by its
+// snapshots gets no fresh replicas from it.
+func TestRGModifyMarksANamedPlaceCount(t *testing.T) {
+	cases := []struct {
+		name       string
+		body       string
+		wantMarker bool
+	}{
+		{name: "layer stack only", body: `{"select_filter":{"layer_stack":["DRBD","STORAGE"]}}`, wantMarker: false},
+		{name: "place count raised", body: `{"select_filter":{"place_count":3}}`, wantMarker: true},
+		{name: "place count unchanged", body: `{"select_filter":{"place_count":2}}`, wantMarker: true},
+		{name: "place count lowered", body: `{"select_filter":{"place_count":1}}`, wantMarker: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := store.NewInMemory()
+			ctx := t.Context()
+
+			if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+				Name:         "rg-1",
+				SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 2},
+			}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+
+			base, stop := startServerWithStore(t, st)
+			defer stop()
+
+			resp := httpPut(t, base+"/v1/resource-groups/rg-1", []byte(tc.body))
+			_ = resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status: got %d, want 200", resp.StatusCode)
+			}
+
+			got, err := st.ResourceGroups().Get(ctx, "rg-1")
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+
+			if _, ok := got.Annotations[apiv1.AnnotationRGRebalancePending]; !ok {
+				t.Fatalf("rebalance not scheduled; annotations=%v", got.Annotations)
+			}
+
+			if _, ok := got.Annotations[apiv1.AnnotationRGRebalancePlaceCount]; ok != tc.wantMarker {
+				t.Fatalf("place-count marker present=%v, want %v; annotations=%v",
+					ok, tc.wantMarker, got.Annotations)
+			}
+		})
+	}
+}
+
+// TestRGModifyKeepsThePlaceCountMarker: the REST handler only ever sets
+// the marker. A constraint-only modify that lands on top of one naming
+// a place count, before the rebalance pass ran, must not take the
+// place count's placement away.
+func TestRGModifyKeepsThePlaceCountMarker(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
 	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
 		Name:         "rg-1",
-		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 3},
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 2},
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -338,15 +396,16 @@ func TestRGModifyNoAnnotationOnPlaceCountDecrease(t *testing.T) {
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	body, _ := json.Marshal(apiv1.ResourceGroup{
-		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 2},
-	})
+	for _, body := range []string{
+		`{"select_filter":{"place_count":3}}`,
+		`{"select_filter":{"replicas_on_same":["Aux/zone"]}}`,
+	} {
+		resp := httpPut(t, base+"/v1/resource-groups/rg-1", []byte(body))
+		_ = resp.Body.Close()
 
-	resp := httpPut(t, base+"/v1/resource-groups/rg-1", body)
-	_ = resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: status: got %d, want 200", body, resp.StatusCode)
+		}
 	}
 
 	got, err := st.ResourceGroups().Get(ctx, "rg-1")
@@ -354,8 +413,8 @@ func TestRGModifyNoAnnotationOnPlaceCountDecrease(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 
-	if _, ok := got.Annotations[apiv1.AnnotationRGRebalancePending]; ok {
-		t.Errorf("scale-down must not stamp rebalance annotation; got %v", got.Annotations)
+	if _, ok := got.Annotations[apiv1.AnnotationRGRebalancePlaceCount]; !ok {
+		t.Fatalf("a later constraint-only modify cleared the place-count marker; annotations=%v", got.Annotations)
 	}
 }
 
@@ -1351,8 +1410,9 @@ func TestSpawnInheritsLayerListDRBDLUKSStorage_W10(t *testing.T) {
 	}
 
 	// The LUKS slot must sit BETWEEN DRBD and STORAGE — DRBD-above-
-	// LUKS means DRBD replicates ciphertext (the whole point of the
-	// allowed ordering), and STORAGE-terminal anchors the disk
+	// LUKS is the arrangement where each node encrypts its own storage
+	// independently (DRBD's lower disk is the mapper, so the wire
+	// carries plaintext), and STORAGE-terminal anchors the disk
 	// backend at the bottom of the chain.
 	drbdIdx := -1
 	luksIdx := -1

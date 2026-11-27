@@ -23,8 +23,11 @@ limitations under the License.
 package storetest
 
 import (
+	"maps"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -688,6 +691,7 @@ func testSnapshotUpdateNilArg(t *testing.T, newStore Factory) {
 func RunResourceStore(t *testing.T, newStore Factory) {
 	t.Helper()
 	t.Run("AnySpellingAddressesOneReplica", func(t *testing.T) { testAnySpellingAddressesOneReplica(t, newStore) })
+	t.Run("DeleteDropsConnectionProps", func(t *testing.T) { testResourceDeleteDropsConnectionProps(t, newStore) })
 	t.Run("ListEmpty", func(t *testing.T) {
 		got, err := newStore(t).Resources().List(t.Context())
 		if err != nil {
@@ -1243,6 +1247,9 @@ func RunResourceDefinitionStore(t *testing.T, newStore Factory) {
 		if !errors.Is(err, store.ErrAlreadyExists) {
 			t.Errorf("dup: got %v, want ErrAlreadyExists", err)
 		}
+	})
+	t.Run("CreateRefusedOverDrainingReplicas", func(t *testing.T) {
+		testRDCreateRefusedOverDrainingReplicas(t, newStore)
 	})
 	t.Run("GetMissing", func(t *testing.T) {
 		_, err := newStore(t).ResourceDefinitions().Get(t.Context(), "ghost")
@@ -2304,6 +2311,56 @@ func testAnySpellingAddressesOneNode(t *testing.T, newStore Factory) {
 	}
 }
 
+// testRDCreateRefusedOverDrainingReplicas: a definition deleted while one of
+// its nodes is down leaves that node's replica draining under the name. A new
+// definition of the same name is refused until it is gone, as LINSTOR, which
+// keeps the old definition until then, refuses it; a replica that is not
+// being deleted does not hold the name.
+func testRDCreateRefusedOverDrainingReplicas(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-d"}); err != nil {
+		t.Fatalf("Create definition: %v", err)
+	}
+
+	draining := apiv1.Resource{Name: "pvc-d", NodeName: "node-down", Flags: []string{apiv1.ResourceFlagDelete}}
+	if err := s.Resources().Create(ctx, &draining); err != nil {
+		t.Fatalf("Create draining replica: %v", err)
+	}
+
+	if err := s.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-d", NodeName: "node-up"}); err != nil {
+		t.Fatalf("Create orphan replica: %v", err)
+	}
+
+	if err := s.ResourceDefinitions().Delete(ctx, "pvc-d"); err != nil {
+		t.Fatalf("Delete definition: %v", err)
+	}
+
+	err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-d"})
+	if !errors.Is(err, store.ErrDefinitionReplicasDraining) || !errors.Is(err, store.ErrAlreadyExists) {
+		t.Fatalf("Create over a draining replica = %v, want ErrDefinitionReplicasDraining and ErrAlreadyExists", err)
+	}
+
+	if !strings.Contains(err.Error(), "node-down") || strings.Contains(err.Error(), "node-up") {
+		t.Errorf("refusal %q should name the draining replica's node and only it", err)
+	}
+
+	if _, getErr := s.ResourceDefinitions().Get(ctx, "pvc-d"); !errors.Is(getErr, store.ErrNotFound) {
+		t.Errorf("Get after the refused create = %v, want ErrNotFound", getErr)
+	}
+
+	if err := s.Resources().Delete(ctx, "pvc-d", "node-down"); err != nil {
+		t.Fatalf("Delete draining replica: %v", err)
+	}
+
+	if err := s.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-d"}); err != nil {
+		t.Errorf("Create once the draining replica is gone: %v", err)
+	}
+}
+
 // testAnySpellingAddressesOneReplica: a replica is addressed by the keys of
 // its definition's and its node's names.
 func testAnySpellingAddressesOneReplica(t *testing.T, newStore Factory) {
@@ -2489,4 +2546,77 @@ func testListByNodeUnderAnySpelling(t *testing.T, newStore Factory) {
 			t.Errorf("ListByNode %q found %d replica(s), want 1", asked, len(got))
 		}
 	}
+}
+
+// testResourceDeleteDropsConnectionProps pins that a replica delete takes
+// the resource-connection props of its node along, on whichever path it
+// runs (CLI, lost-node cascade, tiebreaker reap), not only on the REST
+// one: a replica created on the node later must not inherit a stale
+// allow-two-primaries. The connections of the other nodes stay.
+func testResourceDeleteDropsConnectionProps(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	st := newStore(t)
+	ctx := t.Context()
+
+	ab := apiv1.ResourceConnectionPropKey("n1", "n2", "DrbdOptions/Net/allow-two-primaries")
+	ac := apiv1.ResourceConnectionPropKey("n1", "n3", "DrbdOptions/Net/protocol")
+	bc := apiv1.ResourceConnectionPropKey("n2", "n3", "DrbdOptions/Net/protocol")
+
+	err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:  "pvc-conn",
+		Props: map[string]string{ab: "yes", ac: "C", bc: "C", "DrbdOptions/Net/protocol": "A"},
+	})
+	if err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, node := range []string{"n1", "n2", "n3"} {
+		flags := []string{}
+		if node == "n3" {
+			flags = []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker}
+		}
+
+		err = st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-conn", NodeName: node, Flags: flags})
+		if err != nil {
+			t.Fatalf("seed replica on %s: %v", node, err)
+		}
+	}
+
+	if err = st.Resources().Delete(ctx, "pvc-conn", "n2"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	waitForProps(t, st, "pvc-conn", map[string]string{ac: "C", "DrbdOptions/Net/protocol": "A"})
+
+	reaped, err := st.Resources().DeleteIfTieBreaker(ctx, "pvc-conn", "n3")
+	if err != nil || !reaped {
+		t.Fatalf("DeleteIfTieBreaker: %v, %v", reaped, err)
+	}
+
+	waitForProps(t, st, "pvc-conn", map[string]string{"DrbdOptions/Net/protocol": "A"})
+}
+
+// waitForProps polls the definition until its props are want: a
+// Kubernetes-backed store reads through an informer cache.
+func waitForProps(t *testing.T, st store.Store, rdName string, want map[string]string) {
+	t.Helper()
+
+	var got map[string]string
+
+	for range 100 {
+		rd, err := st.ResourceDefinitions().Get(t.Context(), rdName)
+		if err != nil {
+			t.Fatalf("Get RD: %v", err)
+		}
+
+		got = rd.Props
+		if maps.Equal(got, want) {
+			return
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	t.Fatalf("RD props\n got %v\nwant %v", got, want)
 }

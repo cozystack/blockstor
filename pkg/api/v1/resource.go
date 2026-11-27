@@ -28,13 +28,19 @@ package v1
 // `linstor r list`, so emitting nothing crashes the CLI with
 // AttributeError.
 type Resource struct {
-	Name        string            `json:"name"`
-	NodeName    string            `json:"node_name"`
-	Props       map[string]string `json:"props,omitempty"`
-	Flags       []string          `json:"flags,omitempty"`
-	State       ResourceState     `json:"state,omitzero"`
-	UUID        string            `json:"uuid,omitempty"`
-	LayerObject *ResourceLayer    `json:"layer_object,omitempty"`
+	Name     string            `json:"name"`
+	NodeName string            `json:"node_name"`
+	Props    map[string]string `json:"props,omitempty"`
+	Flags    []string          `json:"flags,omitempty"`
+
+	// State is always sent, as `{}` when nothing in it is known.
+	// linstor-csi counts a replica without a state object as faulty
+	// and raises VolumeConditionAbnormal for its volume. LINSTOR
+	// sends `{}` for a STORAGE-topped replica, whose in_use it never
+	// learns, so an empty state must stay on the wire.
+	State       ResourceState  `json:"state"`
+	UUID        string         `json:"uuid,omitempty"`
+	LayerObject *ResourceLayer `json:"layer_object,omitempty"`
 
 	// Annotations carries the K8s-native metadata.annotations of the
 	// backing Resource CRD. Used by Bug 67's `PeerChangedAnnotation`
@@ -55,6 +61,21 @@ type Resource struct {
 	// Bug 40. The CSI driver never sets this; only the REST surface
 	// flips it.
 	ToggleDiskCancel bool `json:"toggle_disk_cancel,omitempty"`
+
+	// SatelliteIncarnation names the satellite process that reported
+	// the runtime state this replica carries (CRD
+	// `Status.SatelliteIncarnation`). Not on the wire: it only lets a
+	// read tell a report from the running satellite from one an earlier
+	// process left behind (ForgetStaleSatelliteState).
+	SatelliteIncarnation string `json:"-"`
+
+	// KernelSlotDestroyed is set when the satellite last saw the
+	// replica's DRBD kernel resource destroyed (CRD Condition
+	// KernelLoaded=False) and the stored status agrees: no volume
+	// keeps a disk state and no peer link is left. Not on the wire:
+	// like SatelliteIncarnation it only tells a read to answer the
+	// replica with no satellite state (ForgetStaleSatelliteState).
+	KernelSlotDestroyed bool `json:"-"`
 
 	// Volumes is the per-replica volume slice — sourced from
 	// Resource.Status.Volumes which the satellite observer writes.
@@ -103,6 +124,20 @@ type Resource struct {
 	// time, matching upstream's per-resource timestamp. Set only on
 	// the read path (crdToWireResource); ignored on writes.
 	CreateTimestamp int64 `json:"create_timestamp,omitempty"`
+
+	// ApplyFailure is the error of the satellite's last apply pass on
+	// this replica, nil when that pass succeeded (Resource status).
+	// Internal: LINSTOR reports a satellite's error in the answer to
+	// the call that triggered the pass, and this is what lets a
+	// resize do the same.
+	ApplyFailure *ApplyFailure `json:"-"`
+}
+
+// ApplyFailure is the error of a failed satellite apply pass, with the
+// definition size of each volume that pass was applying.
+type ApplyFailure struct {
+	Message  string
+	SizesKib map[int32]int64
 }
 
 // ResourceState is the runtime state surface of a Resource.
@@ -192,14 +227,24 @@ type Volume struct {
 	// to a literal "Created" regardless of what disk_state we set.
 	// listMapKey type matches upstream's repeated layer_data shape.
 	LayerDataList []VolumeLayerData `json:"layer_data_list,omitempty"`
+
+	// AppliedSizeKib is the volume definition size the satellite has
+	// finished applying on this replica (Resource status), 0 when it
+	// never reported one. Internal: LINSTOR has no such field, it is
+	// what the REST layer reads to answer a resize only once the
+	// device has grown.
+	AppliedSizeKib int64 `json:"-"`
 }
 
 // VolumeLayerData mirrors upstream LINSTOR's per-volume layer
-// descriptor: a `type` (DRBD/STORAGE/LUKS/…) plus an opaque
-// `data` blob (we leave it empty for now — the CLI only reads
-// the type discriminator to gate the disk_state trust path).
+// descriptor: a `type` (DRBD/STORAGE/LUKS/…) plus the layer's `data`.
+// Only the STORAGE layer of a replica with a disk carries data: the
+// sizes linstor-csi adds up to the capacity a thin pool has promised
+// (ReservedCapacity) when a StorageClass sets overProvision. The CLI
+// only reads the type discriminator to gate the disk_state trust path.
 type VolumeLayerData struct {
-	Type string `json:"type"`
+	Type string              `json:"type"`
+	Data *StorageVolumeLayer `json:"data,omitempty"`
 }
 
 // VolumeState is the runtime state surface of a Volume.
@@ -212,11 +257,15 @@ type VolumeState struct {
 	// full initial-sync (Phase 8.1).
 	CurrentGi string `json:"current_gi,omitempty"`
 
-	// OutOfSyncKib is the worst-case "how many KiB this replica is
-	// behind any peer" reported by `drbdsetup events2 --statistics`
-	// peer-device frames. UI/CLI compute a sync-progress %:
-	//   progress = (1 - OutOfSyncKib / VolumeDefinition.SizeKib) * 100
-	// 0 means fully in sync.
+	// OutOfSyncKib is the largest out-of-sync count over this
+	// volume's peers, as `drbdsetup events2 --statistics` peer-device
+	// frames report it. 0 means in sync with every peer. It is not a
+	// resync progress once a replica has more than one peer; that is
+	// ReplicationStates[peer].DonePercentage. While the volume is
+	// UpToDate and no peer resyncs with the replica, a change that
+	// keeps the count non-zero can arrive up to 5 minutes late; a
+	// change to or from 0, and any change during a resync, arrives at
+	// once.
 	OutOfSyncKib int64 `json:"out_of_sync_kib,omitempty"`
 
 	// ReplicationStates is the per-peer replication-state map the
@@ -237,11 +286,10 @@ type ReplicationState struct {
 	// `VerifyS/T`, `Ahead`, `Behind`, `Off`, `WFBitMap*`, etc.
 	ReplicationState string `json:"replication_state,omitempty"`
 
-	// DonePercentage is a float in [0, 100] giving the syncing
-	// progress for `SyncTarget` / `PausedSync*` / `VerifyT` states.
-	// nil for `Established` (nothing to sync) — the JSON `omitempty`
-	// drops it when 0 too, which is fine: the CLI renders "?" when
-	// the field is absent.
+	// DonePercentage is DRBD's `done` for the resync running with
+	// this peer, in [0, 100], measured against that resync's total.
+	// nil while no resync with the peer runs; the CLI renders "?"
+	// for a syncing peer without it.
 	DonePercentage *float64 `json:"done_percentage,omitempty"`
 }
 
@@ -281,6 +329,12 @@ type ResourceModify struct {
 	LayerObject      *ResourceLayer    `json:"layer_object,omitempty"`
 	Annotations      map[string]string `json:"annotations,omitempty"`
 	ToggleDiskCancel bool              `json:"toggle_disk_cancel,omitempty"`
+	// DrbdTiebreaker and DrbdClient (REST 1.28) turn a diskless replica
+	// into a tiebreaker or a diskless replica without a quorum vote, or
+	// back. blockstor refuses both, apart from drbd_client=false, which
+	// every replica here already is.
+	DrbdTiebreaker *bool `json:"drbd_tiebreaker,omitempty"`
+	DrbdClient     *bool `json:"drbd_client,omitempty"`
 	// NO `omitempty` here: mirrors Resource.Volumes / ResourceWithVolumes.Volumes
 	// (Bug 137 follow-up). GET emits `volumes` even when nil/empty;
 	// the operator's round-trip pipes the same wire shape back.

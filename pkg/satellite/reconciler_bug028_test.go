@@ -103,16 +103,21 @@ func expectGetGI(fx *storage.FakeExec, rd, device, currentGI string) {
 		storage.FakeResponse{Stdout: []byte(currentGI + ":0000000000000000:0:0:1:1:0:0:0:0\n")})
 }
 
-// expectDrbdMetaSignature cans the blkid answer real hardware gives
-// for the BACKING device of an internal-metadata DRBD volume: libblkid
-// recognises the DRBD meta superblock at the device tail and reports
-// TYPE=drbd even on a never-formatted volume (stand forensics,
-// bug028-fix-validation-20260612-054452/iter2). The BUG-028 probes
-// MUST read this as "no user filesystem" — the naive any-TYPE= probe
-// wedged both the bypass and the latch-free retry forever.
+// backingProbe is the filesystem-only low-level blkid probe the BUG-028
+// gates run on a backing device.
+func backingProbe(device string) string {
+	return "blkid -p -n nodrbd -o export " + device
+}
+
+// expectDrbdMetaSignature cans the answer real hardware gives for the
+// BACKING device of a never-formatted internal-metadata DRBD volume. A
+// plain blkid reports TYPE=drbd there (libblkid stops at the DRBD meta
+// superblock at the device tail; stand forensics,
+// bug028-fix-validation-20260612-054452/iter2); the probe without the
+// DRBD prober skips that superblock and finds nothing, exit 2. The
+// BUG-028 probes MUST read this as "no filesystem".
 func expectDrbdMetaSignature(fx *storage.FakeExec, device string) {
-	fx.Expect("blkid -o export "+device,
-		storage.FakeResponse{Stdout: []byte("DEVNAME=" + device + "\nUUID=6715da3a6dd3182a\nTYPE=drbd\n")})
+	fx.Expect(backingProbe(device), storage.FakeResponse{Err: storage.FakeExitError{Code: 2}})
 }
 
 func newThinReconciler(fx *storage.FakeExec, dir string) *satellite.Reconciler {
@@ -197,6 +202,7 @@ func assertNoPromoteNoMkfs(t *testing.T, cmds []string) {
 func TestApplyBug028Day0RaceVetoBypassedMkfsRuns(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd6500")
 	device := expectThinBacking(fx, "pvc-b028")
 	// Kernel truth at the winner's finishDRBDApply: the day0 sibling is
 	// already Connected+UpToDate → AnyConnectedPeerHasData vetoes.
@@ -209,7 +215,7 @@ func TestApplyBug028Day0RaceVetoBypassedMkfsRuns(t *testing.T) {
 	// Backing-device blkid answers TYPE=drbd (the real-hardware shape:
 	// libblkid sees the internal DRBD metadata superblock) — the bypass
 	// must read that as "no user filesystem". The post-promote probe on
-	// /dev/drbd6500 returns the FakeExec default (no signature).
+	// /dev/drbd6500 is canned blank (exit 2, no signature).
 	expectDrbdMetaSignature(fx, device)
 
 	rec := newThinReconciler(fx, dir)
@@ -265,7 +271,7 @@ func TestApplyBug028VetoHoldsOnFsSignature(t *testing.T) {
 	fx.Expect("drbdsetup status pvc-b028f --json",
 		storage.FakeResponse{Stdout: []byte(statusBothUpToDateSecondary("pvc-b028f"))})
 	expectGetGI(fx, "pvc-b028f", device, satellite.Day0GiForTest("pvc-b028f", 0))
-	fx.Expect("blkid -o export "+device,
+	fx.Expect(backingProbe(device),
 		storage.FakeResponse{Stdout: []byte("DEVNAME=" + device + "\nTYPE=ext4\nUSAGE=filesystem\n")})
 
 	rec := newThinReconciler(fx, dir)
@@ -332,6 +338,7 @@ func TestApplyBug028VetoHoldsOnUnconnectedDiskfulPeer(t *testing.T) {
 func TestApplyBug028BypassFiresDespitePeerHasDataLag(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd6540")
 	device := expectThinBacking(fx, "pvc-b028g")
 	fx.Expect("drbdsetup status pvc-b028g --json",
 		storage.FakeResponse{Stdout: []byte(statusBothUpToDateSecondary("pvc-b028g"))})
@@ -389,13 +396,14 @@ func bug028FalseLatchDR(rd, minor string) []*intent.DesiredResource {
 func TestApplyBug028FalseLatchRetryFiresWithoutAutoPrimary(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	expectBlankMkfsTarget(fx, "/dev/drbd6600")
 	device := expectThinBacking(fx, "pvc-b028r")
 	fx.Expect("drbdsetup status pvc-b028r --json",
 		storage.FakeResponse{Stdout: []byte(statusBothUpToDateSecondary("pvc-b028r"))})
 	// Backing blkid answers TYPE=drbd (the real-hardware shape — see
 	// expectDrbdMetaSignature): the retry must read it as "no user
-	// filesystem". /dev/drbd6600's post-promote probe stays at the
-	// FakeExec default (no signature) → mkfs runs.
+	// filesystem". /dev/drbd6600's post-promote probe is canned blank
+	// (exit 2, no signature) → mkfs runs.
 	expectDrbdMetaSignature(fx, device)
 
 	rec := newThinReconciler(fx, dir)
@@ -420,7 +428,8 @@ func TestApplyBug028FalseLatchRetryFiresWithoutAutoPrimary(t *testing.T) {
 func TestApplyBug028FalseLatchRetryDefersWhileForeignPrimary(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	expectThinBacking(fx, "pvc-b028w")
+	expectBlankMkfsTarget(fx, "/dev/drbd6610")
+	expectDrbdMetaSignature(fx, expectThinBacking(fx, "pvc-b028w"))
 	fx.Expect("drbdsetup status pvc-b028w --json",
 		storage.FakeResponse{Stdout: []byte(`[{
 		  "name":"pvc-b028w","node-id":0,"role":"Secondary",
@@ -493,7 +502,7 @@ func TestApplyBug028FalseLatchRetryRefusedWhenFsPresent(t *testing.T) {
 	device := expectThinBacking(fx, "pvc-b028s")
 	fx.Expect("drbdsetup status pvc-b028s --json",
 		storage.FakeResponse{Stdout: []byte(statusBothUpToDateSecondary("pvc-b028s"))})
-	fx.Expect("blkid -o export "+device,
+	fx.Expect(backingProbe(device),
 		storage.FakeResponse{Stdout: []byte("DEVNAME=" + device + "\nTYPE=ext4\nUSAGE=filesystem\n")})
 
 	rec := newThinReconciler(fx, dir)
@@ -504,4 +513,40 @@ func TestApplyBug028FalseLatchRetryRefusedWhenFsPresent(t *testing.T) {
 	}
 
 	assertNoPromoteNoMkfs(t, fx.CommandLines())
+}
+
+// TestApplyResultCarriesTheOptionsLeftOutOfTheRes: an option the .res left
+// out goes back on the apply result, whatever path the apply ends on, so
+// the c-r reconciler can raise a Warning Event for it on the Resource.
+func TestApplyResultCarriesTheOptionsLeftOutOfTheRes(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	device := expectThinBacking(fx, "pvc-typo")
+	fx.Expect("drbdsetup status pvc-typo --json",
+		storage.FakeResponse{Stdout: []byte(statusBothUpToDateSecondary("pvc-typo"))})
+	expectGetGI(fx, "pvc-typo", device, "2BCB1C8F00B058AE")
+
+	rec := newThinReconciler(fx, dir)
+
+	drs := bug028WinnerDR("pvc-typo", "6530")
+	drs[0].DrbdOptions["DrbdOptions/AutoSnapshot/Keep"] = "2"
+
+	results, err := rec.Apply(t.Context(), drs)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if len(results) != 1 || len(results[0].DroppedOptions) != 1 ||
+		!strings.Contains(results[0].DroppedOptions[0], "DrbdOptions/AutoSnapshot/Keep") {
+		t.Fatalf("apply result does not report the key left out of the .res: %+v", results)
+	}
+
+	again, err := rec.Apply(t.Context(), bug028WinnerDR("pvc-typo", "6530"))
+	if err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+
+	if len(again[0].DroppedOptions) != 0 {
+		t.Errorf("a later apply without the key still reports it: %q", again[0].DroppedOptions)
+	}
 }

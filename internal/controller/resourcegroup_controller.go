@@ -28,6 +28,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/conflict"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -63,6 +64,10 @@ type ResourceGroupReconciler struct {
 	// the REST server and the other reconcilers). Required for the
 	// placer integration.
 	Store store.Store
+
+	// conflicts retries a pass that lost an optimistic-concurrency
+	// race and counts such races per object.
+	conflicts conflict.Retrier
 }
 
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcegroups,verbs=get;list;watch;create;update;patch;delete
@@ -71,11 +76,32 @@ type ResourceGroupReconciler struct {
 // +kubebuilder:rbac:groups=blockstor.org,resources=resourcedefinitions,verbs=get;list;watch
 // +kubebuilder:rbac:groups=blockstor.org,resources=resources,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile finds every RD spawned from this RG and runs the placer
-// to backfill replicas missing under the new spec. Idempotent: an
-// RG without any change still passes through, the placer's
-// already-placed accounting prevents extra Resources.
+// Reconcile runs one pass and retries one that lost an
+// optimistic-concurrency race instead of reporting it as an error;
+// see conflict.Retrier.
 func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return r.conflicts.Reconcile(ctx, req, r.ReconcilePass)
+}
+
+// ReconcilePass finds every RD spawned from this RG and runs the placer
+// to backfill replicas missing under the new spec. Idempotent: an
+// RG without any change still passes through, and a definition whose
+// diskful replicas already reach the place count is skipped before
+// the placer runs, so no extra Resources appear.
+//
+// Any RG event lands here, the initial list on a controller start
+// included, so this is a placement nobody asked for; LINSTOR places
+// nothing on an RG event at all. It leaves alone every definition
+// LINSTOR's balance task would (balanceGate.skipReason): one being
+// deleted, one with BalanceResourcesEnabled=false, which linstor-csi
+// sets while it deletes a volume's replicas, one with no UpToDate
+// diskful replica on an online node, such as a volume deleted while its
+// snapshots keep the definition, and one whose diskful replicas already
+// reach the place count, which also keeps DisklessOnRemaining from
+// adding diskless replicas to it. An `rg modify` that names a place
+// count still reaches those through the rebalance-pending path, with
+// balancing on or off.
+func (r *ResourceGroupReconciler) ReconcilePass(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	if r.Store == nil {
@@ -94,12 +120,40 @@ func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	gate, err := newBalanceGate(ctx, r.Store)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	for i := range rds {
 		if !naming.Same(rds[i].ResourceGroupName, rg.Name) {
 			continue
 		}
 
-		err := r.applyRGToRD(ctx, &rg, &rds[i])
+		// This runs on every group event, a controller start
+		// included, so it follows the balance pass: a definition
+		// without DRBD is left alone. An `rg modify` that names a
+		// place count reaches it through the rebalance annotation,
+		// which the rebalance reconciler places on whether balancing
+		// is on or off.
+		if !definitionUsesDRBD(&rds[i], &rg) {
+			continue
+		}
+
+		reason, err := gate.skipReason(ctx, &rg, &rds[i])
+		if err != nil {
+			log.Error(err, "RG placement skipped: replicas unreadable", "rg", rg.Name, "rd", rds[i].Name)
+
+			continue
+		}
+
+		if reason != "" {
+			log.V(1).Info("RG placement skipped", "rg", rg.Name, "rd", rds[i].Name, "reason", reason)
+
+			continue
+		}
+
+		err = r.applyRGToRD(ctx, gate, &rg, &rds[i])
 		if err != nil {
 			log.Error(err, "apply RG to RD",
 				"rg", rg.Name, "rd", rds[i].Name)
@@ -115,15 +169,13 @@ func (r *ResourceGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 // The placer is idempotent: if the RD already has place_count
 // replicas, no change. If the RG bumped place_count, the gap is
 // filled. Reductions are not auto-acted on here.
-func (r *ResourceGroupReconciler) applyRGToRD(ctx context.Context, rg *apiv1.ResourceGroup, rd *apiv1.ResourceDefinition) error {
+func (r *ResourceGroupReconciler) applyRGToRD(ctx context.Context, gate *balanceGate, rg *apiv1.ResourceGroup, rd *apiv1.ResourceDefinition) error {
 	filter := rg.SelectFilter
 	if filter.PlaceCount == 0 {
 		filter.PlaceCount = 1
 	}
 
-	_, _, err := placer.New(r.Store).Place(ctx, rd.Name, &filter)
-
-	return err
+	return gate.place(ctx, placer.New(r.Store), rg, rd.Name, &filter)
 }
 
 // SetupWithManager sets up the controller with the Manager.

@@ -31,6 +31,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/passphrase"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/cozystack/blockstor/internal/cli/command"
@@ -56,6 +57,11 @@ type propertyAccessor struct {
 	// migration reconciler both stamp per-replica properties, and a
 	// `resource set-property` racing one of them undid its work.
 	edit func(ctx context.Context, st store.Store, ident []string, change func(map[string]string) error) error
+	// whitelist is the LINSTOR whitelist object the bag belongs to; a
+	// DrbdOptions key it does not list, or a value its rule refuses, is
+	// refused before the bag is touched, as on the REST door. Set from
+	// propertyNouns; the zero value judges nothing.
+	whitelist propwhitelist.Object
 	// namedKey judges the key an operator NAMED, before the bag is
 	// touched. The edit guards judge the resulting state, which cannot
 	// see an operator setting an immutable key to the value it already
@@ -95,6 +101,15 @@ func setProperty(accessor propertyAccessor) handler {
 
 		if value != "" && passphrase.IsPlaintextPropKey(key) {
 			return fmt.Errorf("%w: %s", errPlaintextPassphraseProp, key)
+		}
+
+		if value != "" {
+			whitelistErr := propwhitelist.Check(accessor.whitelist, key, value)
+			if whitelistErr != nil {
+				return fmt.Errorf("%w: %w", errUnwhitelistedProp, whitelistErr)
+			}
+
+			value = propwhitelist.Normalize(accessor.whitelist, key, value)
 		}
 
 		if accessor.namedKey != nil {
@@ -257,6 +272,12 @@ func patchDefinitionProps(
 // definition itself.
 var errServerOwnedProp = errors.New("blockstor sets this property itself")
 
+// errUnwhitelistedProp refuses a DrbdOptions property LINSTOR's whitelist
+// does not allow on the object, or a value its rule refuses. Stored, it is
+// rendered into the .res, and drbdadm refuses the whole file on every node;
+// REST refuses the same write.
+var errUnwhitelistedProp = errors.New("refusing a property LINSTOR does not allow here")
+
 // errPlaintextPassphraseProp refuses a set-property that would store the
 // LUKS master passphrase in a property. A property is kept in plaintext on
 // its CR and blockstor never reads the passphrase from one; REST refuses the
@@ -401,6 +422,11 @@ func resourceDefinitionDelete(ctx context.Context, run *runContext) error {
 	// Then the replicas. Dropping the definition alone leaves them with no
 	// parent to stamp a deletion on, so the satellite finalizer never runs
 	// and the DRBD minor, port and peer entries stay live on every node.
+	err = store.MarkDefinitionDeleting(ctx, run.Store, name)
+	if err != nil {
+		return fmt.Errorf("delete resource definition %s: %w", name, err)
+	}
+
 	err = store.CascadeDeleteResources(ctx, run.Store, name)
 	if err != nil {
 		return fmt.Errorf("delete replicas of %s: %w", name, err)

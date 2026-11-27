@@ -30,6 +30,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	k8sstore "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
@@ -190,6 +191,10 @@ func (s *Server) handleControllerPropsModify(w http.ResponseWriter, r *http.Requ
 	var modify apiv1.GenericPropsModify
 
 	if !decodeJSON(w, r, &modify) {
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.Controller, modify.OverrideProps) {
 		return
 	}
 

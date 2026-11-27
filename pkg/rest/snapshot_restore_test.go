@@ -94,13 +94,18 @@ func TestSnapshotRestoreAfterSourceResourcesDeleted_G3a(t *testing.T) {
 	}
 
 	// Snapshot recorded on n1/n2 — but NO Resources exist (every replica
-	// was `r d`'d). The RD shell + the snapshot both survive.
+	// was `r d`'d). The RD shell + the snapshot both survive, and the
+	// snapshot still names the pool that holds it on each node.
 	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
 		Name:         "snap-keep",
 		ResourceName: "pvc-src",
 		Nodes:        []string{"n1", "n2"},
 		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
 			{VolumeNumber: 0, SizeKib: 1024 * 1024},
+		},
+		Snapshots: []apiv1.SnapshotPerNode{
+			{NodeName: "n1", StoragePool: "data"},
+			{NodeName: "n2", StoragePool: "data"},
 		},
 	}); err != nil {
 		t.Fatalf("seed snap: %v", err)
@@ -147,6 +152,13 @@ func TestSnapshotRestoreAfterSourceResourcesDeleted_G3a(t *testing.T) {
 	placed := make(map[string]bool, len(resList))
 	for i := range resList {
 		placed[resList[i].NodeName] = true
+
+		// The pool comes off the snapshot: with the source's replicas gone
+		// there is nothing else to read it from, and a replica without one
+		// never comes up on its satellite.
+		if pool := resList[i].Props["StorPoolName"]; pool != "data" {
+			t.Errorf("restored replica on %s StorPoolName = %q, want the snapshot's data", resList[i].NodeName, pool)
+		}
 	}
 
 	if !placed["n1"] || !placed["n2"] {
@@ -722,6 +734,16 @@ func TestSnapshotRestoreBug354StampsResourcesOnExplicitNodes(t *testing.T) {
 		t.Fatalf("seed source resource: %v", err)
 	}
 
+	// n2 holds a copy but no source replica; it restores into the pool
+	// of the same name, which it has to have.
+	for _, node := range []string{"n1", "n2"} {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: node, StoragePoolName: "zpool", ProviderKind: apiv1.StoragePoolKindZFSThin,
+		}); err != nil {
+			t.Fatalf("seed pool on %s: %v", node, err)
+		}
+	}
+
 	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
 		Name:         "snap-1",
 		ResourceName: "pvc-src",
@@ -805,6 +827,7 @@ func TestSnapshotRestoreBug354AcceptsNodeNamesAlias(t *testing.T) {
 		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
 			{VolumeNumber: 0, SizeKib: 1024 * 1024},
 		},
+		Snapshots: []apiv1.SnapshotPerNode{{NodeName: "n1", StoragePool: "data"}},
 	}); err != nil {
 		t.Fatalf("seed snap: %v", err)
 	}
@@ -1090,10 +1113,9 @@ func TestSnapshotRestoreVolumeDefinitionConflict_G3b(t *testing.T) {
 		t.Fatalf("ret_code: got %+v, want a negative (error) code", rc)
 	}
 
-	// FAIL_EXISTS_VLM_DFN (502) sub-code so golinstor's typed matcher fires.
-	const failBit = 502
-	if rc[0].RetCode&failBit != failBit {
-		t.Errorf("ret_code: got %#x, want FAIL_EXISTS_VLM_DFN (502) bit set", rc[0].RetCode)
+	// FAIL_EXISTS_VLM_DFN (503) so golinstor's typed matcher fires.
+	if rc[0].RetCode != apiCallRcError|apiCallRcFailExistsVlmDfn {
+		t.Errorf("ret_code: got %#x, want FAIL_EXISTS_VLM_DFN (503)", rc[0].RetCode)
 	}
 
 	// The target RD's original volume 0 must remain untouched (size

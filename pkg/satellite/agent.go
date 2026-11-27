@@ -29,6 +29,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 
 	"github.com/cockroachdb/errors"
 	"k8s.io/client-go/rest"
@@ -147,7 +148,7 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	a.logger.Info("agent starting",
 		"node", a.cfg.NodeName,
-		"blockstor_version", version.Version)
+		version.LogKey, version.Version)
 
 	rec := a.newReconciler()
 
@@ -231,12 +232,20 @@ func (a *Agent) startStreamServer(ctx context.Context, rec *Reconciler) {
 
 	go func() {
 		err := stream.ListenAndServe(ctx, addr, srv, a.cfg.StreamTLS)
-		if err != nil && !errors.Is(err, context.Canceled) {
+		if streamServerFailed(err) {
 			a.logger.Error("snapshot stream server exited", "addr", addr, "err", err)
 		}
 	}()
 
 	a.logger.Info("snapshot stream server listening", "addr", addr)
+}
+
+// streamServerFailed reports whether the stream server stopped for a
+// reason other than the agent's shutdown. ListenAndServe answers a clean
+// shutdown with http.ErrServerClosed, which every satellite stop used to
+// log as an ERROR.
+func streamServerFailed(err error) bool {
+	return err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, http.ErrServerClosed)
 }
 
 // startControllerRuntime launches a controller-runtime manager

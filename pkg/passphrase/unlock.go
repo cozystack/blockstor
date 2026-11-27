@@ -119,12 +119,18 @@ func ResolveRef(ctx context.Context, reader client.Reader) (Ref, error) {
 	return Ref{Name: ref.Name, Key: key, Generated: false}, nil
 }
 
-// Secrets reads the passphrase Secret and the keyring Secret. Reader
-// should be the manager's direct reader: Secret RBAC is a namespaced get,
-// which a cache cannot list and watch with.
+// Secrets reads the passphrase Secret and the keyring Secret. Reader is
+// the manager's direct reader or a WatchedReader: the manager's cache
+// would watch every Secret in the cluster, which the name-limited Secret
+// Role does not allow.
 type Secrets struct {
 	Reader    client.Reader
 	Namespace string
+
+	// Direct, when set, is what a read-modify-write of a Secret reads:
+	// a WatchedReader trails the API server, and an update made from
+	// what it read conflicts until it catches up. Nil is Reader.
+	Direct client.Reader
 }
 
 // Keyring returns the keyring and its Secret's resourceVersion, or a nil
@@ -170,6 +176,15 @@ func (s Secrets) Passphrase(ctx context.Context, ref Ref) ([]byte, string, error
 	}
 
 	return bytes.Clone(value), sec.ResourceVersion, nil
+}
+
+// direct is the reader a read-modify-write reads through.
+func (s Secrets) direct() Secrets {
+	if s.Direct != nil {
+		s.Reader = s.Direct
+	}
+
+	return s
 }
 
 // Status is what Unlock found.
@@ -275,6 +290,36 @@ func (u *Unlocker) Unlock(ctx context.Context) (Status, error) {
 //
 // It reports whether it created the keyring.
 func Bootstrap(ctx context.Context, writer client.Client, secrets Secrets, now time.Time) (bool, error) {
+	if secrets.Direct == nil {
+		return bootstrap(ctx, writer, secrets, now)
+	}
+
+	// The steady state, a keyring that exists, is answered from Reader.
+	ref, err := ResolveRef(ctx, secrets.Reader)
+	if err != nil || ref.Generated {
+		return false, err
+	}
+
+	ring, _, err := secrets.Keyring(ctx)
+	if err != nil || ring != nil {
+		return false, err
+	}
+
+	pass, _, err := secrets.Passphrase(ctx, ref)
+	clear(pass)
+
+	if err != nil || pass == nil {
+		return false, err
+	}
+
+	// Reader says there is a keyring to create, but a watch trails the
+	// API server: whether one is there by now, which Secret it is
+	// created from and the passphrase it holds are read from Direct.
+	return bootstrap(ctx, writer, secrets.direct(), now)
+}
+
+// bootstrap is Bootstrap with every read through secrets.Reader.
+func bootstrap(ctx context.Context, writer client.Client, secrets Secrets, now time.Time) (bool, error) {
 	ref, err := ResolveRef(ctx, secrets.Reader)
 	if err != nil || ref.Generated {
 		return false, err

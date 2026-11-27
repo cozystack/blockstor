@@ -82,7 +82,7 @@ func TestThickResizeReapplyRefreservation(t *testing.T) {
 		t.Fatalf("ResizeVolume: %v", err)
 	}
 
-	wantVolsize := "zfs set volsize=2048M tank/pvc-1_00000"
+	wantVolsize := "zfs set volsize=2097152K tank/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), wantVolsize) {
 		t.Errorf("expected volsize set %q in calls; got %v",
 			wantVolsize, fx.CommandLines())
@@ -293,6 +293,7 @@ func TestThickRecvIdempotentSkipStillEnsuresRefreservation(t *testing.T) {
 			VolumeNumber: 0,
 			SizeKib:      1024 * 1024,
 		},
+		storage.Snapshot{ResourceName: "pvc-1", SnapshotName: "s1"},
 		src,
 	)
 	if err != nil {
@@ -334,6 +335,7 @@ func TestThinRecvIdempotentSkipNoRefreservation(t *testing.T) {
 			VolumeNumber: 0,
 			SizeKib:      1024 * 1024,
 		},
+		storage.Snapshot{ResourceName: "pvc-1", SnapshotName: "s1"},
 		src,
 	)
 	if err != nil {

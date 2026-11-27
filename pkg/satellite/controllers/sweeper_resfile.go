@@ -59,7 +59,9 @@ const resFileSuffix = ".res"
 // Selection rules (a file is removed only when ALL hold):
 //   - The directory entry is a regular `*.res` file (never a marker
 //     like `.owned`/`.md-created`/`.mkfs.done`, never global_common.conf,
-//     never a sub-directory).
+//     never a sub-directory, never a symlink: blockstor writes its
+//     `.res` with os.WriteFile, so a link is someone else's, and the
+//     slot it describes is not ours to down).
 //   - Its RD name (basename minus `.res`) is NOT in `owned` — the set of
 //     RD names this node currently hosts a Resource CRD for.
 //   - The RD is past the create/delete grace window (Bug 291 race: the
@@ -84,7 +86,7 @@ func orphanResForRemoval(
 	var out []string
 
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if !entry.Type().IsRegular() {
 			continue
 		}
 
@@ -174,6 +176,8 @@ func (s *OrphanSweeperRunnable) sweepOrphanResFiles(
 
 	now := clock()
 
+	reportForeignResEntries(logger, entries)
+
 	stale := orphanResForRemoval(entries, owned, rdAges, now, grace)
 	if len(stale) == 0 {
 		return
@@ -181,6 +185,21 @@ func (s *OrphanSweeperRunnable) sweepOrphanResFiles(
 
 	for _, rd := range stale {
 		s.removeOrphanResFile(ctx, logger, rd)
+	}
+}
+
+// reportForeignResEntries logs every `*.res` entry in StateDir that is
+// not a regular file. orphanResForRemoval leaves them alone because
+// blockstor never writes one; the log is how an operator finds out the
+// GC is not managing them.
+func reportForeignResEntries(logger logr.Logger, entries []os.DirEntry) {
+	for _, entry := range entries {
+		if entry.Type().IsRegular() || !strings.HasSuffix(entry.Name(), resFileSuffix) {
+			continue
+		}
+
+		logger.Info("leaving non-regular .res entry in StateDir alone; blockstor did not write it",
+			"name", entry.Name(), "type", entry.Type().String())
 	}
 }
 
@@ -197,8 +216,16 @@ func (s *OrphanSweeperRunnable) removeOrphanResFile(
 	// tearDownOrphans). IsLoaded folds any non-zero drbdsetup exit into
 	// "not loaded", so a transient probe hiccup biases toward "leave the
 	// slot, just remove the file" — acceptable: the next reconcile/sweep
-	// re-converges, and the goal is breaking the .res-collision.
-	loaded, _ := s.isSlotLoaded(ctx, rd)
+	// re-converges, and the goal is breaking the .res-collision. A
+	// probe that did not answer is an error instead: the slot may be
+	// loaded, and its file is the only config to recover it from.
+	loaded, err := s.isSlotLoaded(ctx, rd)
+	if err != nil {
+		logger.Error(err, "kernel slot state unknown; keeping orphan .res for retry", "resource", rd)
+
+		return
+	}
+
 	if loaded {
 		// Kernel still holds the slot the stale file described. Tear it
 		// down (kernel-direct `drbdsetup down`, bounded by
@@ -219,7 +246,7 @@ func (s *OrphanSweeperRunnable) removeOrphanResFile(
 
 	path := filepath.Join(s.StateDir, rd+resFileSuffix)
 
-	err := os.Remove(path)
+	err = os.Remove(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		logger.Error(err, "remove orphan .res file", "path", path)
 

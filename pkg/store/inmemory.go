@@ -47,12 +47,16 @@ type InMemory struct {
 
 // NewInMemory constructs an InMemory store with empty per-resource maps.
 func NewInMemory() *InMemory {
+	resources := &inMemoryResources{m: map[rKey]apiv1.Resource{}}
+	rds := &inMemoryResourceDefinitions{m: map[string]apiv1.ResourceDefinition{}, replicas: resources}
+	resources.rds = rds
+
 	return &InMemory{
 		nodes:                  &inMemoryNodes{m: map[string]apiv1.Node{}},
 		storagePools:           &inMemoryStoragePools{m: map[spKey]apiv1.StoragePool{}},
 		resourceGroups:         &inMemoryResourceGroups{m: map[string]apiv1.ResourceGroup{}},
-		resourceDefinitions:    &inMemoryResourceDefinitions{m: map[string]apiv1.ResourceDefinition{}},
-		resources:              &inMemoryResources{m: map[rKey]apiv1.Resource{}},
+		resourceDefinitions:    rds,
+		resources:              resources,
 		volumeDefinitions:      &inMemoryVolumeDefinitions{m: map[vdKey]apiv1.VolumeDefinition{}},
 		snapshots:              &inMemorySnapshots{m: map[snapKey]apiv1.Snapshot{}},
 		physicalDevices:        &inMemoryPhysicalDevices{m: map[string]apiv1.PhysicalDevice{}},

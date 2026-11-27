@@ -26,6 +26,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 
+	"github.com/cozystack/blockstor/internal/cli/color"
 	"github.com/cozystack/blockstor/internal/cli/view"
 )
 
@@ -106,7 +107,8 @@ func TestUsageTriState(t *testing.T) {
 //   - a replica under deletion renders `DELETING`;
 //   - a converged replica renders `UpToDate` with NO percentage —
 //     the harness greps for the absence of `UpToDate(NN%)`;
-//   - a syncing replica DOES carry its progress.
+//   - a replica in SyncTarget carries DRBD's `done` for that resync,
+//     and no other state carries a percentage.
 func TestStateColumnContracts(t *testing.T) {
 	t.Parallel()
 
@@ -151,18 +153,58 @@ func TestStateColumnContracts(t *testing.T) {
 		}
 	})
 
-	t.Run("syncing replica carries progress", func(t *testing.T) {
+	t.Run("syncing replica carries the resync's done", func(t *testing.T) {
 		t.Parallel()
 
-		res := diskful("node-2", "SyncTarget", 512)
+		res := diskful("node-2", "Inconsistent", 512)
+		done := 50.31
+		res.Volumes[0].State.ReplicationStates = map[string]apiv1.ReplicationState{
+			"node-1": {ReplicationState: "SyncTarget", DonePercentage: &done},
+		}
+
+		got := cellAt(t, view.ResourceList(view.ResourceListInput{Resources: []apiv1.Resource{res}}), 0, "State")
+
+		if got != "SyncTarget(50.31%)" {
+			t.Errorf("State = %q, want %q", got, "SyncTarget(50.31%)")
+		}
+	})
+
+	// The live report: a replica finished a small resync from one peer
+	// and then ran a full one from the Primary. The out-of-sync count
+	// is the last peer frame's (here 1% of the volume), the kernel says
+	// done:50.31 for the running resync. The column read
+	// `Inconsistent(99%)`; LINSTOR shows `SyncTarget(50.31%)`.
+	t.Run("resync from a second peer shows that resync, not the out-of-sync count", func(t *testing.T) {
+		t.Parallel()
+
+		res := diskful("node-3", "Inconsistent", 1)
+		done := 50.31
+		res.Volumes[0].State.ReplicationStates = map[string]apiv1.ReplicationState{
+			"node-1": {ReplicationState: "SyncTarget", DonePercentage: &done},
+			"node-2": {ReplicationState: "Established"},
+		}
 
 		got := cellAt(t, view.ResourceList(view.ResourceListInput{
-			Resources:      []apiv1.Resource{res},
-			VolumeSizesKib: map[string]map[int32]int64{res.Name: {0: 1024}},
+			Resources:  []apiv1.Resource{res},
+			FaultyOnly: true,
 		}), 0, "State")
 
-		if got != "SyncTarget(50%)" {
-			t.Errorf("State = %q, want %q", got, "SyncTarget(50%)")
+		if got != "SyncTarget(50.31%)" {
+			t.Errorf("State = %q, want %q", got, "SyncTarget(50.31%)")
+		}
+	})
+
+	t.Run("inconsistent replica with no running resync carries no percentage", func(t *testing.T) {
+		t.Parallel()
+
+		res := diskful("node-2", "Inconsistent", 512)
+
+		got := cellAt(t, view.ResourceList(view.ResourceListInput{
+			Resources: []apiv1.Resource{res},
+		}), 0, "State")
+
+		if got != "Inconsistent" {
+			t.Errorf("State = %q, want bare %q", got, "Inconsistent")
 		}
 	})
 
@@ -300,15 +342,91 @@ func cellAt(t *testing.T, tbl *metav1.Table, row int, column string) string {
 		t.Fatalf("row %d out of range (%d rows)", row, len(tbl.Rows))
 	}
 
-	cell := tbl.Rows[row].Cells[idx]
-	if cell == nil {
+	switch cell := tbl.Rows[row].Cells[idx].(type) {
+	case nil:
+		return ""
+	case string:
+		return cell
+	case color.Cell:
+		return cell.Text
+	default:
+		t.Fatalf("cell %q is %T, want string or color.Cell", column, cell)
+
 		return ""
 	}
+}
 
-	s, ok := cell.(string)
-	if !ok {
-		t.Fatalf("cell %q is %T, want string", column, cell)
+// classAt returns the colour class the view decided for a cell; a
+// plain string cell decided none and reads Neutral.
+func classAt(t *testing.T, tbl *metav1.Table, row int, column string) color.Class {
+	t.Helper()
+
+	cellAt(t, tbl, row, column) // bounds and column checks
+
+	for i := range tbl.ColumnDefinitions {
+		if tbl.ColumnDefinitions[i].Name != column {
+			continue
+		}
+
+		if cell, ok := tbl.Rows[row].Cells[i].(color.Cell); ok {
+			return cell.Class
+		}
 	}
 
-	return s
+	return color.Neutral
+}
+
+// A replica toggled to diskful whose satellite cannot attach the new
+// disk keeps reporting Diskless with every connection up. It read as a
+// healthy diskless replica, and a conversion stuck on a refused attach
+// went unnoticed for hours. LINSTOR's client paints a Diskless replica
+// without the DISKLESS flag red; here it is faulty, and it reads
+// AttachFailed once the satellite has failed to attach.
+func TestDisklessReplicaMeantToHaveDisk(t *testing.T) {
+	t.Parallel()
+
+	converting := diskful("node-2", "Diskless", 0)
+
+	tbl := view.ResourceList(view.ResourceListInput{Resources: []apiv1.Resource{converting}, FaultyOnly: true})
+	if len(tbl.Rows) != 1 {
+		t.Fatalf("a diskful replica reporting Diskless is not listed by --faulty")
+	}
+
+	if got := cellAt(t, tbl, 0, "State"); got != "Diskless" {
+		t.Errorf("before a failed attach: State = %q, want %q", got, "Diskless")
+	}
+
+	stuck := converting
+	stuck.State.ToggleDiskRetries = 3
+
+	tbl = view.ResourceList(view.ResourceListInput{Resources: []apiv1.Resource{stuck}, FaultyOnly: true})
+	if len(tbl.Rows) != 1 {
+		t.Fatalf("a replica failing to attach is not listed by --faulty")
+	}
+
+	if got := cellAt(t, tbl, 0, "State"); got != "AttachFailed" {
+		t.Errorf("after failed attaches: State = %q, want %q", got, "AttachFailed")
+	}
+
+	twoVolumes := stuck
+	twoVolumes.Volumes = []apiv1.Volume{
+		{VolumeNumber: 0, State: apiv1.VolumeState{DiskState: "UpToDate"}},
+		{VolumeNumber: 1, State: apiv1.VolumeState{DiskState: "Diskless"}},
+	}
+
+	if got := cellAt(t, view.ResourceList(view.ResourceListInput{Resources: []apiv1.Resource{twoVolumes}}), 0, "State"); got != "AttachFailed" {
+		t.Errorf("one volume failing to attach: State = %q, want %q", got, "AttachFailed")
+	}
+
+	intended := diskful("node-3", "Diskless", 0)
+	intended.Flags = []string{apiv1.ResourceFlagDiskless}
+	intended.State.ToggleDiskRetries = 3
+
+	if view.IsFaulty(&intended, nil) {
+		t.Errorf("a replica meant to be diskless is reported faulty")
+	}
+
+	if got := cellAt(t, view.ResourceList(view.ResourceListInput{Resources: []apiv1.Resource{intended}}), 0, "State"); got != "Diskless" {
+		t.Errorf("intended diskless: State = %q, want %q", got, "Diskless")
+	}
 }

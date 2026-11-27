@@ -32,6 +32,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -411,11 +412,25 @@ func (s *Server) handleNodesList(w http.ResponseWriter, r *http.Request) {
 	// Mirrors Bug 115's RD-side redaction at the REST boundary — the
 	// satellite-side reads (which need the un-redacted value for the
 	// LUKS-prereq gate) bypass this path.
+	//
+	// The `nodes` and `props` filters run on the redacted props, so a
+	// filter cannot probe a secret's value. linstor-csi asks for the
+	// nodes a volume is deployed on by name, and for the nodes of a
+	// topology segment by prop: answered with every node, a volume is
+	// reported accessible everywhere and a segment spans the cluster.
+	nameFilter := multiValueQuery(r, "nodes")
+	propFilter := propsQuery(r)
+	filtered := make([]apiv1.Node, 0, len(nodes))
+
 	for i := range nodes {
 		redactSensitiveProps(nodes[i].Props)
+
+		if matchAnyName(nameFilter, nodes[i].Name) && matchProps(propFilter, nodes[i].Props) {
+			filtered = append(filtered, nodes[i])
+		}
 	}
 
-	writeJSON(w, http.StatusOK, nodes)
+	writeJSON(w, http.StatusOK, filtered)
 }
 
 func (s *Server) handleNodeGet(w http.ResponseWriter, r *http.Request) {
@@ -546,6 +561,10 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 	// matching the Bug 92 / Bug 111 refusal pattern — and the
 	// `?force=true` query string preserves the deliberate-renumber
 	// escape hatch.
+	if refuseUnwhitelistedProps(w, propwhitelist.Node, n.Props) {
+		return
+	}
+
 	if !isForce(r) && s.refuseNodeIPRewrite(w, r, &n) {
 		return
 	}
@@ -926,6 +945,10 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeStoreError(w, err)
 
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.Node, patch.OverrideProps) {
 		return
 	}
 

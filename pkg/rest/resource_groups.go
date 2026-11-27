@@ -32,6 +32,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
 
 	"github.com/pkg/errors"
@@ -82,11 +83,13 @@ func (s *Server) handleRGList(w http.ResponseWriter, r *http.Request) {
 	// list endpoint. Same semantics: names match as the store keys them,
 	// unknown names => empty list, missing param => no filter.
 	nameFilter := multiValueQuery(r, "resource_groups")
-	if len(nameFilter) > 0 {
+	propFilter := propsQuery(r)
+
+	if len(nameFilter) > 0 || len(propFilter) > 0 {
 		filtered := rgs[:0]
 
 		for i := range rgs {
-			if matchAnyName(nameFilter, rgs[i].Name) {
+			if matchAnyName(nameFilter, rgs[i].Name) && matchProps(propFilter, rgs[i].Props) {
 				filtered = append(filtered, rgs[i])
 			}
 		}
@@ -182,7 +185,7 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if refuseServerOwnedGroupProps(w, rg.Name, rg.Props, rg.OverrideProps) {
+	if refuseRGCreateProps(w, &rg) {
 		return
 	}
 
@@ -211,7 +214,9 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 
 	err = s.Store.ResourceGroups().Create(r.Context(), &rg)
 	if err != nil {
-		writeStoreError(w, err)
+		// FAIL_EXISTS_RSC_GRP on a duplicate: linstor-csi takes it for a
+		// concurrent CreateVolume that made the group first.
+		writeStoreErrorTyped(w, err, storeKindResourceGrp)
 
 		return
 	}
@@ -225,6 +230,30 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "resource group created: " + rg.Name,
 	}})
+}
+
+// refuseRGCreateProps runs the refusals an `rg c` body's props meet: the
+// props blockstor owns, and LINSTOR's whitelist, which judges a group's
+// props as a definition's and its volume groups' as a volume definition's,
+// since that is what they are copied onto. True means the refusal has been
+// written.
+func refuseRGCreateProps(w http.ResponseWriter, rg *apiv1.ResourceGroup) bool {
+	if refuseServerOwnedGroupProps(w, rg.Name, rg.Props, rg.OverrideProps) {
+		return true
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, rg.Props) ||
+		refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, rg.OverrideProps) {
+		return true
+	}
+
+	for i := range rg.VolumeGroups {
+		if refuseUnwhitelistedProps(w, propwhitelist.VolumeDefinition, rg.VolumeGroups[i].Props) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
@@ -257,21 +286,29 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 		applyRGUpdatePatch(existing, &patch, raw)
 
 		// Bug 60 (cli-parity-audit row #41): upstream LINSTOR
-		// re-runs autoplace on every child RD when `rg modify`
-		// raises PlaceCount or changes a placement-affecting
-		// filter. Phase 11.x split pushed reconcilers into a
+		// re-runs autoplace on every child RD short of the place
+		// count an `rg modify` names; a changed placement-affecting
+		// filter schedules the gated pass. Phase 11.x split pushed reconcilers into a
 		// separate process, so the REST handler can't walk RDs
 		// inline — instead it stamps the
 		// `blockstor.org/rebalance-pending` annotation and the
-		// RGRebalanceReconciler picks it up. Scale-DOWN
-		// intentionally does NOT trigger anything.
-		rebalanceScheduled = rgNeedsRebalance(&prevFilter, &existing.SelectFilter)
+		// RGRebalanceReconciler picks it up. No pass removes
+		// replicas, so a lowered place count only tops up the
+		// children below it, as LINSTOR's does.
+		placeCount := rgModifyCarriesPlaceCount(raw, &existing.SelectFilter)
+
+		rebalanceScheduled = placeCount || rgNeedsRebalance(&prevFilter, &existing.SelectFilter)
 		if rebalanceScheduled {
 			if existing.Annotations == nil {
 				existing.Annotations = map[string]string{}
 			}
 
-			existing.Annotations[apiv1.AnnotationRGRebalancePending] = time.Now().UTC().Format(time.RFC3339Nano)
+			stamp := time.Now().UTC().Format(time.RFC3339Nano)
+			existing.Annotations[apiv1.AnnotationRGRebalancePending] = stamp
+
+			if placeCount {
+				existing.Annotations[apiv1.AnnotationRGRebalancePlaceCount] = stamp
+			}
 		}
 
 		return nil
@@ -368,6 +405,25 @@ func applyRGUpdatePatch(existing, patch *apiv1.ResourceGroup, raw []byte) {
 // rather than failing the parent `rg modify` over a list-side hiccup.
 func countChildRDs(ctx context.Context, st store.Store, rgName string) int {
 	rds, err := st.ResourceDefinitions().List(ctx)
+
+	return childRDCount(rds, err, rgName)
+}
+
+// countChildRDsUncached is countChildRDs from the API server, for the
+// rg delete gate. The cache can still hold a definition a delete has
+// just removed: linstor-csi deletes the group right after the last
+// volume of its class, refused with FAIL_EXISTS_RSC_DFN it gives up,
+// and nothing deletes the group after that. LINSTOR answers from its
+// own state, which has the definition gone by then.
+func countChildRDsUncached(ctx context.Context, st store.Store, rgName string) int {
+	rds, err := st.ResourceDefinitions().ListUncached(ctx)
+
+	return childRDCount(rds, err, rgName)
+}
+
+// childRDCount counts the definitions of rds in rgName, -1 when the list
+// failed.
+func childRDCount(rds []apiv1.ResourceDefinition, err error, rgName string) int {
 	if err != nil {
 		return -1
 	}
@@ -394,13 +450,30 @@ func rebalanceMessage(count int) string {
 	return fmt.Sprintf("rebalance scheduled for %d RDs", count)
 }
 
+// rgModifyCarriesPlaceCount reports whether an `rg modify` is the one
+// LINSTOR places replicas for: its request names a place count. LINSTOR
+// then runs the autoplacer on every child definition with fewer
+// replicas than that count, whether the count went up, down or stayed
+// the same (CtrlRscGrpApiCallHandler.modifyInTransaction, the
+// `newReplicaCount != null` branch). A zero count is the cleared field,
+// which LINSTOR refuses as a place count, so it marks nothing.
+func rgModifyCarriesPlaceCount(raw []byte, merged *apiv1.AutoSelectFilter) bool {
+	if _, ok := rgSelectFilterKeys(raw)["place_count"]; !ok {
+		return false
+	}
+
+	return merged.PlaceCount > 0
+}
+
 // rgNeedsRebalance reports whether the placement-affecting subset of
 // the SelectFilter changed in a way that should re-run autoplace on
 // the RG's child RDs. The decision is additive-only:
 //
-//   - PlaceCount: trigger only when the NEW value strictly exceeds
-//     the old one. Scale-down is a no-op (upstream LINSTOR forces the
-//     operator to remove replicas explicitly via `linstor r d`).
+//   - PlaceCount: a raise always triggers. A request that names a
+//     lower or the same place count triggers through
+//     rgModifyCarriesPlaceCount instead; no pass ever removes a
+//     replica (upstream LINSTOR forces the operator to remove replicas
+//     explicitly via `linstor r d`).
 //   - LayerStack / ReplicasOnSame / NotPlaceWithRsc /
 //     NotPlaceWithRscRegex: trigger on ANY change. The placer's next
 //     pass honours the new constraint; existing replicas that violate
@@ -645,6 +718,11 @@ func (s *Server) refuseRGUpdate(
 		return true
 	}
 
+	if refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, patch.Props) ||
+		refuseUnwhitelistedProps(w, propwhitelist.ResourceDefinition, patch.OverrideProps) {
+		return true
+	}
+
 	// Guarding create alone leaves the stack patchable afterwards, which is
 	// the same door by another name.
 	if patch.SelectFilter.LayerStack != nil {
@@ -785,7 +863,7 @@ func (s *Server) refuseRGDeleteIfReferenced(w http.ResponseWriter, r *http.Reque
 	// (the RG is presumed unsafe to drop) but degrade the message
 	// to omit the unknown count rather than print "-1 resource-
 	// definitions".
-	childCount := countChildRDs(r.Context(), s.Store, name)
+	childCount := countChildRDsUncached(r.Context(), s.Store, name)
 	if childCount == 0 {
 		return false
 	}
@@ -824,7 +902,7 @@ func (s *Server) captureResourceGroup(ctx context.Context, name string) (apiv1.R
 // when the delete is safe to commit. Mirrors Bug 145's
 // `rollbackSPDeleteIfRaced` shape.
 func (s *Server) rollbackRGDeleteIfRaced(w http.ResponseWriter, r *http.Request, name string, captured *apiv1.ResourceGroup) bool {
-	childCount := countChildRDs(r.Context(), s.Store, name)
+	childCount := countChildRDsUncached(r.Context(), s.Store, name)
 	if childCount == 0 {
 		return false
 	}

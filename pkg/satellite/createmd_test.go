@@ -190,6 +190,10 @@ func (f *fakeMetadataStamperInternal) StampMetadataCreated(_ context.Context, rd
 	return nil
 }
 
+func (f *fakeMetadataStamperInternal) StampMetadataFound(ctx context.Context, rdName, nodeName string) error {
+	return f.StampMetadataCreated(ctx, rdName, nodeName)
+}
+
 // sequencedFakeExec wraps storage.FakeExec to deliver a sequence of
 // canned responses for the same command line on successive calls.
 // FakeExec keys responses by cmdline — fine for one-shot stubs but
@@ -279,7 +283,7 @@ func TestCreateMDWithCollisionRecoveryFreesForeignZombie(t *testing.T) {
 		Adm: drbd.NewAdm(seq),
 	})
 
-	err := rec.createMDWithCollisionRecovery(context.Background(), "e2e-twovol", "e2e-twovol")
+	err := rec.createMDWithCollisionRecovery(context.Background(), "e2e-twovol", "e2e-twovol", drbd.DefaultGeometry())
 	if err != nil {
 		t.Fatalf("createMDWithCollisionRecovery: %v", err)
 	}
@@ -340,7 +344,7 @@ func TestCreateMDWithCollisionRecoveryRefusesSelfTearDown(t *testing.T) {
 		Adm: drbd.NewAdm(fx),
 	})
 
-	err := rec.createMDWithCollisionRecovery(context.Background(), "e2e-twovol", "e2e-twovol")
+	err := rec.createMDWithCollisionRecovery(context.Background(), "e2e-twovol", "e2e-twovol", drbd.DefaultGeometry())
 	if err == nil {
 		t.Fatalf("createMDWithCollisionRecovery: expected error on self-owned collision, got nil")
 	}
@@ -575,6 +579,9 @@ func uncleanFixture(
 	fx := storage.NewFakeExec()
 	fx.Expect("drbdadm dump-md pvc-unclean/0", storage.FakeResponse{Err: errDumpMdUnclean})
 	fx.Expect("drbdadm create-md --force --max-peers=15 pvc-unclean/0", storage.FakeResponse{})
+	// The superblock is one blockstor made, in its own layout. A test of
+	// another layout registers its own.
+	fx.Expect("drbdadm dump-md --force pvc-unclean/0", storage.FakeResponse{Stdout: dumpWithPeerSlots(15)})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := NewReconciler(ReconcilerConfig{
@@ -603,68 +610,200 @@ func uncleanFixture(
 	return rec, dr, devices, filepath.Join(dir, "pvc-unclean.md-created"), fx
 }
 
-// A lower disk carrying an unclean superblock and no reported GI is
-// initialised, on both activation arms.
-//
-// An unapplied activity log does NOT mean "this volume is established": a
-// volume added to a live resource arrives with firstActivation=false on a
-// lower disk that is brand new, and one carved from a recycled pool extent
-// carries whatever superblock the previous tenant left. Gating
-// re-initialisation on firstActivation stalled exactly that shape — the e2e
-// suite caught vol-1 never leaving Diskless while the kernel had it UpToDate.
-// What tells an established replica apart is a GI it reported, see
-// TestEnsureMetadataRepairsTheCrashOfAReplicaWithAReportedGI.
-func TestEnsureMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
-	for _, firstActivation := range []bool{true, false} {
-		rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+// uncleanMetadataPaths are the three ways the satellite reaches the metadata
+// probe of a volume: the first activation, the diskless to diskful flip and
+// the per-volume path of an established resource.
+func uncleanMetadataPaths(t *testing.T) map[string]func(*Reconciler, *intent.DesiredResource, map[int32]string, string) error {
+	t.Helper()
 
-		if !firstActivation {
-			if err := os.WriteFile(mdMarkerPath, nil, 0o600); err != nil {
-				t.Fatalf("seed .md-created marker: %v", err)
-			}
-		}
+	return map[string]func(*Reconciler, *intent.DesiredResource, map[int32]string, string) error{
+		"first activation": func(rec *Reconciler, dr *intent.DesiredResource, devices map[int32]string, marker string) error {
+			return rec.ensureMetadata(t.Context(), dr, devices, marker, true)
+		},
+		"diskful flip": func(rec *Reconciler, dr *intent.DesiredResource, devices map[int32]string, marker string) error {
+			return rec.ensureMetadata(t.Context(), dr, devices, marker, false)
+		},
+		"per volume": func(rec *Reconciler, dr *intent.DesiredResource, devices map[int32]string, _ string) error {
+			return rec.ensurePerVolumeMetadata(t.Context(), dr, devices, false)
+		},
+	}
+}
 
-		err := rec.ensureMetadata(context.Background(), dr, devices, mdMarkerPath, firstActivation)
-		if err != nil {
-			t.Fatalf("firstActivation=%v: ensureMetadata: %v", firstActivation, err)
-		}
+// dumpForNodeID is dumpWithPeerSlots(7) written for another node id.
+func dumpForNodeID(nodeID int) []byte {
+	return []byte(strings.Replace(string(dumpWithPeerSlots(7)),
+		"node-id 0;", "node-id "+strconv.Itoa(nodeID)+";", 1))
+}
 
-		created := false
+// An unclean superblock on a volume with no GI recorded for it is not
+// re-created, on any metadata path. Before, it was: create-md --force threw
+// away the GI and dirty bitmap of a replica that went down while Primary
+// and writing before a GI was recorded for it, an adopted LINSTOR replica
+// on its first activation here among them, and a full resync followed, or
+// data loss when it held the last good copy. LINSTOR never re-creates
+// metadata that is there. One written for this replica's node id is kept,
+// see TestAnUncleanSuperblockOfThisNodeIDIsKeptWithNoRecordedGI; one written
+// for another node id, or whose node id cannot be read, is refused.
+func TestAnUncleanVolumeWithNoRecordedGIIsRefused(t *testing.T) {
+	for superblock, dump := range map[string]storage.FakeResponse{
+		"another node id":   {Stdout: dumpForNodeID(3)},
+		"never attached":    {Stdout: dumpForNodeID(-1)},
+		"unreadable layout": {Err: errApplyALFailed},
+	} {
+		for name, run := range uncleanMetadataPaths(t) {
+			t.Run(superblock+"/"+name, func(t *testing.T) {
+				rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+				fx.Expect("drbdadm dump-md --force pvc-unclean/0", dump)
 
-		for _, line := range fx.CommandLines() {
-			if strings.Contains(line, "create-md") {
-				created = true
-			}
-		}
+				err := run(rec, dr, devices, mdMarkerPath)
+				if !errors.Is(err, drbd.ErrUncleanMetadataUnrecorded) {
+					t.Fatalf("err = %v, want %v", err, drbd.ErrUncleanMetadataUnrecorded)
+				}
 
-		if !created {
-			t.Errorf("firstActivation=%v: the volume was left without metadata", firstActivation)
+				for _, want := range []string{"drbdadm apply-al pvc-unclean/0", "retries every 5 minutes"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("err = %v, want it to name %q", err, want)
+					}
+				}
+
+				for _, cmd := range []string{"create-md", "apply-al", "set-gi"} {
+					if ranCommand(fx, cmd) {
+						t.Errorf("%s ran over metadata nothing records as foreign", cmd)
+					}
+				}
+			})
 		}
 	}
 }
 
-// ensurePerVolumeMetadata carries its own copy of the unclean mapping, and
-// nothing drove it before: deleting that mapping left the whole suite green
-// while an unclean lower disk stopped being initialised on the path that
-// reaches established resources.
-//
-// The behaviour is the same as its ensureMetadata twin and pinned for the
-// same reason — see TestEnsureMetadataInitialisesAnUncleanLowerDisk.
-func TestEnsurePerVolumeMetadataInitialisesAnUncleanLowerDisk(t *testing.T) {
-	rec, dr, devices, _, fx := uncleanFixture(t)
+// A replica with no recorded GI whose superblock carries its own node id
+// under a dirty activity log is one that crashed while Primary before its
+// GI was recorded, an adopted LINSTOR replica that crashed before the
+// cutover among them. LINSTOR keeps that metadata and attaches it, the
+// kernel applies the log, and the replica resyncs only its dirty extents.
+// Refusing it left the whole resource down, healthy sibling volumes too,
+// until an operator ran drbdadm inside the satellite pod.
+func TestAnUncleanSuperblockOfThisNodeIDIsKeptWithNoRecordedGI(t *testing.T) {
+	for name, run := range uncleanMetadataPaths(t) {
+		t.Run(name, func(t *testing.T) {
+			rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+			fx.Expect(uncleanApplyAL, storage.FakeResponse{})
 
-	err := rec.ensurePerVolumeMetadata(context.Background(), dr, devices, false)
-	if err != nil {
-		t.Fatalf("ensurePerVolumeMetadata: %v", err)
+			if err := run(rec, dr, devices, mdMarkerPath); err != nil {
+				t.Fatalf("err = %v, want the metadata kept", err)
+			}
+
+			if !ranCommand(fx, "apply-al") {
+				t.Error("the activity log was not applied")
+			}
+
+			if ranCommand(fx, "create-md") {
+				t.Error("create-md ran over a superblock of this replica's node id")
+			}
+		})
 	}
+}
 
-	for _, line := range fx.CommandLines() {
-		if strings.Contains(line, "create-md") {
-			return
+// Metadata repaired from a dirty activity log on a first activation keeps
+// the generation and dirty bitmap the replica went down with. The day0 GI
+// seed of a first activation used to overwrite them: with a seed from a
+// peer's GI, or a skip of the initial sync, the bitmap was then reconciled
+// against the wrong generation and its dirty blocks were never resynced,
+// which is what keeping the metadata is for.
+func TestRepairedMetadataIsNotSeededOnAFirstActivation(t *testing.T) {
+	for name, record := range map[string]func(*Reconciler, *intent.DesiredResource, *storage.FakeExec){
+		"this node id, no record": func(*Reconciler, *intent.DesiredResource, *storage.FakeExec) {},
+		"recorded GI": func(_ *Reconciler, dr *intent.DesiredResource, fx *storage.FakeExec) {
+			dr.Volumes[0].ObservedGI = uncleanReportedGI
+			fx.ExpectSequence(uncleanDumpMD,
+				storage.FakeResponse{Err: errDumpMdUnclean},
+				storage.FakeResponse{Stdout: dumpWithPeerBitmap("9F00AA11BB22CC33", uncleanReportedGI)})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+			fx.Expect(uncleanApplyAL, storage.FakeResponse{})
+			record(rec, dr, fx)
+
+			skip := true
+			dr.SkipInitialSync = &skip
+			dr.Volumes[0].SeedFromGI = "4B1C2D3E4F506172"
+
+			if err := rec.ensureMetadata(t.Context(), dr, devices, mdMarkerPath, true); err != nil {
+				t.Fatalf("ensureMetadata: %v", err)
+			}
+
+			if !ranCommand(fx, "apply-al") {
+				t.Fatal("the activity log was not applied")
+			}
+
+			for _, cmd := range []string{"create-md", "set-gi"} {
+				if ranCommand(fx, cmd) {
+					t.Errorf("%s ran over metadata repaired from a dirty activity log", cmd)
+				}
+			}
+		})
+	}
+}
+
+// A restore is the one volume with no GI that is initialised over an
+// unclean superblock: a clone or a receive of a snapshot of an attached
+// volume carries the source's superblock with its activity log open, and
+// needs metadata of its own, even when the source replica had this
+// replica's node id. Once this node created metadata for it, the
+// superblock is the replica's own: a dirty log on it is repaired, and
+// never re-created.
+func TestAnUncleanRestoreIsInitialisedOnlyBeforeItsMetadataIsCreated(t *testing.T) {
+	for name, tc := range map[string]struct {
+		created func(t *testing.T, dr *intent.DesiredResource, marker string)
+		init    bool
+	}{
+		"not yet created": {created: func(*testing.T, *intent.DesiredResource, string) {}, init: true},
+		"condition": {created: func(_ *testing.T, dr *intent.DesiredResource, _ string) {
+			dr.MetadataCreated = true
+		}},
+		"marker": {created: func(t *testing.T, _ *intent.DesiredResource, marker string) {
+			t.Helper()
+
+			if err := os.WriteFile(marker, nil, 0o600); err != nil {
+				t.Fatalf("seed .md-created marker: %v", err)
+			}
+		}},
+	} {
+		for _, path := range []string{"ensureMetadata", "ensurePerVolumeMetadata"} {
+			t.Run(name+"/"+path, func(t *testing.T) {
+				rec, dr, devices, mdMarkerPath, fx := uncleanFixture(t)
+				dr.Volumes[0].SourceSnapshot = "pvc-source:snap-1"
+				fx.Expect(uncleanApplyAL, storage.FakeResponse{})
+				tc.created(t, dr, mdMarkerPath)
+
+				err := runMetadataPath(t, path, rec, dr, devices, mdMarkerPath)
+				if err != nil {
+					t.Fatalf("%s: %v", path, err)
+				}
+
+				if tc.init {
+					if !ranCommand(fx, "create-md") {
+						t.Error("the restored volume was left without metadata of its own")
+					}
+
+					if ranCommand(fx, "apply-al") {
+						t.Error("the source's activity log was applied to the restored volume")
+					}
+
+					return
+				}
+
+				if ranCommand(fx, "create-md") {
+					t.Error("create-md ran over a restored replica whose metadata was created here")
+				}
+
+				if !ranCommand(fx, "apply-al") {
+					t.Error("the activity log of a restored replica whose metadata was created here was not applied")
+				}
+			})
 		}
 	}
-
-	t.Error("the volume was left without metadata")
 }
 
 const (
@@ -699,6 +838,13 @@ func dumpWithHistory(current, history string) []byte {
 	return dumpV09(current, "0000000000000000", history)
 }
 
+// dumpWithPeerSlots is a dump of a superblock with the given peer-slot
+// count and no GI anything here recorded.
+func dumpWithPeerSlots(slots int) []byte {
+	return []byte(strings.Replace(string(dumpWithPeerBitmap("9F00AA11BB22CC33", "0000000000000000")),
+		"max-peers 7;", "max-peers "+strconv.Itoa(slots)+";", 1))
+}
+
 func dumpV09(current, peerBitmap, history string) []byte {
 	return []byte("# DRBD meta data dump\nversion \"v09\";\n\nmax-peers 7;\n" +
 		"node-id 0;\ncurrent-uuid 0x" + current + ";\nflags 0x00000011;\n" +
@@ -709,6 +855,7 @@ func dumpV09(current, peerBitmap, history string) []byte {
 		"    bitmap-dagtag 0x0000000000000000;\n    flags 0x00000005;\n}\n" +
 		"history-uuids {\n        0x" + history + "; 0x0000000000000000; 0x0000000000000000; 0x0000000000000000;\n}\n" +
 		"la-size-sect 2097152;\nbm-byte-per-bit 4096;\ndevice-uuid 0x5A5A5A5A5A5A5A5A;\n" +
+		"la-peer-max-bio-size 1048576;\nal-stripes 1;\nal-stripe-size-4k 8;\n" +
 		"bitmap[0] {\n   # at 0kB\n    64 times 0x0000000000000000;\n}\n")
 }
 
@@ -909,6 +1056,27 @@ func TestDeleteResourceForgetsTheGIRecord(t *testing.T) {
 
 	if got := mustRecordedGIs(t, rec, "pvc-unclean", 0); len(got) != 1 {
 		t.Fatalf("the re-created replica's first GI was not recorded: %v", got)
+	}
+}
+
+// Deleting a resource takes the reconnect a DRBD workaround owed it, so
+// a replica created again under the name is not adjusted for a peer the
+// old one lost.
+func TestDeleteResourceDropsTheOwedReconnect(t *testing.T) {
+	rec := uncleanReconciler(t)
+
+	record := filepath.Join(rec.StateDir(), "pvc-unclean"+ReconnectPendingSuffix)
+	if err := os.WriteFile(record, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := rec.DeleteResource(context.Background(), &intent.DeleteResourceRequest{Name: "pvc-unclean"})
+	if err != nil || !resp.GetOk() {
+		t.Fatalf("DeleteResource: %v, %+v", err, resp)
+	}
+
+	if _, err := os.Stat(record); !os.IsNotExist(err) {
+		t.Errorf("the deleted resource kept its owed reconnect: %v", err)
 	}
 }
 

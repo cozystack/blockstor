@@ -141,3 +141,135 @@ func TestWireToCRDSnapshotSuspendIOByGroup(t *testing.T) {
 			grouped.Labels[LabelSnapshotGroupID])
 	}
 }
+
+// TestSnapshotRecordsVolumeDefinitionProps pins that a snapshot keeps
+// its volume definitions' props as they were when it was taken, the
+// block size among them, and serves those rather than what the
+// definition carries later. A restore copies them, so the restored
+// volume comes up at the sector size its data was written at.
+func TestSnapshotRecordsVolumeDefinitionProps(t *testing.T) {
+	t.Parallel()
+
+	in := &apiv1.Snapshot{
+		Name:         "snap-1",
+		ResourceName: "pvc-1",
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{{
+			VolumeNumber: 0,
+			SizeKib:      1024,
+			VolumeDefinitionProps: map[string]string{
+				"DrbdOptions/Disk/block-size":    "4096",
+				"Linstor/Drbd/freeze-block-size": "True",
+				"LuksPassphrase":                 "never-recorded",
+			},
+		}},
+	}
+
+	spec := wireToCRDSnapshotSpec(in)
+
+	recorded := spec.VolumeDefinitions[0].Props
+	if recorded["DrbdOptions/Disk/block-size"] != "4096" || recorded["Linstor/Drbd/freeze-block-size"] != "True" {
+		t.Fatalf("recorded props %v, want the block size and its freeze", recorded)
+	}
+
+	if _, ok := recorded["LuksPassphrase"]; ok {
+		t.Fatalf("a passphrase prop was recorded on the snapshot: %v", recorded)
+	}
+
+	// The definition has changed since.
+	parent := &crdv1alpha1.ResourceDefinition{
+		Spec: crdv1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []crdv1alpha1.ResourceDefinitionVolume{{
+				VolumeNumber: 0,
+				Props:        map[string]string{"DrbdOptions/Disk/block-size": "512"},
+			}},
+		},
+	}
+
+	got := crdToWireSnapshot(&crdv1alpha1.Snapshot{Spec: spec}, parent)
+	if v := got.VolumeDefinitions[0].VolumeDefinitionProps["DrbdOptions/Disk/block-size"]; v != "4096" {
+		t.Fatalf("snapshot serves block-size %q, want the recorded 4096", v)
+	}
+}
+
+// TestSnapshotWithoutRecordFallsBackToDefinition: a snapshot recorded
+// before the props were kept, an adopted LINSTOR one among them, serves
+// its definition's current props, and one recorded with none serves none.
+func TestSnapshotWithoutRecordFallsBackToDefinition(t *testing.T) {
+	t.Parallel()
+
+	parent := &crdv1alpha1.ResourceDefinition{
+		Spec: crdv1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []crdv1alpha1.ResourceDefinitionVolume{{
+				VolumeNumber: 0,
+				Props:        map[string]string{"DrbdOptions/Disk/block-size": "4096"},
+			}},
+		},
+	}
+
+	old := &crdv1alpha1.Snapshot{Spec: crdv1alpha1.SnapshotSpec{
+		VolumeDefinitions: []crdv1alpha1.SnapshotVolumeRef{{VolumeNumber: 0, SizeKib: 1024}},
+	}}
+
+	if v := crdToWireSnapshot(old, parent).VolumeDefinitions[0].VolumeDefinitionProps["DrbdOptions/Disk/block-size"]; v != "4096" {
+		t.Fatalf("unrecorded snapshot serves block-size %q, want the definition's 4096", v)
+	}
+
+	empty := &crdv1alpha1.Snapshot{Spec: crdv1alpha1.SnapshotSpec{
+		VolumeDefinitions: []crdv1alpha1.SnapshotVolumeRef{{VolumeNumber: 0, SizeKib: 1024, Props: map[string]string{}}},
+	}}
+
+	if props := crdToWireSnapshot(empty, parent).VolumeDefinitions[0].VolumeDefinitionProps; len(props) != 0 {
+		t.Fatalf("a snapshot recorded with no props serves %v", props)
+	}
+}
+
+// TestCrdToWireSnapshotCarriesTheAbortReason: the snapshot create answers
+// a failed take with the abort the controller recorded, so the wire DTO
+// carries it, from Spec or, for a writer that predates the field, from the
+// annotation written beside it.
+func TestCrdToWireSnapshotCarriesTheAbortReason(t *testing.T) {
+	t.Parallel()
+
+	const reason = "snapshot aborted: the take did not start in time"
+
+	fromSpec := &crdv1alpha1.Snapshot{
+		Spec: crdv1alpha1.SnapshotSpec{ResourceDefinitionName: "src", SnapshotName: "snap", AbortReason: reason},
+	}
+
+	if got := crdToWireSnapshot(fromSpec, nil).AbortReason; got != reason {
+		t.Errorf("from Spec: AbortReason %q, want %q", got, reason)
+	}
+
+	fromAnnotation := &crdv1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			crdv1alpha1.AnnotationSnapshotAbortReason: reason,
+		}},
+		Spec: crdv1alpha1.SnapshotSpec{ResourceDefinitionName: "src", SnapshotName: "snap"},
+	}
+
+	if got := crdToWireSnapshot(fromAnnotation, nil).AbortReason; got != reason {
+		t.Errorf("from the annotation: AbortReason %q, want %q", got, reason)
+	}
+}
+
+// TestCRDToWireSnapshotCarriesDeleteFailures: the satellite records why
+// deleting its copy failed on the CRD status; the REST delete reads the
+// snapshot through this conversion and answers with that error, so the
+// conversion must not drop it.
+func TestCRDToWireSnapshotCarriesDeleteFailures(t *testing.T) {
+	t.Parallel()
+
+	crd := &crdv1alpha1.Snapshot{
+		Spec: crdv1alpha1.SnapshotSpec{ResourceDefinitionName: "rd1", SnapshotName: "snap1", Nodes: []string{"n1"}},
+		Status: crdv1alpha1.SnapshotStatus{
+			DeleteFailures: []crdv1alpha1.SnapshotDeleteFailure{{NodeName: "n1", Message: "pool in error"}},
+		},
+	}
+
+	got := crdToWireSnapshot(crd, nil).DeleteFailures
+
+	want := []apiv1.SnapshotDeleteFailure{{NodeName: "n1", Message: "pool in error"}}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Errorf("DeleteFailures: got %+v, want %+v", got, want)
+	}
+}

@@ -64,9 +64,12 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/apihealth"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 	"github.com/cozystack/blockstor/pkg/rest"
 	"github.com/cozystack/blockstor/pkg/store"
 	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
+	"github.com/cozystack/blockstor/pkg/version"
 )
 
 // apiserverFlags collects every CLI knob the binary exposes.
@@ -140,7 +143,12 @@ func newScheme() *runtime.Scheme {
 // independently. Caches still warm up so the REST server's
 // cached-client reads are cheap.
 func buildManager(flags *apiserverFlags) (manager.Manager, *storek8s.Store, error) {
-	mgr, st, err := storek8s.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	restCfg, err := apihealth.GetConfig()
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "apiserver")
+	}
+
+	mgr, st, err := storek8s.NewManager(restCfg, ctrl.Options{
 		Scheme: newScheme(),
 		Metrics: metricsserver.Options{
 			BindAddress:   flags.metricsAddr,
@@ -204,6 +212,14 @@ func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserver
 			"address", flags.restAddr)
 	}
 
+	// Every resource view derives the encryption state, and linstor-csi
+	// polls the view; the watches keep that off the API server while
+	// nothing changes.
+	encryptionWatches, err := passphrase.AddWatchedReader(mgr, namespace)
+	if err != nil {
+		return errors.Wrap(err, "add the passphrase watches")
+	}
+
 	err = mgr.Add(&rest.Server{
 		Addr:      flags.restAddr,
 		TLS:       tlsOptions(flags),
@@ -213,7 +229,12 @@ func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserver
 		// The passphrase Secret is read past the cache, so no informer
 		// watches every Secret in the cluster for it.
 		SecretReader: mgr.GetAPIReader(),
-		OnReady:      ready.MarkBound,
+		// A snapshot create answers once its take is over, as LINSTOR's.
+		SnapshotTakeWait:   rest.SnapshotTakeWait,
+		StateReader:        encryptionWatches,
+		OnReady:            ready.MarkBound,
+		ResourceReadyWait:  rest.DefaultResourceReadyWait,
+		ResourceDeployWait: rest.DefaultResourceDeployWait,
 	})
 	if err != nil {
 		return errors.Wrap(err, "add rest server")
@@ -286,6 +307,7 @@ func main() {
 	}
 
 	setupLog.Info("Starting apiserver",
+		version.LogKey, version.Version,
 		"rest_debug_http", flags.restAddr,
 		"rest_tls", flags.tlsAddr,
 		"tls_enabled", tlsOptions(flags) != nil,

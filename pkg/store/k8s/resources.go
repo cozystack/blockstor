@@ -20,11 +20,14 @@ package k8s
 
 import (
 	"context"
+	"maps"
 	"slices"
 	"sort"
+	"strconv"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -43,6 +46,10 @@ const (
 
 type resources struct {
 	c ctrlclient.Client
+
+	// rds lets a replica delete take the resource-connection props of
+	// its node off the definition (see dropConnectionProps).
+	rds *resourceDefinitions
 
 	// apiReader is the manager's direct, uncached reader. ListByNode uses
 	// it when it is there; see nodeScopedReader for why that read in
@@ -287,7 +294,8 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 	// `lookupVolumeNumbers` during the harm window leaks the backing
 	// LV / zvol. Mirrors the RD / RG / Snapshot stores.
 	mergeUserAnnotationsInto(&existing.ObjectMeta, withoutCallerNameAnnotations(in.Annotations),
-		crdv1alpha1.ResourceAnnotationVolumeNumbers, AnnotationLinstorRDName, AnnotationLinstorNodeName)
+		crdv1alpha1.ResourceAnnotationVolumeNumbers, crdv1alpha1.ResourceAnnotationLiveMigrateApplied,
+		AnnotationLinstorRDName, AnnotationLinstorNodeName)
 
 	err = s.c.Update(ctx, &existing)
 	if err != nil {
@@ -369,16 +377,24 @@ func (s *resources) PatchResourceSpec(ctx context.Context, rdName, node string, 
 		// path and protects against future closures that explicitly
 		// reset live.Annotations.
 		mergeUserAnnotationsInto(&existing.ObjectMeta, withoutCallerNameAnnotations(wire.Annotations),
-			crdv1alpha1.ResourceAnnotationVolumeNumbers, AnnotationLinstorRDName, AnnotationLinstorNodeName)
+			crdv1alpha1.ResourceAnnotationVolumeNumbers, crdv1alpha1.ResourceAnnotationLiveMigrateApplied,
+			AnnotationLinstorRDName, AnnotationLinstorNodeName)
 
 		return s.c.Patch(ctx, &existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
 	}), "patch Resource %s/%s", rdName, node)
 }
 
 func (s *resources) Delete(ctx context.Context, rdName, node string) error {
+	// The connection props go first, so a failure to drop them leaves
+	// the replica in place and a retried delete drops them still.
+	err := s.dropConnectionProps(ctx, rdName, node)
+	if err != nil {
+		return err
+	}
+
 	crd := &crdv1alpha1.Resource{ObjectMeta: metav1.ObjectMeta{Name: resourceCRDName(rdName, node)}}
 
-	err := s.c.Delete(ctx, crd)
+	err = s.c.Delete(ctx, crd)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return errors.Wrapf(store.ErrNotFound, "resource %q on node %q", rdName, node)
@@ -452,6 +468,11 @@ func (s *resources) DeleteIfTieBreaker(ctx context.Context, rdName, node string)
 
 		return false, errors.Wrapf(err, "delete Resource %s/%s", rdName, node)
 	}
+
+	// After the delete, not before: the precondition may yet refuse
+	// it. A witness carries no connection props of its own in
+	// practice, so a failure here is not worth failing the reap for.
+	_ = s.dropConnectionProps(ctx, rdName, node)
 
 	return true, nil
 }
@@ -693,7 +714,9 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 			DrbdState:         crd.Status.DrbdState,
 			ToggleDiskRetries: crd.Status.ToggleDiskRetries,
 		},
-		ToggleDiskCancel: crd.Spec.ToggleDiskCancel,
+		ToggleDiskCancel:     crd.Spec.ToggleDiskCancel,
+		SatelliteIncarnation: crd.Status.SatelliteIncarnation,
+		KernelSlotDestroyed:  kernelSlotDeparted(&crd.Status),
 		Volumes: volumesWithReplicationStates(
 			volumesFromStatus(crd.Status.Volumes),
 			crd.Status.Connections,
@@ -706,6 +729,7 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 		// metadata.creationTimestamp is the per-replica creation time
 		// and the natural, persistence-free source for it.
 		CreateTimestamp: crdCreateTimestampMs(crd),
+		ApplyFailure:    applyFailureFromStatus(crd.Status.ApplyFailure),
 	}
 }
 
@@ -719,6 +743,43 @@ func deletedVolumesFromStatus(in []crdv1alpha1.DeletedVolumeStatus) []apiv1.Dele
 	out := make([]apiv1.DeletedVolume, 0, len(in))
 	for _, d := range in {
 		out = append(out, apiv1.DeletedVolume{VolumeNumber: d.VolumeNumber, DeleteID: d.DeleteID})
+	}
+
+	return out
+}
+
+// kernelSlotDeparted reports whether the satellite saw the replica's
+// DRBD kernel resource destroyed and the stored status agrees: the
+// KernelLoaded Condition is False and no volume disk state or peer
+// link is left. The Condition is written only from events2 resource
+// frames, so a write that failed when the resource came back leaves it
+// False on a healthy replica. Every status write the observer makes
+// carries the replica's cached disk states and links, so such a
+// replica keeps a disk state and the reads do not answer it as gone.
+func kernelSlotDeparted(status *crdv1alpha1.ResourceStatus) bool {
+	if !meta.IsStatusConditionFalse(status.Conditions, crdv1alpha1.ConditionKernelLoaded) {
+		return false
+	}
+
+	if len(status.Connections) > 0 {
+		return false
+	}
+
+	return !slices.ContainsFunc(status.Volumes, func(vol crdv1alpha1.ResourceVolumeStatus) bool {
+		return vol.DiskState != ""
+	})
+}
+
+// applyFailureFromStatus projects the satellite's last apply error onto
+// the wire Resource, nil when the last pass succeeded.
+func applyFailureFromStatus(in *crdv1alpha1.ResourceApplyFailure) *apiv1.ApplyFailure {
+	if in == nil {
+		return nil
+	}
+
+	out := &apiv1.ApplyFailure{Message: in.Message, SizesKib: make(map[int32]int64, len(in.Volumes))}
+	for _, vol := range in.Volumes {
+		out.SizesKib[vol.VolumeNumber] = vol.SizeKib
 	}
 
 	return out
@@ -790,7 +851,8 @@ func volumesFromStatus(in []crdv1alpha1.ResourceVolumeStatus) []apiv1.Volume {
 				CurrentGi:    volStatus.CurrentGI,
 				OutOfSyncKib: volStatus.OutOfSyncKib,
 			},
-			LayerDataList: layerDataList,
+			LayerDataList:  layerDataList,
+			AppliedSizeKib: volStatus.AppliedSizeKib,
 		})
 	}
 
@@ -803,6 +865,16 @@ func volumesFromStatus(in []crdv1alpha1.ResourceVolumeStatus) []apiv1.Volume {
 // — it cannot infer per-peer replication from
 // `layer_object.drbd.connections[].replication_state`, even though
 // blockstor stores the data there too.
+//
+// The replication state is the volume's own with that peer
+// (peerVolumes[].replicationState) and done_percentage that volume's
+// `done`, so a two-volume resource reports each volume's own resync,
+// as LINSTOR does from its per-peer, per-volume DrbdVolume. The
+// connection-level replicationState is whichever volume's frame came
+// last; it is only the fallback for a volume the satellite has not
+// reported per volume yet. LINSTOR fills done_percentage whenever the
+// satellite reported one (Json.apiToVolumeState), whatever the
+// replication state, and so does this.
 func volumesWithReplicationStates(
 	vols []apiv1.Volume,
 	conns []crdv1alpha1.ResourceConnectionStatus,
@@ -811,28 +883,62 @@ func volumesWithReplicationStates(
 		return vols
 	}
 
-	states := make(map[string]apiv1.ReplicationState, len(conns))
-
-	for i := range conns {
-		c := &conns[i]
-		if c.ReplicationState == "" {
-			continue
-		}
-
-		states[c.PeerNodeName] = apiv1.ReplicationState{
-			ReplicationState: c.ReplicationState,
-		}
-	}
-
-	if len(states) == 0 {
-		return vols
-	}
-
 	for i := range vols {
-		vols[i].State.ReplicationStates = states
+		states := make(map[string]apiv1.ReplicationState, len(conns))
+
+		for j := range conns {
+			c := &conns[j]
+			peerVol := findPeerVolume(c.PeerVolumes, vols[i].VolumeNumber)
+
+			repl := c.ReplicationState
+			if peerVol != nil && peerVol.ReplicationState != "" {
+				repl = peerVol.ReplicationState
+			}
+
+			if repl == "" {
+				continue
+			}
+
+			states[c.PeerNodeName] = apiv1.ReplicationState{
+				ReplicationState: repl,
+				DonePercentage:   peerVolumeDone(peerVol),
+			}
+		}
+
+		if len(states) > 0 {
+			vols[i].State.ReplicationStates = states
+		}
 	}
 
 	return vols
+}
+
+// findPeerVolume returns one volume's entry of a connection's
+// per-volume peer view, nil when the satellite reported none.
+func findPeerVolume(peerVolumes []crdv1alpha1.PeerVolumeStatus, volumeNumber int32) *crdv1alpha1.PeerVolumeStatus {
+	for i := range peerVolumes {
+		if peerVolumes[i].VolumeNumber == volumeNumber {
+			return &peerVolumes[i]
+		}
+	}
+
+	return nil
+}
+
+// peerVolumeDone parses the `done` token the satellite recorded for
+// one volume on one connection. nil when the volume has none or the
+// token does not parse: no progress is better than a made-up one.
+func peerVolumeDone(peerVol *crdv1alpha1.PeerVolumeStatus) *float64 {
+	if peerVol == nil || peerVol.Done == "" {
+		return nil
+	}
+
+	done, err := strconv.ParseFloat(peerVol.Done, 64)
+	if err != nil {
+		return nil
+	}
+
+	return &done
 }
 
 // volumeLayerDataFromStack mirrors the resource-level layer stack
@@ -1007,6 +1113,12 @@ func drbdLayerFromStatus(st *crdv1alpha1.ResourceStatus) *apiv1.DrbdResourceLaye
 
 			hasAny = true
 		}
+	}
+
+	if st.PromotionScore != nil || st.MayPromote != nil {
+		out.PromotionScore = st.PromotionScore
+		out.MayPromote = st.MayPromote
+		hasAny = true
 	}
 
 	if !hasAny {
@@ -1245,4 +1357,39 @@ func (s *resources) nodeScopedReader() ctrlclient.Reader {
 	}
 
 	return s.c
+}
+
+// dropConnectionProps takes the resource-connection props of node off
+// the definition, as LINSTOR deletes the connections of a resource with
+// it: a replica created on the node later starts from none, and does not
+// pick up a stale allow-two-primaries or protocol. Every delete path
+// (REST, CLI, the tiebreaker and lost-node reapers) goes through here.
+func (s *resources) dropConnectionProps(ctx context.Context, rdName, node string) error {
+	if s.rds == nil {
+		return nil
+	}
+
+	rd, err := s.rds.Get(ctx, rdName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+
+		return errors.Wrapf(err, "get ResourceDefinition %s", rdName)
+	}
+
+	if !apiv1.DropResourceConnectionProps(node, maps.Clone(rd.Props)) {
+		return nil
+	}
+
+	err = s.rds.PatchResourceDefinitionSpec(ctx, rdName, func(live *apiv1.ResourceDefinition) error {
+		apiv1.DropResourceConnectionProps(node, live.Props)
+
+		return nil
+	})
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return errors.Wrapf(err, "drop connection props of %s from %s", node, rdName)
+	}
+
+	return nil
 }

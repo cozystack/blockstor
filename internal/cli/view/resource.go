@@ -25,9 +25,10 @@ limitations under the License.
 //
 // Column names and order are a contract: shell in this repository
 // parses these tables at fixed `awk -F'|'` indexes, so the tests pin
-// both. The derivations were reproduced from observed output and from
-// this repository's own assertions, not from the upstream client's
-// (GPL) source.
+// both. The derivations reproduce the upstream client's observable
+// behaviour, the cells and colours `linstor r l` shows for each layer
+// stack and state, and this repository's own assertions. No upstream
+// code or structure is carried over.
 package view
 
 import (
@@ -41,6 +42,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/naming"
+
+	"github.com/cozystack/blockstor/internal/cli/color"
 )
 
 // Well-known state cells shared across views.
@@ -48,18 +52,33 @@ const (
 	stateOk       = "Ok"
 	stateDeleting = "DELETING"
 	stateUnknown  = "Unknown"
+	stateCreated  = "Created"
+	stateDiskless = "Diskless"
 	flagDelete    = "DELETE"
+
+	// stateAttachFailed is a replica that should have a disk, reports
+	// none, and whose satellite has failed to attach one at least
+	// once.
+	stateAttachFailed = "AttachFailed"
+
+	replicationStateSyncTarget = "SyncTarget"
 )
 
-// State cells that are terminal — a converged replica never carries a
-// sync percentage, which a harness asserts by grepping for the absence
-// of `UpToDate(NN%)`.
-var terminalStates = map[string]struct{}{ //nolint:gochecknoglobals // static classification table
-	"uptodate":   {},
-	"diskless":   {},
-	"tiebreaker": {},
-	"created":    {},
-}
+// Flags the State column reads beyond the ones apiv1 names.
+const (
+	flagDrbdDelete          = "DRBD_DELETE"
+	flagEvacuate            = "EVACUATE"
+	flagEvicted             = "EVICTED"
+	flagDiskAdding          = "DISK_ADDING"
+	flagDiskAddRequested    = "DISK_ADD_REQUESTED"
+	flagDiskRemoving        = "DISK_REMOVING"
+	flagDiskRemoveRequested = "DISK_REMOVE_REQUESTED"
+)
+
+// propSkipDisk is the property the satellite stamps on a replica whose
+// backing disk failed with an I/O error; DRBD keeps that disk detached
+// while it is true.
+const propSkipDisk = "DrbdOptions/SkipDisk"
 
 // ResourceListInput is everything `resource list` renders from.
 type ResourceListInput struct {
@@ -67,17 +86,19 @@ type ResourceListInput struct {
 	// the caller passed those flags.
 	Resources []apiv1.Resource
 
-	// VolumeSizesKib maps a resource-definition name to its volume
-	// sizes, used to turn the observed out-of-sync KiB into a progress
-	// percentage. Absent sizes simply omit the percentage.
-	//
-	// Keyed by definition, not by volume number alone: a listing spans
-	// several definitions, and volume 0 of one is not volume 0 of
-	// another.
-	VolumeSizesKib map[string]map[int32]int64
+	// DefinitionProps maps a resource-definition name (naming.Key) to
+	// its own properties, so a SkipDisk set on the definition shows on
+	// every replica of it.
+	DefinitionProps map[string]map[string]string
 
-	// FaultyOnly keeps only replicas whose observed disk state is
-	// present and not converged (`--faulty`).
+	// Primaries maps a resource-definition name (naming.Key) to how
+	// many of its replicas are in use. Nil counts them from Resources;
+	// a caller that has already narrowed Resources passes the count
+	// from the rows it read, so filtering out a healthy primary does
+	// not hide a second one.
+	Primaries map[string]int
+
+	// FaultyOnly keeps only the rows IsFaulty reports (`--faulty`).
 	FaultyOnly bool
 }
 
@@ -87,10 +108,17 @@ func ResourceList(in ResourceListInput) *metav1.Table {
 		ColumnDefinitions: columns("ResourceName", "Node", "Port", "Usage", "Conns", "State", "CreatedOn"),
 	}
 
+	primaries := in.Primaries
+	if primaries == nil {
+		primaries = PrimariesByDefinition(in.Resources)
+	}
+
 	for i := range in.Resources {
 		res := &in.Resources[i]
+		key := naming.Key(res.Name)
 
-		if in.FaultyOnly && !IsFaulty(res) {
+		row := describeReplica(res, primaries[key], in.DefinitionProps[key])
+		if in.FaultyOnly && row.state.Class == color.Healthy {
 			continue
 		}
 
@@ -98,9 +126,9 @@ func ResourceList(in ResourceListInput) *metav1.Table {
 			res.Name,
 			res.NodeName,
 			drbdPort(res),
-			usageCell(res),
-			connsCell(res),
-			stateCell(res, in.VolumeSizesKib[res.Name]),
+			row.usage,
+			row.conns,
+			row.state,
 			createdOn(res.CreateTimestamp),
 		}})
 	}
@@ -118,19 +146,85 @@ func columns(names ...string) []metav1.TableColumnDefinition {
 	return out
 }
 
+// replicaRow is the derived cells of one `resource list` row.
+type replicaRow struct {
+	usage color.Cell
+	conns color.Cell
+	state color.Cell
+}
+
+// describeReplica derives the Usage, Conns and State cells together,
+// because they depend on each other the way `linstor r l` shows them:
+// a replica being deleted or deactivated reports no usage, Conns stays
+// blank while nothing is known about the replica, and a broken peer
+// link turns the State red whatever the disk says.
+func describeReplica(res *apiv1.Resource, primaries int, defProps map[string]string) replicaRow {
+	var row replicaRow
+
+	reported := true
+
+	switch {
+	case slices.Contains(res.Flags, flagDelete) || slices.Contains(res.Flags, flagDrbdDelete):
+		row.state = color.Cell{Text: stateDeleting, Class: color.Broken}
+	case slices.Contains(res.Flags, apiv1.ResourceFlagInactive):
+		row.state = color.Cell{Text: apiv1.ResourceFlagInactive, Class: color.Transitional}
+	default:
+		row.usage = usageCell(res, primaries)
+		row.state, reported = replicaState(res)
+	}
+
+	row.state = withSkipDisk(row.state, res, defProps)
+	row.state = withToggleDisk(row.state, res.Flags)
+
+	if !reported || row.state.Text == stateUnknown {
+		return row
+	}
+
+	var broken bool
+
+	row.conns, broken = connsCell(res)
+	if broken {
+		row.state.Class = color.Broken
+	}
+
+	return row
+}
+
+// PrimariesByDefinition counts the in-use replicas per definition,
+// keyed by naming.Key. Two at once is either a live migration or a
+// split brain, so the Usage cell turns yellow instead of claiming a
+// healthy InUse.
+func PrimariesByDefinition(resources []apiv1.Resource) map[string]int {
+	out := make(map[string]int, len(resources))
+
+	for i := range resources {
+		inUse := resources[i].State.InUse
+		if inUse != nil && *inUse {
+			out[naming.Key(resources[i].Name)]++
+		}
+	}
+
+	return out
+}
+
 // usageCell renders the tri-state usage. A satellite that has not
-// reported yet leaves the cell blank rather than claiming the replica
-// is unused.
-func usageCell(res *apiv1.Resource) string {
+// reported yet, and a replica whose top layer has no notion of being
+// open (a bare STORAGE volume), leave the cell blank rather than
+// claiming the replica is unused.
+func usageCell(res *apiv1.Resource, primaries int) color.Cell {
 	if res.State.InUse == nil {
-		return ""
+		return color.Cell{}
 	}
 
-	if *res.State.InUse {
-		return "InUse"
+	if !*res.State.InUse {
+		return color.Cell{Text: "Unused", Class: color.Neutral}
 	}
 
-	return "Unused"
+	if primaries > 1 {
+		return color.Cell{Text: "InUse", Class: color.Transitional}
+	}
+
+	return color.Cell{Text: "InUse", Class: color.Healthy}
 }
 
 // drbdPort renders the replica's own DRBD listen port; the allocator
@@ -145,11 +239,19 @@ func drbdPort(res *apiv1.Resource) string {
 }
 
 // connsCell summarises the peer connections: a fully-connected mesh
-// reads `Ok`, and any broken peer is named so a partition is visible
-// in the table instead of hiding behind a healthy-looking summary.
-func connsCell(res *apiv1.Resource) string {
-	if res.LayerObject == nil || res.LayerObject.Drbd == nil || len(res.LayerObject.Drbd.Connections) == 0 {
-		return ""
+// reads `Ok`, and broken peers are named, grouped by what is wrong
+// with them, so a partition is visible in the table instead of hiding
+// behind a healthy-looking summary.
+//
+// A replica with no DRBD layer has no peers to lose and reads `Ok`.
+// The caller leaves the cell blank for a replica nothing has reported
+// on, whose links are not known yet. It reports whether any link is
+// broken.
+func connsCell(res *apiv1.Resource) (color.Cell, bool) {
+	allConnected := color.Cell{Text: stateOk, Class: color.Healthy}
+
+	if !topLayerIsDRBD(res) || len(res.LayerObject.Drbd.Connections) == 0 {
+		return allConnected, false
 	}
 
 	peers := make([]string, 0, len(res.LayerObject.Drbd.Connections))
@@ -159,7 +261,9 @@ func connsCell(res *apiv1.Resource) string {
 
 	sort.Strings(peers)
 
-	broken := make([]string, 0, len(peers))
+	var messages []string
+
+	byMessage := map[string][]string{}
 
 	for _, peer := range peers {
 		conn := res.LayerObject.Drbd.Connections[peer]
@@ -172,122 +276,280 @@ func connsCell(res *apiv1.Resource) string {
 			message = "Unconnected"
 		}
 
-		broken = append(broken, fmt.Sprintf("%s(%s)", message, peer))
+		if _, seen := byMessage[message]; !seen {
+			messages = append(messages, message)
+		}
+
+		byMessage[message] = append(byMessage[message], peer)
 	}
 
-	if len(broken) == 0 {
-		return "Ok"
+	if len(messages) == 0 {
+		return allConnected, false
 	}
 
-	return strings.Join(broken, ",")
+	broken := make([]string, 0, len(messages))
+	for _, message := range messages {
+		broken = append(broken, fmt.Sprintf("%s(%s)", message, strings.Join(byMessage[message], ",")))
+	}
+
+	return color.Cell{Text: strings.Join(broken, ","), Class: color.Broken}, true
 }
 
-// stateCell derives the State column.
+// topLayerIsDRBD reports whether the replica's own layer chain starts
+// with DRBD and carries its payload.
+func topLayerIsDRBD(res *apiv1.Resource) bool {
+	if res.LayerObject == nil || res.LayerObject.Drbd == nil {
+		return false
+	}
+
+	return res.LayerObject.Type == "" || strings.EqualFold(res.LayerObject.Type, apiv1.LayerKindDRBD)
+}
+
+// replicaState derives the State column from the replica's volumes,
+// and whether the satellite has said anything about the replica yet.
 //
-// Order matters: a replica being deleted reads DELETING whatever its
-// disk says, and a tie-breaker reads the literal `TieBreaker` (a
-// harness greps for that exact token, case included) rather than the
-// Diskless it also technically is.
-func stateCell(res *apiv1.Resource, sizes map[int32]int64) string {
-	if slices.Contains(res.Flags, flagDelete) {
-		return stateDeleting
+// A tie-breaker reads the literal `TieBreaker` (a harness greps for
+// that exact token, case included) rather than the Diskless it also
+// technically is: this table has no Flags column to carry the
+// difference. A diskless replica no volume reports on, but whose
+// device the satellite has seen, reads Diskless.
+//
+// A diskless replica or tie-breaker the satellite has never reported
+// on is not known to be healthy: its device may never have come up.
+// It reads yellow, as the upstream client shows it, the tie-breaker
+// keeping its token and a plain diskless one reading Unknown.
+//
+// Otherwise the first volume that is not healthy speaks for the row,
+// and the last one when all are.
+func replicaState(res *apiv1.Resource) (color.Cell, bool) {
+	tieBreaker := slices.Contains(res.Flags, apiv1.ResourceFlagTieBreaker)
+	diskless := slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) && !anyDiskState(res)
+
+	if !tieBreaker && !diskless {
+		return volumesState(res), true
 	}
 
-	if slices.Contains(res.Flags, apiv1.ResourceFlagTieBreaker) {
-		return "TieBreaker"
+	reported := satelliteReported(res)
+
+	switch {
+	case tieBreaker && reported:
+		return color.Cell{Text: "TieBreaker", Class: color.Healthy}, true
+	case tieBreaker:
+		return color.Cell{Text: "TieBreaker", Class: color.Transitional}, false
+	case reported:
+		return color.Cell{Text: stateDiskless, Class: color.Healthy}, true
+	default:
+		return color.Cell{Text: stateUnknown, Class: color.Transitional}, false
 	}
+}
 
-	if slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) {
-		return "Diskless"
-	}
+// volumesState is the state of the first volume that is not healthy,
+// or of the last one when all are.
+func volumesState(res *apiv1.Resource) color.Cell {
+	state := color.Cell{Text: stateUnknown, Class: color.Transitional}
 
-	vol := worstVolume(res)
-	if vol == nil || vol.State.DiskState == "" {
-		return stateUnknown
-	}
+	for i := range res.Volumes {
+		state = volumeState(res, &res.Volumes[i])
 
-	state := vol.State.DiskState
+		if slices.Contains(res.Flags, flagEvacuate) {
+			state.Text += ", Evacuating"
+		}
 
-	// A converged replica never carries a percentage; a syncing one
-	// does, computed from what the satellite reports as still
-	// out-of-sync.
-	if _, terminal := terminalStates[strings.ToLower(state)]; terminal {
-		return state
-	}
-
-	if pct, ok := syncPercent(vol, sizes); ok {
-		return fmt.Sprintf("%s(%d%%)", state, pct)
+		if state.Class != color.Healthy {
+			break
+		}
 	}
 
 	return state
 }
 
-// worstVolume picks the volume whose state the row should report: the
-// first non-converged one, else the first.
-func worstVolume(res *apiv1.Resource) *apiv1.Volume {
-	if len(res.Volumes) == 0 {
-		return nil
-	}
-
-	for i := range res.Volumes {
-		state := strings.ToLower(res.Volumes[i].State.DiskState)
-		if state == "" {
-			continue
-		}
-
-		if _, terminal := terminalStates[state]; !terminal {
-			return &res.Volumes[i]
-		}
-	}
-
-	return &res.Volumes[0]
-}
-
-// syncPercent converts the observed out-of-sync KiB into progress.
-func syncPercent(vol *apiv1.Volume, sizes map[int32]int64) (int, bool) {
-	if vol.State.OutOfSyncKib <= 0 {
-		return 0, false
-	}
-
-	size, ok := sizes[vol.VolumeNumber]
-	if !ok || size <= 0 {
-		return 0, false
-	}
-
-	done := float64(size-vol.State.OutOfSyncKib) / float64(size) * 100
-	if done < 0 {
-		done = 0
-	}
-
-	return int(done), true
-}
-
-// IsFaulty backs `--faulty`: a replica counts as faulty when a volume
-// has an observed disk state that has not converged, or when a peer
-// link is down. A replica the satellite has not reported on is NOT
-// faulty — absence of data is not evidence of breakage, and reporting
-// it as such would drown a real fault.
-func IsFaulty(res *apiv1.Resource) bool {
-	// A replica whose local disk is UpToDate but whose peer link is
-	// StandAlone or failed is exactly the split-brain the
-	// troubleshooting runbooks tell an operator to find with
-	// `--faulty`. Looking only at DiskState hides it.
-	if hasBrokenConnection(res) {
+// satelliteReported reports whether the satellite has written anything
+// it observed about the replica's device: a role, a volume's disk
+// state or a peer link. The store fills none of these on its own.
+func satelliteReported(res *apiv1.Resource) bool {
+	if res.State.DrbdState != "" || anyDiskState(res) {
 		return true
 	}
 
-	for i := range res.Volumes {
-		state := strings.ToLower(res.Volumes[i].State.DiskState)
-		if state == "" {
-			continue
-		}
+	return res.LayerObject != nil && res.LayerObject.Drbd != nil && len(res.LayerObject.Drbd.Connections) > 0
+}
 
-		if _, terminal := terminalStates[state]; !terminal {
+// anyDiskState reports whether any volume of the replica has an
+// observed disk state.
+func anyDiskState(res *apiv1.Resource) bool {
+	for i := range res.Volumes {
+		if res.Volumes[i].State.DiskState != "" {
 			return true
 		}
 	}
 
 	return false
+}
+
+// volumeState derives one volume's state cell.
+//
+// Only a volume whose top layer is DRBD has a disk state to report: a
+// bare STORAGE volume, or LUKS over STORAGE, is either there or not,
+// and once it is listed it reads Created. Reading such a volume's
+// missing disk state as Unknown is what made a healthy local volume
+// look like it was never reported on.
+//
+// There is no `Resizing` marker: nothing in this store flags a volume
+// while it grows, so a branch for one would only ever fire in a test.
+func volumeState(res *apiv1.Resource, vol *apiv1.Volume) color.Cell {
+	if !volumeTopLayerIsDRBD(res, vol) {
+		return color.Cell{Text: stateCreated, Class: color.Healthy}
+	}
+
+	disk := vol.State.DiskState
+
+	class := color.Transitional
+
+	switch strings.ToLower(disk) {
+	case "", "dunknown":
+		return color.Cell{Text: stateUnknown, Class: color.Transitional}
+	case "diskless":
+		// Diskless on purpose is healthy; a replica that was given a
+		// disk and reports none has lost it. Once its satellite has
+		// failed to attach the disk it reads AttachFailed: the failure
+		// repeats until someone acts, and a bare Diskless next to an Ok
+		// connection column reads as a healthy diskless replica.
+		class = color.Broken
+		if slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) {
+			class = color.Healthy
+		} else if res.State.ToggleDiskRetries > 0 {
+			return color.Cell{Text: stateAttachFailed, Class: color.Broken}
+		}
+	case "inconsistent", "failed", "to: creating", "to: attachable", "to: attaching":
+		class = color.Broken
+	case "uptodate", "created", "attached":
+		class = color.Healthy
+	}
+
+	// A volume resyncing from a peer reads `SyncTarget(50.31%)`, DRBD's
+	// own `done` for that resync, which is what `linstor r l` shows
+	// against LINSTOR. No other state carries a percentage. One derived
+	// from the volume size and the out-of-sync count is wrong once a
+	// replica resyncs from more than one peer: the count is the last
+	// peer's, so a replica half way through a full resync read
+	// `Inconsistent(99%)` after a small resync from another peer.
+	if done, ok := vol.State.SyncProgress(replicationStateSyncTarget); ok {
+		return color.Cell{Text: apiv1.SyncProgressState(replicationStateSyncTarget, done), Class: color.Transitional}
+	}
+
+	return color.Cell{Text: disk, Class: class}
+}
+
+// volumeTopLayerIsDRBD reads the volume's own layer list first and the
+// replica's layer chain after it. A volume with neither was never
+// stamped with a stack, which in this store means the default one, and
+// that starts with DRBD.
+func volumeTopLayerIsDRBD(res *apiv1.Resource, vol *apiv1.Volume) bool {
+	if len(vol.LayerDataList) > 0 {
+		return strings.EqualFold(vol.LayerDataList[0].Type, apiv1.LayerKindDRBD)
+	}
+
+	if res.LayerObject != nil && res.LayerObject.Type != "" {
+		return strings.EqualFold(res.LayerObject.Type, apiv1.LayerKindDRBD)
+	}
+
+	return true
+}
+
+// withToggleDisk appends an in-flight toggle-disk to the state. The
+// conversion is work in progress, so a state that read healthy turns
+// yellow until it finishes.
+func withToggleDisk(state color.Cell, flags []string) color.Cell {
+	var suffix string
+
+	switch {
+	case slices.Contains(flags, flagDiskAdding):
+		suffix = ", Adding Disk"
+	case slices.Contains(flags, flagDiskAddRequested):
+		suffix = ", Adding Disk (pending)"
+	case slices.Contains(flags, flagDiskRemoving):
+		suffix = ", Removing Disk"
+	case slices.Contains(flags, flagDiskRemoveRequested):
+		suffix = ", Removing Disk (pending)"
+	default:
+		return state
+	}
+
+	state.Text += suffix
+	if state.Class == color.Healthy || state.Class == color.Neutral {
+		state.Class = color.Transitional
+	}
+
+	return state
+}
+
+// IsFaulty backs `--faulty`: a replica is faulty when its State cell
+// is anything but green, which already covers a broken peer link. So
+// the filter lists exactly the rows the table flags: a diskful replica
+// that lost its disk, one being deleted or deactivated, one nothing
+// has reported on yet, one with SkipDisk set or a toggle-disk in
+// flight. defProps are the properties of the replica's definition.
+func IsFaulty(res *apiv1.Resource, defProps map[string]string) bool {
+	return describeReplica(res, 0, defProps).state.Class != color.Healthy
+}
+
+// SkipDisk reports whether the replica's State carries the SkipDisk
+// marker, so a caller can explain it under the table.
+func SkipDisk(res *apiv1.Resource, defProps map[string]string) bool {
+	return skipDiskSuffix(res, defProps) != ""
+}
+
+// SkipDiskHelp explains the SkipDisk marker. It goes to stderr, under a
+// table that showed one, so the table itself stays parseable.
+const SkipDiskHelp = `SkipDisk: DrbdOptions/SkipDisk is set on at least one replica above.
+  The satellite sets it after an I/O error on the backing disk, and DRBD
+  keeps that disk detached while it stays set. Once the disk is repaired
+  or replaced, remove it with
+  'r sp <node> <resource> DrbdOptions/SkipDisk ""' (or 'rd sp' where the
+  marker reads RD) so the volume is attached, and recreated if needed.
+`
+
+// withSkipDisk marks a replica whose disk is held detached. It is not
+// healthy whatever the volumes say, so a green state turns yellow.
+func withSkipDisk(state color.Cell, res *apiv1.Resource, defProps map[string]string) color.Cell {
+	suffix := skipDiskSuffix(res, defProps)
+	if suffix == "" {
+		return state
+	}
+
+	state.Text += suffix
+	if state.Class == color.Healthy || state.Class == color.Neutral {
+		state.Class = color.Transitional
+	}
+
+	return state
+}
+
+// skipDiskSuffix renders `, SkipDisk (R, RD)`: the replica's own value
+// wins over its definition's, as it does for the satellite, and every
+// scope that sets the key is named, the winning one first. Empty when
+// the effective value is not true.
+func skipDiskSuffix(res *apiv1.Resource, defProps map[string]string) string {
+	var scopes []string
+
+	value, set := res.Props[propSkipDisk]
+	if set {
+		scopes = append(scopes, "R")
+	}
+
+	if defValue, ok := defProps[propSkipDisk]; ok {
+		if !set {
+			value = defValue
+		}
+
+		scopes = append(scopes, "RD")
+	}
+
+	if !strings.EqualFold(value, "true") {
+		return ""
+	}
+
+	return ", SkipDisk (" + strings.Join(scopes, ", ") + ")"
 }
 
 // hasBrokenConnection reports whether any DRBD peer link is in a state

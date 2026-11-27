@@ -79,12 +79,20 @@ func seedIntervalFixture(t *testing.T, ctx context.Context, st store.Store, plac
 		if err := st.Resources().Create(ctx, &apiv1.Resource{
 			Name:     "pvc-interval",
 			NodeName: n,
+			Volumes:  upToDateVolumes(),
 		}); err != nil {
 			t.Fatalf("seed existing replica on %q: %v", n, err)
 		}
 	}
 
 	return rg
+}
+
+// upToDateVolumes is the volume list of a replica whose satellite
+// reports its copy complete. The scheduled tick only tops up a
+// definition that has one such replica, as LINSTOR's balance task does.
+func upToDateVolumes() []apiv1.Volume {
+	return []apiv1.Volume{{VolumeNumber: 0, State: apiv1.VolumeState{DiskState: "UpToDate"}}}
 }
 
 // TestRebalanceInterval pins scenario 2.15 first half: with the

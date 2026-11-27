@@ -128,6 +128,7 @@ var brokenStates = map[string]struct{}{ //nolint:gochecknoglobals // static clas
 	"unconnected":    {},
 	"faulty":         {},
 	"error":          {},
+	"attachfailed":   {},
 }
 
 // ClassifyState buckets a state string. Matching is case-insensitive
@@ -250,4 +251,24 @@ func (w Writer) Paint(s string, class Class) string {
 // PaintState is the common case: classify a state string, then paint it.
 func (w Writer) PaintState(state string) string {
 	return w.Paint(state, ClassifyState(state))
+}
+
+// Cell is a table cell whose class the view decided rather than the
+// renderer guessing it from the text.
+//
+// Classifying by text cannot tell two cells apart that read the same:
+// `Diskless` is healthy on a replica placed without a disk and broken
+// on one that lost its disk, and `Unknown` in a State column is a
+// replica not reported yet, not a failure. A view that knows which
+// case it is looking at says so with a Cell, and the renderer paints
+// that class whatever column the cell sits in.
+type Cell struct {
+	Text  string
+	Class Class
+}
+
+// String returns the cell's text, so a Cell formats like the plain
+// string it stands for anywhere colour is not applied.
+func (c Cell) String() string {
+	return c.Text
 }

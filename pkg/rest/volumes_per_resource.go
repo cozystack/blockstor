@@ -19,10 +19,14 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"slices"
+	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/propwhitelist"
 )
 
 // registerVolumesPerResource wires the per-Resource Volume routes
@@ -73,9 +77,19 @@ func (s *Server) handleVolumesPerResourceList(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	vols := res.Volumes
-	if vols == nil {
-		vols = []apiv1.Volume{}
+	s.forgetStaleReplica(r.Context(), &res)
+
+	// Every volume definition is listed, built or not, as LINSTOR does
+	// (see ensureVolumesForView). REST 1.28 added the `props` filter
+	// here, on the volumes' own props.
+	propFilter := propsQuery(r)
+	listed := ensureVolumesForView(res.Volumes, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName))
+	vols := make([]apiv1.Volume, 0, len(listed))
+
+	for i := range listed {
+		if matchProps(propFilter, listed[i].Props) {
+			vols = append(vols, listed[i])
+		}
 	}
 
 	writeJSON(w, http.StatusOK, vols)
@@ -106,12 +120,22 @@ func (s *Server) handleVolumesPerResourceGet(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	for i := range res.Volumes {
-		if res.Volumes[i].VolumeNumber == vlmNr {
-			writeJSON(w, http.StatusOK, res.Volumes[i])
+	s.forgetStaleReplica(r.Context(), &res)
 
-			return
-		}
+	if vol, ok := s.awaitReportedVolume(r.Context(), &res, vlmNr); ok {
+		writeJSON(w, http.StatusOK, vol)
+
+		return
+	}
+
+	// A volume the satellite has still not built answers without a
+	// device path, as LINSTOR's does, rather than 404: linstor-csi's
+	// attach then reports "could not determine device path" and
+	// retries, instead of failing on a volume that does exist.
+	if vol, ok := placeholderVolume(&res, vlmNr, s.placeholderPool(r.Context(), &res), s.definitionVolumeSizes(r.Context(), rdName)); ok {
+		writeJSON(w, http.StatusOK, vol)
+
+		return
 	}
 
 	writeError(w, http.StatusNotFound, fmt.Sprintf(
@@ -155,6 +179,10 @@ func (s *Server) handleVolumesPerResourceModify(w http.ResponseWriter, r *http.R
 	var patch apiv1.GenericPropsModify
 
 	if !decodeJSON(w, r, &patch) {
+		return
+	}
+
+	if refuseUnwhitelistedProps(w, propwhitelist.Volume, patch.OverrideProps) {
 		return
 	}
 
@@ -224,4 +252,81 @@ func mergeVolumePropsPatch(vol *apiv1.Volume, patch *apiv1.GenericPropsModify) {
 	applyPropsModify(vol.Props, patch.OverrideProps, patch.DeleteProps)
 
 	deletePropNamespaces(vol.Props, patch.DeleteNamespace)
+}
+
+// placeholderVolume is volume vlmNr of the replica as the volume list
+// answers it (ensureVolumesForView), and whether that list has it.
+func placeholderVolume(res *apiv1.Resource, vlmNr int32, poolFor func(int32) string, vdSizes map[int32]int64) (apiv1.Volume, bool) {
+	vols := ensureVolumesForView(res.Volumes, poolFor, vdSizes)
+
+	idx := findVolumeIndexByNumber(vols, vlmNr)
+	if idx < 0 {
+		return apiv1.Volume{}, false
+	}
+
+	return vols[idx], true
+}
+
+// volumeReportBudget bounds how long a volume read waits for the satellite
+// to report a volume its definition has. It stays well below the
+// external-attacher's timeout.
+const volumeReportBudget = 10 * time.Second
+
+// awaitReportedVolume answers volume vlmNr of the replica, waiting for its
+// satellite to report it with a device path when the replica is new:
+// linstor-csi reads the volume's device path right after make-available
+// and fails the attach on a missing volume or an empty path, and LINSTOR
+// knows both from the moment the replica exists. The observer reports the
+// disk state before the apply pass stamps the path, so the volume alone is
+// not enough. Once the budget runs out the volume is answered as it
+// stands. A volume number the definition does not have, and a replica
+// being deleted, are answered at once.
+func (s *Server) awaitReportedVolume(ctx context.Context, res *apiv1.Resource, vlmNr int32) (apiv1.Volume, bool) {
+	deadline := time.Now().Add(volumeReportBudget)
+
+	for {
+		idx := findVolumeIndexByNumber(res.Volumes, vlmNr)
+		if idx >= 0 && res.Volumes[idx].DevicePath != "" {
+			return res.Volumes[idx], true
+		}
+
+		if !s.awaitVolumeReport(ctx, res, vlmNr, deadline) {
+			if idx >= 0 {
+				return res.Volumes[idx], true
+			}
+
+			return apiv1.Volume{}, false
+		}
+	}
+}
+
+// awaitVolumeReport waits one poll interval and re-reads the replica into
+// res. It reports false, leaving res as it was, when there is nothing left
+// to wait for: the budget ran out, the replica is being deleted, or its
+// definition has no such volume.
+func (s *Server) awaitVolumeReport(ctx context.Context, res *apiv1.Resource, vlmNr int32, deadline time.Time) bool {
+	if slices.Contains(res.Flags, apiv1.ResourceFlagDelete) || time.Now().After(deadline) {
+		return false
+	}
+
+	_, err := s.Store.VolumeDefinitions().Get(ctx, res.Name, vlmNr)
+	if err != nil {
+		return false
+	}
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(cacheConvergePollInterval):
+	}
+
+	next, err := s.Store.Resources().Get(ctx, res.Name, res.NodeName)
+	if err != nil {
+		return false
+	}
+
+	s.forgetStaleReplica(ctx, &next)
+	*res = next
+
+	return true
 }

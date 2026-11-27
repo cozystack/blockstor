@@ -56,11 +56,27 @@ type pool struct {
 	// afterSet runs once, right after the next `zfs set`, to model a
 	// command another goroutine ran in between.
 	afterSet func()
+
+	// afterRecv runs once, right after the next `zfs recv`, likewise.
+	afterRecv func()
+
+	// failDestroy makes the next `zfs destroy` of this dataset fail.
+	failDestroy string
+
+	// failSet makes the next `zfs set` fail, as a satellite that stops
+	// between two commands leaves the rest undone.
+	failSet bool
 }
 
 type dataset struct {
 	origin string
 	marked bool
+
+	// received is the local value of blockstor:received_snapshot.
+	received string
+
+	// taken is set on a snapshot `zfs snapshot` created.
+	taken bool
 }
 
 var (
@@ -71,7 +87,7 @@ var (
 	errHasChildren   = errors.New("cannot destroy: volume has children")
 	errHasDependents = errors.New("cannot destroy: snapshot has dependent clones")
 	errBusy          = errors.New("cannot rename: dataset is busy")
-	errExists        = errors.New("cannot rename to target: dataset already exists")
+	errExists        = errors.New("dataset already exists")
 )
 
 func newPool(t *testing.T, names ...string) *pool {
@@ -107,13 +123,59 @@ func (p *pool) Run(_ context.Context, name string, args ...string) ([]byte, erro
 		return nil, p.rename(args[1], args[2])
 	case "destroy":
 		return nil, p.destroy(args[1:])
+	case "inherit":
+		return nil, p.inherit(args[1:])
+	case "snapshot":
+		return nil, p.snapshot(args[1:])
 	}
 
 	return nil, fmt.Errorf("%w %q", errUnexpected, line)
 }
 
-func (p *pool) RunWithStdin(ctx context.Context, _ io.Reader, name string, args ...string) ([]byte, error) {
-	return p.Run(ctx, name, args...)
+// RunWithStdin models `zfs recv -F [-o blockstor:received_snapshot=<snap>]
+// <target>`: the stream's content is the name of the snapshot it was sent
+// from, and the receive creates the target zvol with that snapshot on it, as
+// a full send of one snapshot does.
+func (p *pool) RunWithStdin(ctx context.Context, src io.Reader, name string, args ...string) ([]byte, error) {
+	if name != "zfs" || len(args) < 3 || args[0] != "recv" || args[1] != "-F" {
+		return p.Run(ctx, name, args...)
+	}
+
+	var received string
+
+	switch len(args) {
+	case 3:
+	case 5:
+		value, ok := strings.CutPrefix(args[3], "blockstor:received_snapshot=")
+		if args[2] != "-o" || !ok {
+			return nil, fmt.Errorf("%w: recv %v", errUnexpected, args)
+		}
+
+		received = value
+	default:
+		return nil, fmt.Errorf("%w: recv %v", errUnexpected, args)
+	}
+
+	stream, err := io.ReadAll(src)
+	if err != nil {
+		return nil, fmt.Errorf("read the stream: %w", err)
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.calls = append(p.calls, name+" "+strings.Join(args, " "))
+
+	target := args[len(args)-1]
+	p.datasets[target] = &dataset{received: received}
+	p.datasets[target+"@"+string(stream)] = &dataset{}
+
+	if hook := p.afterRecv; hook != nil {
+		p.afterRecv = nil
+		hook()
+	}
+
+	return nil, nil
 }
 
 // clone records target as a clone of the snapshot origin.
@@ -264,14 +326,70 @@ func (p *pool) get(args []string) ([]byte, error) {
 		}
 
 		return []byte("-\n"), nil
+	case "blockstor:received_snapshot":
+		if !slices.Contains(args, "local") {
+			return nil, fmt.Errorf("%w: received snapshot read without -s local", errUnexpected)
+		}
+
+		if ds.received == "" {
+			return nil, nil
+		}
+
+		return []byte(ds.received + "\n"), nil
 	}
 
 	return nil, fmt.Errorf("%w: property %q", errUnexpected, property)
 }
 
+func (p *pool) inherit(args []string) error {
+	if len(args) != 2 || args[0] != "blockstor:received_snapshot" {
+		return fmt.Errorf("%w: inherit %v", errUnexpected, args)
+	}
+
+	ds, ok := p.datasets[args[1]]
+	if !ok {
+		return errNoDataset
+	}
+
+	ds.received = ""
+
+	return nil
+}
+
+func (p *pool) snapshot(args []string) error {
+	if len(args) != 1 || !strings.Contains(args[0], "@") {
+		return fmt.Errorf("%w: snapshot %v", errUnexpected, args)
+	}
+
+	if _, ok := p.datasets[args[0]]; ok {
+		return fmt.Errorf("%w: %q", errExists, args[0])
+	}
+
+	p.datasets[args[0]] = &dataset{taken: true}
+
+	return nil
+}
+
+func (p *pool) receivedOn(name string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if ds, ok := p.datasets[name]; ok {
+		return ds.received
+	}
+
+	return ""
+}
+
 func (p *pool) set(args []string) error {
 	if args[0] != "linstor:marked_for_deletion=true" {
 		return fmt.Errorf("%w: set %v", errUnexpected, args)
+	}
+
+	if p.failSet {
+		p.failSet = false
+
+		return errBusy
 	}
 
 	ds, ok := p.datasets[args[1]]
@@ -339,6 +457,12 @@ func (p *pool) destroy(args []string) error {
 	target := args[0]
 	if _, ok := p.datasets[target]; !ok {
 		return errNoDataset
+	}
+
+	if p.failDestroy == target {
+		p.failDestroy = ""
+
+		return errBusy
 	}
 
 	if snaps := p.snapshotsOf(target); len(snaps) > 0 {
@@ -870,7 +994,7 @@ func TestRecvSnapshotProbeFailureTouchesNothing(t *testing.T) {
 	p := newPool(t, "tank/pvc-a_00000")
 	p.failList = true
 
-	err := zfs.NewProvider(zfs.Config{Pool: "tank"}, p).RecvSnapshot(t.Context(), vol("pvc-a"), strings.NewReader("stream"))
+	err := zfs.NewProvider(zfs.Config{Pool: "tank"}, p).RecvSnapshot(t.Context(), vol("pvc-a"), snap("pvc-src", "s1"), strings.NewReader("s1"))
 	if err == nil {
 		t.Fatalf("RecvSnapshot with a failing probe: got nil, want an error")
 	}
@@ -1037,5 +1161,258 @@ func TestSendFindsTheSnapshotOfARenamedZvol(t *testing.T) {
 
 	if want := []string{"send", "-p", renamed + "@s1"}; !slices.Equal(argv, want) {
 		t.Errorf("argv %v, want %v", argv, want)
+	}
+}
+
+// Restoring onto a node that holds no copy of the snapshot receives the
+// zvol together with that snapshot. Nothing names the received copy, so it
+// goes once the receive is done, and the restored volume's delete destroys
+// its zvol instead of renaming it and keeping it for that copy forever.
+func TestRecvSnapshotDropsTheReceivedSnapshot(t *testing.T) {
+	t.Parallel()
+
+	p := newPool(t)
+	prov := zfs.NewProvider(zfs.Config{Pool: "tank", Thin: true}, p)
+
+	err := prov.RecvSnapshot(t.Context(), vol("pvc-b"), snap("pvc-a", "s1"), strings.NewReader("s1"))
+	if err != nil {
+		t.Fatalf("RecvSnapshot: %v", err)
+	}
+
+	if got := p.names(); !slices.Equal(got, []string{"tank/pvc-b_00000"}) {
+		t.Errorf("after the receive: %v, want only the zvol", got)
+	}
+
+	err = prov.DeleteVolume(t.Context(), vol("pvc-b"))
+	if err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+
+	if got := p.names(); len(got) != 0 {
+		t.Errorf("after the delete: %v, want nothing left", got)
+	}
+}
+
+// A destroy of the received copy that fails leaves it marked, so the delete
+// of the restored volume destroys it and then the zvol, instead of keeping
+// both under a `_deleted_` name.
+func TestRecvSnapshotLeavesAFailedDropToTheDelete(t *testing.T) {
+	t.Parallel()
+
+	p := newPool(t)
+	p.failDestroy = "tank/pvc-b_00000@s1"
+	prov := zfs.NewProvider(zfs.Config{Pool: "tank", Thin: true}, p)
+
+	err := prov.RecvSnapshot(t.Context(), vol("pvc-b"), snap("pvc-a", "s1"), strings.NewReader("s1"))
+	if err == nil {
+		t.Fatalf("RecvSnapshot with a failing destroy: got nil, want an error")
+	}
+
+	if !p.markedFor("tank/pvc-b_00000@s1") {
+		t.Errorf("the received snapshot is not marked: %v", p.names())
+	}
+
+	err = prov.DeleteVolume(t.Context(), vol("pvc-b"))
+	if err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+
+	if got := p.names(); len(got) != 0 {
+		t.Errorf("after the delete: %v, want nothing left", got)
+	}
+}
+
+// Only the snapshot the stream was sent from is removed. Any other snapshot
+// of the new zvol was taken by someone, and its delete is theirs to ask for.
+func TestRecvSnapshotKeepsOtherSnapshots(t *testing.T) {
+	t.Parallel()
+
+	p := newPool(t)
+	p.afterRecv = func() { p.datasets["tank/pvc-b_00000@s2"] = &dataset{} }
+	prov := zfs.NewProvider(zfs.Config{Pool: "tank", Thin: true}, p)
+
+	err := prov.RecvSnapshot(t.Context(), vol("pvc-b"), snap("pvc-a", "s1"), strings.NewReader("s1"))
+	if err != nil {
+		t.Fatalf("RecvSnapshot: %v", err)
+	}
+
+	if got := p.names(); !slices.Equal(got, []string{"tank/pvc-b_00000", "tank/pvc-b_00000@s2"}) {
+		t.Errorf("after the receive: %v", got)
+	}
+
+	if p.markedFor("tank/pvc-b_00000@s2") {
+		t.Errorf("a snapshot the stream did not bring was marked")
+	}
+}
+
+// A receive that brought no snapshot of that name has nothing to remove and
+// still succeeds: the zvol it received is complete.
+func TestRecvSnapshotWithoutTheNamedSnapshot(t *testing.T) {
+	t.Parallel()
+
+	p := newPool(t)
+	prov := zfs.NewProvider(zfs.Config{Pool: "tank", Thin: true}, p)
+
+	err := prov.RecvSnapshot(t.Context(), vol("pvc-b"), snap("pvc-a", "s1"), strings.NewReader("other"))
+	if err != nil {
+		t.Fatalf("RecvSnapshot: %v", err)
+	}
+
+	if got := p.destroyed(); len(got) != 0 {
+		t.Errorf("destroyed %v", got)
+	}
+}
+
+// A receive that stops after `zfs recv` and before its cleanup leaves the
+// zvol in place, so the next reconcile does not receive again. Whichever
+// path that reconcile takes, it removes the snapshot the stream brought, and
+// the restored volume's delete leaves nothing behind.
+func TestRetryFinishesAnInterruptedReceive(t *testing.T) {
+	t.Parallel()
+
+	interrupts := map[string]func(p *pool){
+		"mark fails":  func(p *pool) { p.failSet = true },
+		"probe fails": func(p *pool) { p.failList = true },
+	}
+
+	retries := map[string]func(t *testing.T, prov *zfs.Provider) error{
+		"restore": func(t *testing.T, prov *zfs.Provider) error {
+			t.Helper()
+
+			return prov.RestoreVolumeFromSnapshot(t.Context(), vol("pvc-b"), snap("pvc-a", "s1"))
+		},
+		"receive": func(t *testing.T, prov *zfs.Provider) error {
+			t.Helper()
+
+			return prov.RecvSnapshot(t.Context(), vol("pvc-b"), snap("pvc-a", "s1"), strings.NewReader("s1"))
+		},
+	}
+
+	for interrupted, interrupt := range interrupts {
+		for retried, retry := range retries {
+			t.Run(interrupted+"/"+retried, func(t *testing.T) {
+				t.Parallel()
+
+				p := newPool(t)
+				p.afterRecv = func() { interrupt(p) }
+				prov := zfs.NewProvider(zfs.Config{Pool: "tank", Thin: true}, p)
+
+				err := prov.RecvSnapshot(t.Context(), vol("pvc-b"), snap("pvc-a", "s1"), strings.NewReader("s1"))
+				if err == nil {
+					t.Fatalf("interrupted RecvSnapshot: got nil, want an error")
+				}
+
+				p.failList = false
+
+				err = retry(t, prov)
+				if err != nil {
+					t.Fatalf("retry: %v", err)
+				}
+
+				if got := p.names(); !slices.Equal(got, []string{"tank/pvc-b_00000"}) {
+					t.Errorf("after the retry: %v, want only the zvol", got)
+				}
+
+				if got := p.receivedOn("tank/pvc-b_00000"); got != "" {
+					t.Errorf("the zvol still records %q as received", got)
+				}
+
+				err = prov.DeleteVolume(t.Context(), vol("pvc-b"))
+				if err != nil {
+					t.Fatalf("DeleteVolume: %v", err)
+				}
+
+				if got := p.names(); len(got) != 0 {
+					t.Errorf("after the delete: %v, want nothing left", got)
+				}
+			})
+		}
+	}
+}
+
+// A snapshot of the restored resource that shares its name with the
+// restore's source must hold the data it is taken from, not the copy an
+// interrupted receive left: the copy goes and the snapshot is taken.
+func TestCreateSnapshotReplacesAReceivedCopy(t *testing.T) {
+	t.Parallel()
+
+	p := newPool(t)
+	p.afterRecv = func() { p.failSet = true }
+	prov := zfs.NewProvider(zfs.Config{Pool: "tank", Thin: true}, p)
+
+	err := prov.RecvSnapshot(t.Context(), vol("pvc-b"), snap("pvc-a", "s1"), strings.NewReader("s1"))
+	if err == nil {
+		t.Fatalf("interrupted RecvSnapshot: got nil, want an error")
+	}
+
+	err = prov.CreateSnapshot(t.Context(), snap("pvc-b", "s1"))
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	if !slices.Contains(p.destroyed(), "tank/pvc-b_00000@s1") {
+		t.Errorf("the received copy was not destroyed: %v", p.destroyed())
+	}
+
+	p.mu.Lock()
+	taken := p.datasets["tank/pvc-b_00000@s1"]
+	p.mu.Unlock()
+
+	if taken == nil || !taken.taken {
+		t.Errorf("tank/pvc-b_00000@s1 is not a snapshot CreateSnapshot took: %+v", taken)
+	}
+}
+
+// A snapshot of the restored zvol that no receive recorded is somebody's:
+// neither a restore retry nor a snapshot of the same name touches it.
+func TestRestoreKeepsASnapshotNoReceiveRecorded(t *testing.T) {
+	t.Parallel()
+
+	p := newPool(t, "tank/pvc-b_00000", "tank/pvc-b_00000@s1")
+	prov := zfs.NewProvider(zfs.Config{Pool: "tank", Thin: true}, p)
+
+	err := prov.RestoreVolumeFromSnapshot(t.Context(), vol("pvc-b"), snap("pvc-a", "s1"))
+	if err != nil {
+		t.Fatalf("RestoreVolumeFromSnapshot: %v", err)
+	}
+
+	err = prov.CreateSnapshot(t.Context(), snap("pvc-b", "s1"))
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	if got := p.destroyed(); len(got) != 0 {
+		t.Errorf("destroyed %v", got)
+	}
+
+	if p.markedFor("tank/pvc-b_00000@s1") {
+		t.Errorf("a snapshot no receive recorded was marked")
+	}
+}
+
+// A snapshot whose source volume was deleted on this node lives under the
+// renamed zvol, and the pool still holds it: the restore after the source
+// is gone is placed in the pool HasSnapshot names.
+func TestHasSnapshotFindsTheCopyOfADeletedZvol(t *testing.T) {
+	t.Parallel()
+
+	p := newPool(t, "tank/pvc-a_00000", "tank/pvc-a_00000@s1")
+	prov := zfs.NewProvider(zfs.Config{Pool: "tank"}, p)
+
+	err := prov.DeleteVolume(t.Context(), vol("pvc-a"))
+	if err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+
+	deletedName(t, p, "tank/_deleted_pvc-a_00000_")
+
+	has, err := prov.HasSnapshot(t.Context(), snap("pvc-a", "s1"))
+	if err != nil || !has {
+		t.Errorf("HasSnapshot(s1) = %v, %v; want true under the renamed zvol", has, err)
+	}
+
+	has, err = prov.HasSnapshot(t.Context(), snap("pvc-a", "s2"))
+	if err != nil || has {
+		t.Errorf("HasSnapshot(s2) = %v, %v; want false", has, err)
 	}
 }
