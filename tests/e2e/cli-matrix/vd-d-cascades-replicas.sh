@@ -48,7 +48,8 @@
 #   4. Within 30s, `linstor vd l <rd>` must show no volume 0
 #      AND the parent RD must still exist (vd d ≠ rd d).
 #   5. Per-node Resource Volumes (.status.volumes) must drop the
-#      removed VolumeNumber; backing zvol/LV must be gone.
+#      removed VolumeNumber; backing zvol/LV must be gone on every
+#      replica (LINSTOR deletes it there; blockstor used to leave it).
 
 set -euo pipefail
 
@@ -185,6 +186,28 @@ for N in "$N1" "$N2"; do
     if grep -qE '(^|[[:space:]])0([[:space:]]|$)' <<<"$vols"; then
         echo "FAIL (Bug 355 deep): $RD.$N still has volume 0 in Status.Volumes 120s after vd d 0" >&2
         kubectl get "resources.blockstor.org/${RD}.${N}" -o yaml 2>&1 | head -40 >&2
+        exit 1
+    fi
+done
+
+# =====================================================================
+# Each replica's backing volume 0 is gone, volume 1's is not
+# =====================================================================
+# The satellites delete the volume of a definition flagged DELETE, the way
+# LINSTOR's do; the definition left the RD above only once they all had.
+# Volume 0 is `<rd>_00000` on LVM and ZFS alike.
+echo ">> backing volume 0 is gone on both nodes, volume 1 stays"
+for N in "$N1" "$N2"; do
+    # Last path component only: a zvol is listed as <pool>/<name>.
+    names=$(on_node "$N" bash -c \
+        "{ lvs --noheadings -o lv_name 2>/dev/null; zfs list -H -o name -t volume 2>/dev/null; } | awk -F/ '{gsub(/ /, \"\"); print \$NF}'" \
+        2>/dev/null || true)
+    if grep -qx "${RD}_00000" <<<"$names"; then
+        echo "FAIL: $N still holds the backing volume of the deleted volume 0" >&2
+        exit 1
+    fi
+    if ! grep -qx "${RD}_00001" <<<"$names"; then
+        echo "FAIL: $N lost the backing volume of the surviving volume 1" >&2
         exit 1
     fi
 done

@@ -374,15 +374,18 @@ func (s *Satellite) reconcileResources(ctx context.Context) {
 
 		want := s.desiredDrbdState(resource)
 		volumes, missing := s.missingVolumes(ctx, resource, want)
+		deleted := s.confirmedVolumeDeletes(ctx, resource)
 		score := promotionScore(want)
 
 		if resource.Status.DrbdState == want && !missing &&
-			resource.Status.PromotionScore != nil && *resource.Status.PromotionScore == score {
+			resource.Status.PromotionScore != nil && *resource.Status.PromotionScore == score &&
+			slices.Equal(resource.Status.DeletedVolumes, deleted) {
 			continue
 		}
 
 		patched := resource.DeepCopy()
 		patched.Status.DrbdState = want
+		patched.Status.DeletedVolumes = deleted
 		patched.Status.Volumes = volumes
 		patched.Status.PromotionScore = &score
 
@@ -397,6 +400,32 @@ func (s *Satellite) reconcileResources(ctx context.Context) {
 
 		_ = s.client.Status().Update(ctx, patched)
 	}
+}
+
+// confirmedVolumeDeletes is the Status.DeletedVolumes a real satellite
+// reports for the replica: a confirmation, under the definition's
+// deleteID, for every volume definition flagged DELETE, since the mock has
+// no storage to delete first. Without it a `vd d` on a definition with
+// replicas waits for confirmations that never come and the definition
+// stays listed with the DELETE flag.
+func (s *Satellite) confirmedVolumeDeletes(ctx context.Context, resource *blockstoriov1alpha1.Resource) []blockstoriov1alpha1.DeletedVolumeStatus {
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := s.client.Get(ctx, client.ObjectKey{Name: naming.Key(resource.Spec.ResourceDefinitionName)}, &rd)
+	if err != nil {
+		return resource.Status.DeletedVolumes
+	}
+
+	var out []blockstoriov1alpha1.DeletedVolumeStatus
+
+	for i := range rd.Spec.VolumeDefinitions {
+		vd := &rd.Spec.VolumeDefinitions[i]
+		if vd.Deleting() {
+			out = append(out, blockstoriov1alpha1.DeletedVolumeStatus{VolumeNumber: vd.VolumeNumber, DeleteID: vd.DeleteID})
+		}
+	}
+
+	return out
 }
 
 // missingVolumes answers the replica's volumes with one entry per volume

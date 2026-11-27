@@ -131,7 +131,7 @@ func (a *Adm) ConnectPeer(ctx context.Context, resource, peer string) error {
 // IdlePrimary reports a resource that is Primary on this node while none
 // of its volumes is open: nobody uses it, so demoting it loses nothing.
 func (r *KernelResource) IdlePrimary() bool {
-	return r.Role == "Primary" && len(r.Devices) > 0 && r.unused()
+	return r.Role == string(RolePrimary) && len(r.Devices) > 0 && r.unused()
 }
 
 // UnusedSecondaryFailingIO reports a Secondary that still forces I/O

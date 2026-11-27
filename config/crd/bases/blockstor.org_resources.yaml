@@ -731,6 +731,39 @@ spec:
                 x-kubernetes-list-map-keys:
                 - peerNodeName
                 x-kubernetes-list-type: map
+              deletedVolumes:
+                description: |-
+                  deletedVolumes is this replica's confirmation of volume definition
+                  deletes: the satellite lists a volume here once it has removed the
+                  volume from DRBD and deleted its storage, because its volume
+                  definition is flagged DELETE. The controller removes the volume
+                  definition once every replica of the definition lists it with the
+                  same deleteID. The satellite drops an entry once its volume
+                  definition is gone. Empty on a satellite that predates volume
+                  definition deletes, which therefore holds the definition until it is
+                  upgraded rather than having its volume skipped.
+                items:
+                  description: |-
+                    DeletedVolumeStatus is one replica's confirmation that it deleted the
+                    volume of a volume definition flagged DELETE.
+                  properties:
+                    deleteID:
+                      description: |-
+                        deleteID is the deleteID of the volume definition the satellite
+                        acted on.
+                      maxLength: 64
+                      type: string
+                    volumeNumber:
+                      description: volumeNumber is the deleted volume's number.
+                      format: int32
+                      type: integer
+                  required:
+                  - volumeNumber
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - volumeNumber
+                x-kubernetes-list-type: map
               drbdMinor:
                 description: |-
                   drbdMinor is a read-only mirror of the volume-0 minor now
@@ -772,8 +805,9 @@ spec:
                 type: boolean
               mayPromote:
                 description: |-
-                  mayPromote is the kernel's `may_promote:` token from the same
-                  frame: whether a promotion would succeed right now.
+                  mayPromote is the kernel-reported DRBD-9 `may_promote:` flag
+                  from the same frames, published upstream as
+                  `layer_object.drbd.may_promote`. Unset until observed.
                 type: boolean
               metadataPeerSlots:
                 description: |-
@@ -790,13 +824,12 @@ spec:
                 type: integer
               promotionScore:
                 description: |-
-                  promotionScore is the kernel's score for promoting this
-                  replica, parsed from the `promotion_score:` token in
-                  `drbdsetup events2` resource frames. Zero means the kernel
-                  would refuse a promotion here: no reachable UpToDate data, or
-                  no quorum. linstor-csi's volume health reads it as LINSTOR
-                  reports it, so a replica with a score of 0 is an unhealthy
-                  one. Unset until the satellite has seen a resource frame.
+                  promotionScore is the kernel-reported DRBD-9 promotion score of
+                  this replica, parsed from the `promotion_score:` token in
+                  `drbdsetup events2` resource frames. Upstream LINSTOR publishes
+                  it as `layer_object.drbd.promotion_score`, and linstor-csi
+                  reports a volume abnormal on every node whose score is 0 or
+                  missing. Unset until the satellite has observed the resource.
                 format: int32
                 type: integer
               role:

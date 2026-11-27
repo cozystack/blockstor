@@ -106,6 +106,13 @@ type Resource struct {
 	// the wire key under `omitempty`.
 	Volumes []Volume `json:"volumes"`
 
+	// DeletedVolumes mirrors the CRD's Status.DeletedVolumes: the volumes
+	// this replica's satellite deleted because their volume definition is
+	// flagged DELETE, each with the deleteID it acted on. Not on the wire;
+	// the volume definition delete reads it to know which replicas are
+	// done.
+	DeletedVolumes []DeletedVolume `json:"-"`
+
 	// EffectiveProps is the merged Controller→RG→RD→Resource view
 	// of the property bag for this replica. Populated on the
 	// `/v1/view/resources` aggregate GET path; ignored on writes.
@@ -517,4 +524,23 @@ func PromoteWitnessFlags(flags []string, wantDiskful bool) ([]string, bool) {
 	}
 
 	return keep, wasDiskless
+}
+
+// DeletedVolume is one replica's confirmation that it deleted the volume of
+// a volume definition flagged DELETE.
+type DeletedVolume struct {
+	VolumeNumber int32
+	DeleteID     string
+}
+
+// ConfirmedVolumeDelete reports whether the replica confirmed deleting
+// volume vn under deleteID.
+func (r *Resource) ConfirmedVolumeDelete(vn int32, deleteID string) bool {
+	for _, d := range r.DeletedVolumes {
+		if d.VolumeNumber == vn && d.DeleteID == deleteID {
+			return true
+		}
+	}
+
+	return false
 }

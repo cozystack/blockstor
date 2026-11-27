@@ -67,6 +67,10 @@ const (
 // renamed zvol: destroying the wrong one would delete data nobody asked for.
 var errAmbiguousSnapshot = errors.New("snapshot found under more than one deleted zvol")
 
+// errNoFreeDeletedName stops a zvol delete that found every deleted name it
+// tried already taken.
+var errNoFreeDeletedName = errors.New("no free name to rename the deleted zvol to")
+
 // errPoolMissing refuses to read a dataset as deleted while its pool itself
 // is not there: an unimported pool hides every volume in it.
 var errPoolMissing = errors.New("zfs pool is not imported; its datasets cannot be checked")
@@ -159,7 +163,10 @@ func (p *Provider) deleteVolumeDataset(ctx context.Context, dataset, suffix stri
 	}
 
 	if len(snapshots) > 0 {
-		renamed := deletedVolumeName(dataset, suffix)
+		renamed, err := p.freeDeletedVolumeName(ctx, dataset, suffix)
+		if err != nil {
+			return err
+		}
 
 		err = p.markAndRename(ctx, dataset, renamed)
 		if err != nil {
@@ -283,6 +290,48 @@ func (p *Provider) cascadeToBase(ctx context.Context, dataset string) error {
 	}
 
 	return p.cascadeToOrigin(ctx, origin)
+}
+
+// maxRenameAttempts bounds the search for a free deleted name.
+const maxRenameAttempts = 100
+
+// freeDeletedVolumeName is where the zvol goes: under the recorded suffix
+// unless an earlier delete of the same name already put a zvol there. The
+// suffix lives on the Resource for the replica's whole life, and a volume
+// definition deleted, created again and deleted again while snapshots keep
+// the first generation would otherwise collide on every retry. A fresh
+// suffix leaves the snapshots of this generation stamped with the recorded
+// one; locateSnapshot then finds them by searching the renamed zvols.
+func (p *Provider) freeDeletedVolumeName(ctx context.Context, dataset, suffix string) (string, error) {
+	fresh := RenameSuffix(p.now())
+
+	for i := range maxRenameAttempts {
+		candidate := suffix
+
+		switch {
+		case i == 1:
+			candidate = fresh
+		case i > 1:
+			candidate = fmt.Sprintf("%s-%d", fresh, i-1)
+		}
+
+		if i > 0 && candidate == suffix {
+			continue
+		}
+
+		renamed := deletedVolumeName(dataset, candidate)
+
+		taken, err := p.datasetPresent(ctx, renamed)
+		if err != nil {
+			return "", err
+		}
+
+		if !taken {
+			return renamed, nil
+		}
+	}
+
+	return "", errors.Wrapf(errNoFreeDeletedName, "%s after %d attempts", dataset, maxRenameAttempts)
 }
 
 // destroyIfReleased destroys a snapshot that was marked for deletion and has

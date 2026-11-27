@@ -318,6 +318,8 @@ func TestBug139VDDeleteRemovesVolumeFromViewProjection(t *testing.T) {
 		t.Fatalf("seed Resource: %v", err)
 	}
 
+	fakeSatellites(t, st, rdName, node)
+
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
