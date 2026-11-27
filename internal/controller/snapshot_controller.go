@@ -194,8 +194,16 @@ func (r *SnapshotReconciler) ReconcilePass(ctx context.Context, req ctrl.Request
 	// on the Snapshot itself, as LINSTOR persists SUCCESSFUL on the
 	// snapshot definition. The record is what every reader trusts
 	// later, when the source replicas it was taken from may be gone.
+	//
+	// Every sibling of a group is recorded in the same pass, as
+	// LINSTOR marks every snapshot definition of a multi-snapshot
+	// request SUCCESSFUL together (removeInProgressSnapshots). Only
+	// the pass that sees the whole group complete can record it, and
+	// that is the pass of whichever sibling got the last resume ack;
+	// a sibling whose own acks landed earlier was reconciled while
+	// the group was still incomplete and gets no further event.
 	if takeCompleted(siblings) {
-		return ctrl.Result{}, r.markSnapshotSuccessful(ctx, &snap)
+		return ctrl.Result{}, r.markGroupSuccessful(ctx, siblings)
 	}
 
 	next := r.nextPhase(&snap, siblings)
@@ -305,6 +313,21 @@ func withSuccessfulFlag(flags []string) ([]string, bool) {
 	}
 
 	return append(slices.Clone(flags), blockstoriov1alpha1.SnapshotStatusFlagSuccessful), true
+}
+
+// markGroupSuccessful persists SUCCESSFUL on every sibling of a batch
+// (self alone for a single snapshot).
+func (r *SnapshotReconciler) markGroupSuccessful(
+	ctx context.Context, siblings []blockstoriov1alpha1.Snapshot,
+) error {
+	for i := range siblings {
+		err := r.markSnapshotSuccessful(ctx, &siblings[i])
+		if err != nil {
+			return errors.Wrapf(err, "sibling %q", siblings[i].Name)
+		}
+	}
+
+	return nil
 }
 
 // markSnapshotSuccessful persists SUCCESSFUL on the Snapshot's status.
