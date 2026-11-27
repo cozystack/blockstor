@@ -57,7 +57,7 @@ func (e *awaitingPeerSlotsError) Error() string {
 }
 
 func (e *awaitingPeerSlotsError) Is(target error) bool {
-	return target == errAwaitingPeerSlots //nolint:errorlint // identity of the sentinel
+	return target == errAwaitingPeerSlots
 }
 
 // knownPeerSlots is what the replicas of a definition tell of their

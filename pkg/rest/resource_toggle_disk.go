@@ -183,6 +183,27 @@ func (s *Server) migrateDiskCommon(w http.ResponseWriter, r *http.Request, pool 
 	}})
 }
 
+// cancelToggleDisk asks the satellite to unwind the conversion in
+// flight on rdName's replica on node (`r td --cancel`).
+func (s *Server) cancelToggleDisk(w http.ResponseWriter, r *http.Request, rdName, node string) {
+	err := s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node,
+		func(res *apiv1.Resource) error {
+			res.ToggleDiskCancel = true
+
+			return nil
+		})
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource '" + rdName + "' on '" + node + "' toggle-disk cancel requested",
+	}})
+}
+
 // handleResourceToggleDisk flips Spec.Flags["DISKLESS"] on the
 // named replica. Path-suffix `storage-pool/{pool}` (when present)
 // stamps that pool name on Spec.StoragePool when promoting to
@@ -215,22 +236,7 @@ func (s *Server) handleResourceToggleDisk(w http.ResponseWriter, r *http.Request
 	// rollback so an external observer sees DISKLESS reappear only
 	// AFTER drbdadm down + storage Delete succeed.
 	if queryFlag(r, "cancel") {
-		err := s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node,
-			func(res *apiv1.Resource) error {
-				res.ToggleDiskCancel = true
-
-				return nil
-			})
-		if err != nil {
-			writeStoreError(w, err)
-
-			return
-		}
-
-		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-			RetCode: maskInfo,
-			Message: "resource '" + rdName + "' on '" + node + "' toggle-disk cancel requested",
-		}})
+		s.cancelToggleDisk(w, r, rdName, node)
 
 		return
 	}
