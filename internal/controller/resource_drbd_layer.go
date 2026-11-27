@@ -155,11 +155,13 @@ func (r *ResourceReconciler) allocateDRBDIDsIfUsed(
 		return ctrl.Result{}, true, err
 	}
 
-	if allocated {
-		err = r.settlePeerSlotsKnown(ctx, target)
-		if err != nil {
-			return ctrl.Result{}, true, err
-		}
+	// Settled on every pass, not only the one that allocates: after a
+	// restart or a failed patch between the stamp and this, the replica
+	// has its ids, the allocating pass never comes again, and the
+	// condition would keep saying it has none.
+	err = r.settlePeerSlotsKnown(ctx, target)
+	if err != nil {
+		return ctrl.Result{}, true, err
 	}
 
 	// A definition adopted or created before counts were recorded gets

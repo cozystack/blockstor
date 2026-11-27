@@ -503,3 +503,67 @@ func TestRestoredReplicaGetsItsSourceReplicasPeerSlots(t *testing.T) {
 		})
 	}
 }
+
+// A replica stamped on a pass whose condition update never ran, as
+// when the controller restarted in between, has its ids and still
+// carries PeerSlotsKnown=False. Every later pass finds its identities
+// settled and allocates nothing, so the condition is settled there too,
+// not only on the pass that allocates.
+func TestStampedReplicaSettlesAStalePeerSlotsCondition(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	seven := int32(7)
+
+	waiting := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "adopted.n3", CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour))},
+		Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "adopted", NodeName: "n3"},
+	}
+
+	cli, rec := peerSlotsFixtureRecorded(t, nil, nil, []*blockstoriov1alpha1.Resource{
+		preexistingReplica("adopted", "n1", 0, nil), waiting,
+	})
+
+	_, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKey{Name: waiting.Name}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if !apimeta.IsStatusConditionFalse(getReplica(t, cli, waiting.Name).Status.Conditions,
+		blockstoriov1alpha1.ConditionPeerSlotsKnown) {
+		t.Fatal("no PeerSlotsKnown=False on the replica waiting past the limit")
+	}
+
+	// The allocating pass lands its ids and count, and the controller
+	// goes away before it settles the condition.
+	told := getReplica(t, cli, "adopted.n1")
+	told.Status.MetadataPeerSlots = &seven
+
+	if err := cli.Status().Update(ctx, told); err != nil {
+		t.Fatalf("report the count: %v", err)
+	}
+
+	nodeID, port, minor := int32(1), int32(7001), int32(1000)
+	skip := false
+
+	stamped := getReplica(t, cli, waiting.Name)
+	stamped.Spec.DRBDNodeID, stamped.Spec.DRBDPort, stamped.Spec.SkipInitialSync = &nodeID, &port, &skip
+	stamped.Spec.PeerSlots = &seven
+
+	if err := cli.Update(ctx, stamped); err != nil {
+		t.Fatalf("stamp: %v", err)
+	}
+
+	stamped.Status.DRBDNodeID, stamped.Status.DRBDPort, stamped.Status.DRBDMinor = &nodeID, &port, &minor
+
+	if err := cli.Status().Update(ctx, stamped); err != nil {
+		t.Fatalf("stamp status: %v", err)
+	}
+
+	reconcileToSteadyState(t, ctx, rec, waiting.Name)
+
+	got := getReplica(t, cli, waiting.Name)
+	if !apimeta.IsStatusConditionTrue(got.Status.Conditions, blockstoriov1alpha1.ConditionPeerSlotsKnown) {
+		t.Errorf("conditions %+v; want PeerSlotsKnown=True on a replica that has its ids", got.Status.Conditions)
+	}
+}
