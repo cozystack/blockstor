@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -116,6 +117,59 @@ func TestGrowPendingRequeues(t *testing.T) {
 
 	if !growPending([]*intent.ResourceApplyResult{{Ok: true}, {Ok: true, GrowPending: true}}) {
 		t.Error("a pass that left a grow short of its device was not repeated")
+	}
+}
+
+// TestMetadataPeerSlotsClearedWithTheDisk: a replica that loses its disk
+// loses its superblock, so the count published for it is cleared; the
+// metadata a toggle back creates is read and published again.
+func TestMetadataPeerSlotsClearedWithTheDisk(t *testing.T) {
+	t.Parallel()
+
+	for _, flag := range []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker} {
+		t.Run(flag, func(t *testing.T) {
+			t.Parallel()
+
+			const node = "n-slots"
+
+			rdName := "pvc-slots-" + strconv.Itoa(len(flag))
+			fifteen := int32(15)
+			res := &blockstoriov1alpha1.Resource{
+				ObjectMeta: metav1.ObjectMeta{Name: rdName + "." + node},
+				Spec: blockstoriov1alpha1.ResourceSpec{
+					NodeName: node, ResourceDefinitionName: rdName, Flags: []string{flag},
+				},
+				Status: blockstoriov1alpha1.ResourceStatus{MetadataPeerSlots: &fifteen},
+			}
+
+			cli := fake.NewClientBuilder().
+				WithScheme(newToggleDiskTestScheme(t)).
+				WithObjects(res).
+				WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+				Build()
+
+			reconciler := &ResourceReconciler{Client: cli, Config: Config{NodeName: node}}
+
+			var got blockstoriov1alpha1.Resource
+			if err := cli.Get(t.Context(), client.ObjectKey{Name: res.Name}, &got); err != nil {
+				t.Fatalf("get Resource: %v", err)
+			}
+
+			err := reconciler.recordMetadataPeerSlots(t.Context(), &got, []*intent.ResourceApplyResult{
+				{Name: rdName, NodeName: node, Ok: true},
+			})
+			if err != nil {
+				t.Fatalf("record: %v", err)
+			}
+
+			if err := cli.Get(t.Context(), client.ObjectKey{Name: res.Name}, &got); err != nil {
+				t.Fatalf("get Resource: %v", err)
+			}
+
+			if v := got.Status.MetadataPeerSlots; v != nil {
+				t.Errorf("a replica without a disk still publishes %d peer slots", *v)
+			}
+		})
 	}
 }
 

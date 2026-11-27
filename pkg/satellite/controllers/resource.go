@@ -1364,11 +1364,31 @@ func (r *ResourceReconciler) stampLiveMigrateApplied(ctx context.Context, res *b
 
 // recordMetadataPeerSlots publishes the peer-slot count the pass read
 // from the replica's superblock (Status.MetadataPeerSlots), for the
-// controller to record as the replica's count. Written once: a value
-// already there is the one the superblock holds.
+// controller to record as the replica's count. Written once per
+// superblock: a value already there is the one the superblock holds.
+// A replica without a disk has no superblock, so the value is cleared
+// there; a toggle back to diskful creates new metadata, with the
+// replica's own count, and the next read publishes that. Left in
+// place, the old count would size the grows of the new metadata.
 func (r *ResourceReconciler) recordMetadataPeerSlots(
 	ctx context.Context, res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult,
 ) error {
+	if slices.Contains(res.Spec.Flags, apiv1.ResourceFlagDiskless) || slices.Contains(res.Spec.Flags, apiv1.ResourceFlagTieBreaker) {
+		if res.Status.MetadataPeerSlots == nil {
+			return nil
+		}
+
+		base := res.DeepCopy()
+		res.Status.MetadataPeerSlots = nil
+
+		err := r.Status().Patch(ctx, res, client.MergeFrom(base))
+		if err != nil {
+			return errors.Wrap(err, "clear Status.MetadataPeerSlots")
+		}
+
+		return nil
+	}
+
 	if len(results) == 0 || res.Status.MetadataPeerSlots != nil {
 		return nil
 	}

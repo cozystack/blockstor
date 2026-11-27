@@ -177,3 +177,25 @@ func TestSuperblockCountOfMetadataCreatedHereIsNotRead(t *testing.T) {
 		}
 	}
 }
+
+// TestGrowAfterToggleUsesTheSlotsCreateMDWrote: a replica an older
+// satellite created with 15 while it was recorded with 7 publishes 15.
+// After a toggle to diskless and back, create-md writes the 7 it is
+// recorded with; the grow must size for those 7, not for the 15 the
+// status still held, or the device comes out larger than the
+// definition.
+func TestGrowAfterToggleUsesTheSlotsCreateMDWrote(t *testing.T) {
+	t.Parallel()
+
+	r, dr, vol := restoredReplica(t.TempDir())
+	vol.SourceSnapshot = ""
+
+	stale := int32(drbd.LegacyPeerSlots)
+	dr.MetadataPeerSlots = &stale
+
+	r.noteMetadataSlots("pvc-r/0", int(restoredPeerSlots))
+
+	if got := r.grownPeerSlots(dr, vol); got != int(restoredPeerSlots) {
+		t.Errorf("grow sized for %d slots, want the %d create-md wrote", got, restoredPeerSlots)
+	}
+}

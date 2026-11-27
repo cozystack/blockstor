@@ -177,9 +177,9 @@ func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withD
 }
 
 // grownPeerSlots is the peer-slot count a grow sizes the metadata of vol
-// for: the count its superblock holds. That is the count the satellite
-// read once and published (Status.MetadataPeerSlots), else the one this
-// process created the metadata with or read (noteMetadataSlots), else,
+// for: the count its superblock holds. That is the one this process
+// created the metadata with or read (noteMetadataSlots), else the count
+// a satellite read once and published (Status.MetadataPeerSlots), else,
 // for a replica whose metadata is not created yet, the replica's own
 // count, which create-md is about to write: a restore, or a clone,
 // whose definition grew before its first activation grows its backing
@@ -200,12 +200,12 @@ func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withD
 // upgrade. So it is sized for at least 15 then, which can only leave the
 // device larger, never short.
 func (r *Reconciler) grownPeerSlots(dr *intent.DesiredResource, vol *intent.DesiredVolume) int {
-	if read := dr.GetMetadataPeerSlots(); read != nil {
-		return int(*read)
-	}
-
 	if slots, ok := r.knownMetadataSlots(dr.GetName(), vol.GetVolumeNumber()); ok {
 		return int(slots)
+	}
+
+	if read := dr.GetMetadataPeerSlots(); read != nil {
+		return int(*read)
 	}
 
 	if r.metadataPending(dr) {
