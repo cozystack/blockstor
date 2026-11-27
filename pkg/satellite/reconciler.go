@@ -5829,8 +5829,6 @@ func (r *Reconciler) mkfsVolumes(ctx context.Context, dr *intent.DesiredResource
 			continue
 		}
 
-		args := strings.Fields(volumeFileSystemProp(dr, vol, fsMkfsParamsProp))
-
 		device := devices[vol.GetVolumeNumber()]
 		if device == "" {
 			// No device path for this volume → caller is a path that
@@ -5858,7 +5856,7 @@ func (r *Reconciler) mkfsVolumes(ctx context.Context, dr *intent.DesiredResource
 		case filesystemAbsent:
 		}
 
-		cmdArgs := append(args, device)
+		cmdArgs := append(strings.Fields(volumeFileSystemProp(dr, vol, fsMkfsParamsProp)), device)
 
 		_, err := r.cfg.Exec.Run(ctx, "mkfs."+fsType, cmdArgs...)
 		if err != nil {
