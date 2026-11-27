@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/propwhitelist"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -2276,6 +2277,8 @@ func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 	if src.Props != nil || len(req.OverrideProps) > 0 {
 		clone.Props = make(map[string]string, len(src.Props)+len(req.OverrideProps))
 		maps.Copy(clone.Props, store.TravellingProps(src.Props))
+		// The copy is a DRBD resource of its own, with its own secret.
+		drbd.DropSharedSecret(clone.Props)
 	}
 
 	maps.Copy(clone.Props, req.OverrideProps)
@@ -2286,7 +2289,14 @@ func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
 
 	deletePropNamespaces(clone.Props, req.DeleteNamespaces)
 
-	err := s.Store.ResourceDefinitions().Create(r.Context(), &clone)
+	err := store.SeedPeerAuthentication(r.Context(), s.Store, &clone, "")
+	if err != nil {
+		writeCloneStoreError(w, src.Name, clone.Name, err)
+
+		return
+	}
+
+	err = s.Store.ResourceDefinitions().Create(r.Context(), &clone)
 	if err != nil {
 		writeCloneStoreError(w, src.Name, clone.Name, err)
 

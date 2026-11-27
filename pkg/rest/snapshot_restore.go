@@ -31,6 +31,7 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/blocksize"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/naming"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
@@ -1446,11 +1447,10 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 		PeerSlots: store.ReplicaPeerSlots(0, srcRDObj.PeerSlots),
 	}
 
-	if newRD.Props == nil {
-		newRD.Props = store.TravellingProps(srcRDObj.Props)
+	err = s.shapeRestoredRD(ctx, &newRD, &srcRDObj, overrides)
+	if err != nil {
+		return materialisedRD{}, err
 	}
-
-	overrides.applyTo(&newRD)
 
 	// A copy short of what its group asks for, a plaintext one in a LUKS
 	// group, is flagged the way the controller flags a definition it pinned
@@ -1512,6 +1512,25 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	}
 
 	return made, nil
+}
+
+// shapeRestoredRD finishes the props of a definition a restore or a clone is
+// about to create: the source's when the snapshot recorded none, then the
+// clone's own edits, then peer authentication. The secret copied from the
+// source is dropped first, so the copy gets one of its own, as LINSTOR
+// generates a new one for every restore and clone.
+func (s *Server) shapeRestoredRD(
+	ctx context.Context, newRD, srcRD *apiv1.ResourceDefinition, overrides *rdShapeOverrides,
+) error {
+	if newRD.Props == nil {
+		newRD.Props = store.TravellingProps(srcRD.Props)
+	}
+
+	drbd.DropSharedSecret(newRD.Props)
+
+	overrides.applyTo(newRD)
+
+	return store.SeedPeerAuthentication(ctx, s.Store, newRD, "") //nolint:wrapcheck // surfaced via writeStoreError
 }
 
 // flagUnappliedGroupStack annotates rd with the layers its group asks for and

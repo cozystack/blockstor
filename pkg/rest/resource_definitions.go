@@ -365,12 +365,10 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 	// and the linstor-csi CreateVolume hot path.
 	seedAutoQuorumDefaults(&rd)
 
-	// The peer slots the definition's replicas get, resolved now as
-	// LINSTOR resolves them when it creates the definition's DRBD layer.
-	err = store.ResolvePeerSlots(r.Context(), s.Store, &rd, body.DrbdPeerSlots)
-	if err != nil {
-		writeStoreError(w, err)
-
+	// The peer slots and the peer authentication the definition's
+	// replicas get, resolved now as LINSTOR resolves them when it creates
+	// the definition's DRBD layer.
+	if !s.prepareDRBDLayer(w, r, &rd, body.DrbdPeerSlots, body.DrbdSecret) {
 		return
 	}
 
