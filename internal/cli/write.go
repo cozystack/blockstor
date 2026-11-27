@@ -401,6 +401,11 @@ func resourceDefinitionCreate(ctx context.Context, run *runContext) error {
 		return err
 	}
 
+	err = store.SeedPeerAuthentication(ctx, run.Store, def, "")
+	if err != nil {
+		return fmt.Errorf("peer authentication of %s: %w", def.Name, err)
+	}
+
 	err = run.Store.ResourceDefinitions().Create(ctx, def)
 	if err != nil {
 		return fmt.Errorf("create resource definition %s: %w", def.Name, err)
