@@ -314,3 +314,53 @@ func TestSnapshotDeleteOnSomeNodesIsRefused(t *testing.T) {
 		t.Errorf("the refused delete removed the snapshot: %v", getErr)
 	}
 }
+
+// TestRDTruncateMarksADefinitionOnlyItsCloneKeeps: CDI deletes the source of
+// a clone while the clone runs, so linstor-csi's truncate with
+// delete_empty_resource_definition finds the clone's internal snapshot on the
+// source. LINSTOR has no snapshot definition there and deletes the source;
+// here the snapshot must outlive the clone, so the source stays, marked for
+// the definition controller to delete once the snapshot is gone. Nothing
+// else asks again. A snapshot of the user keeps the definition unmarked, as
+// in LINSTOR, which deletes it when linstor-csi deletes that snapshot.
+func TestRDTruncateMarksADefinitionOnlyItsCloneKeeps(t *testing.T) {
+	t.Parallel()
+
+	for _, cloneOwned := range []bool{true, false} {
+		st := store.NewInMemory()
+		seedTruncateFixture(t, st, "pvc-src", true)
+
+		if cloneOwned {
+			if err := st.Snapshots().PatchSnapshotProps(t.Context(), "pvc-src", "snap-1", func(props map[string]string) error {
+				props[store.CloneSnapshotOwnerProp] = "pvc-clone"
+
+				return nil
+			}); err != nil {
+				t.Fatalf("mark the clone's snapshot: %v", err)
+			}
+		}
+
+		base, stop := startServerWithStore(t, st)
+
+		err := newClient(t, base).ResourceDefinitions.Truncate(t.Context(), "pvc-src",
+			&lapi.ResourceDefinitionTruncateOpts{DeleteEmptyResourceDefinition: true})
+		if err != nil {
+			t.Fatalf("clone=%v: Truncate: %v", cloneOwned, err)
+		}
+
+		rd, err := st.ResourceDefinitions().Get(t.Context(), "pvc-src")
+		if err != nil {
+			t.Fatalf("clone=%v: the definition its snapshot keeps is gone: %v", cloneOwned, err)
+		}
+
+		if got := rd.Props[store.DeleteWhenEmptyProp] != ""; got != cloneOwned {
+			t.Errorf("clone=%v: marked delete-when-empty = %v, want %v", cloneOwned, got, cloneOwned)
+		}
+
+		if slices.Contains(rd.Flags, rdFlagDelete) {
+			t.Errorf("clone=%v: a definition its snapshot keeps is left marked DELETE: %v", cloneOwned, rd.Flags)
+		}
+
+		stop()
+	}
+}
