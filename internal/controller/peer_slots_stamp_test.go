@@ -29,6 +29,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	controllerpkg "github.com/cozystack/blockstor/internal/controller"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // stampedPeerSlots reconciles one replica of a definition with the given
@@ -322,4 +323,71 @@ func TestNewReplicaOfAnAdoptedDefinitionGetsItsReplicasPeerSlots(t *testing.T) {
 				got.Spec.DRBDNodeID, slotsString(got.Spec.PeerSlots))
 		}
 	})
+}
+
+// A replica restored from a snapshot gets the count of the source's
+// replica on its node, whose superblock its clone carries, as LINSTOR
+// gives it the snapshot replica's count, not the restored definition's.
+// The definition takes the source definition's current count, which a
+// `rd modify --peer-slots` after the replicas were created leaves
+// different from theirs. A replica on a node the source has no replica
+// on gets its definition's count.
+func TestRestoredReplicaGetsItsSourceReplicasPeerSlots(t *testing.T) {
+	t.Parallel()
+
+	seven, fifteen := int32(7), int32(15)
+
+	cases := []struct {
+		name     string
+		node     string
+		recorded *int32
+		read     *int32
+		want     string
+	}{
+		{"source replica on the node", "n1", &seven, nil, "7"},
+		{"its superblock read holds more", "n1", &seven, &fifteen, "15"},
+		{"no source replica on the node", "n2", &seven, nil, "15"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			scheme := newScheme(t)
+			minor := int32(1000)
+
+			restored := &blockstoriov1alpha1.ResourceDefinition{
+				ObjectMeta: metav1.ObjectMeta{Name: "restored"},
+				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+					PeerSlots: &fifteen,
+					Props:     map[string]string{store.RestoreFromSnapshotProp: "src:snap1"},
+					VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+						{VolumeNumber: 0, SizeKib: 1024, DRBDMinor: &minor},
+					},
+				},
+			}
+
+			source := preexistingReplica("src", "n1", 0, tc.read)
+			source.Spec.PeerSlots = tc.recorded
+
+			target := &blockstoriov1alpha1.Resource{
+				ObjectMeta: metav1.ObjectMeta{Name: "restored." + tc.node},
+				Spec:       blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "restored", NodeName: tc.node},
+			}
+
+			cli := fake.NewClientBuilder().WithScheme(scheme).
+				WithStatusSubresource(&blockstoriov1alpha1.Resource{}, &blockstoriov1alpha1.ResourceDefinition{}).
+				WithObjects(restored, source, target).
+				Build()
+
+			reconcileToSteadyState(t, ctx, &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}, target.Name)
+
+			got := getReplica(t, cli, target.Name)
+			if got.Spec.DRBDNodeID == nil || slotsString(got.Spec.PeerSlots) != tc.want {
+				t.Errorf("node id %v, peer slots %s; want a node id and %s",
+					got.Spec.DRBDNodeID, slotsString(got.Spec.PeerSlots), tc.want)
+			}
+		})
+	}
 }

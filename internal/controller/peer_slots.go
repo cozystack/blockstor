@@ -21,6 +21,7 @@ package controller
 import (
 	"context"
 	"slices"
+	"strings"
 
 	cerrors "github.com/cockroachdb/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -29,6 +30,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/naming"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // errAwaitingPeerSlots holds back the identities of a new replica of a
@@ -126,6 +128,11 @@ func (r *ResourceReconciler) peerSlotsToStamp(
 		return copyI32(target.Status.MetadataPeerSlots), nil
 	}
 
+	restored, err := r.restoredReplicaPeerSlots(ctx, target, rd)
+	if err != nil || restored != nil {
+		return restored, err
+	}
+
 	if rd.Spec.PeerSlots != nil {
 		return copyI32(rd.Spec.PeerSlots), nil
 	}
@@ -151,6 +158,57 @@ func (r *ResourceReconciler) peerSlotsToStamp(
 
 		return &v, nil
 	}
+}
+
+// restoredReplicaPeerSlots is the count of a new diskful replica of a
+// definition restored or cloned from a snapshot, nil when it gets its
+// definition's: the count of the source's replica on the same node,
+// whose snapshot the replica's volume is cloned from.
+//
+// The clone carries that replica's superblock, and the metadata probe
+// keeps its layout with no more slots than the replica's own count. The
+// restored definition takes the source definition's current count,
+// which differs from the replica's once the source was modified after
+// the replica was created, as replicas keep theirs. Stamped with the
+// definition's count, the replica can record more slots than the
+// metadata the probe keeps: a grow sized for the record leaves the
+// device larger than the definition, and the placement check counts
+// slots the metadata does not have. LINSTOR gives the
+// restored replica the snapshot replica's count (RscDrbdLayerHelper,
+// v1.33.2).
+//
+// A replica's count never changes, so the live source replica's count
+// is the one its snapshot holds; the superblock's own read comes first,
+// as it is the truth for a replica an older satellite created. With no
+// such replica left, the replica gets its definition's count.
+func (r *ResourceReconciler) restoredReplicaPeerSlots(
+	ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition,
+) (*int32, error) {
+	source, _, restored := strings.Cut(rd.Spec.Props[store.RestoreFromSnapshotProp], ":")
+	if !restored || source == "" || !replicaKeepsDisk(target) {
+		return nil, nil //nolint:nilnil // not a restored replica with a disk
+	}
+
+	replicas, err := r.cachedResources(ctx)
+	if err != nil {
+		return nil, cerrors.Wrapf(err, "list the replicas of %q for the peer slots of its restore", source)
+	}
+
+	for i := range replicas {
+		res := &replicas[i]
+		if !naming.Same(res.Spec.ResourceDefinitionName, source) || !naming.Same(res.Spec.NodeName, target.Spec.NodeName) ||
+			!replicaKeepsDisk(res) {
+			continue
+		}
+
+		if slots := res.Status.MetadataPeerSlots; slots != nil {
+			return copyI32(slots), nil
+		}
+
+		return copyI32(res.Spec.PeerSlots), nil
+	}
+
+	return nil, nil //nolint:nilnil // no source replica left on the node
 }
 
 // recordDefinitionPeerSlots records on a definition that records no
