@@ -28,10 +28,12 @@ import (
 // pythonIndexedKeys are the keys python linstor 1.29 reads from a
 // volume layer's data with a plain index, per layer type: a missing
 // one is a KeyError in `linstor r l` or `linstor v l`.
-var pythonIndexedKeys = map[string][]string{
-	apiv1.LayerKindDRBD: {"drbd_volume_definition", "device_path", "allocated_size_kib", "usable_size_kib"},
-	apiv1.LayerKindLUKS: {},
-	"STORAGE":           {},
+func pythonIndexedKeys(kind string) []string {
+	if kind == apiv1.LayerKindDRBD {
+		return []string{"drbd_volume_definition", "device_path", "allocated_size_kib", "usable_size_kib"}
+	}
+
+	return nil
 }
 
 // TestEveryVolumeLayerCarriesData: LINSTOR sends `data` on every entry
@@ -128,7 +130,7 @@ func assertLayersCarryData(t *testing.T, where string, vols []map[string]any) {
 				continue
 			}
 
-			for _, key := range pythonIndexedKeys[kind] {
+			for _, key := range pythonIndexedKeys(kind) {
 				if _, ok := data[key]; !ok {
 					t.Errorf("%s: %s data lacks %q: %v", where, kind, key, data)
 				}

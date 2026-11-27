@@ -287,7 +287,11 @@ const drbdDevicePrefix = "/dev/drbd"
 // to the top layer, which is the device the volume exposes; a layer
 // below it gets the sizes only. A DRBD entry's minor is read off its
 // /dev/drbd<minor> device path, 0 while the volume has none.
-func (v Volume) MarshalJSON() ([]byte, error) {
+//
+// The receiver is a value: a volume handed to the encoder on its own, as
+// the single-volume GET does, is not addressable, and a pointer method
+// would not be called for it.
+func (v Volume) MarshalJSON() ([]byte, error) { //nolint:gocritic // hugeParam: see above
 	type plain Volume
 
 	out := plain(v)
@@ -328,10 +332,14 @@ func (v *Volume) layerPayload(kind string, top bool) *VolumeLayerPayload {
 
 	payload.DrbdVolumeDefinition = &DrbdVolumeDefinitionData{VolumeNumber: v.VolumeNumber}
 
-	if digits, ok := strings.CutPrefix(v.DevicePath, drbdDevicePrefix); ok {
-		if minor, err := strconv.ParseInt(digits, 10, 32); err == nil {
-			payload.DrbdVolumeDefinition.MinorNumber = int32(minor)
-		}
+	digits, ok := strings.CutPrefix(v.DevicePath, drbdDevicePrefix)
+	if !ok {
+		return payload
+	}
+
+	minor, err := strconv.ParseInt(digits, 10, 32)
+	if err == nil {
+		payload.DrbdVolumeDefinition.MinorNumber = int32(minor)
 	}
 
 	return payload
