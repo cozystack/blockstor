@@ -40,7 +40,7 @@ func TestDefinitionCreateSeedsPeerAuthentication(t *testing.T) {
 		"spawn":     {"rg", "spawn-resources", "rg", "pvc-new"},
 		"restore": {
 			"s", "resource", "restore", "--from-resource", "pvc-x",
-			"--from-snapshot", "snap-1", "--to-resource", "pvc-new",
+			"--from-snapshot", "snap-auth", "--to-resource", "pvc-new",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -50,12 +50,18 @@ func TestDefinitionCreateSeedsPeerAuthentication(t *testing.T) {
 				_ = backend.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: "rg"})
 
 				seedSnapshotSource(ctx, backend)
-				_ = backend.Snapshots().Create(ctx, &apiv1.Snapshot{
-					Name: "snap-1", ResourceName: "pvc-x",
+
+				// Not snap-1: seedSnapshotSource made that one, without a
+				// secret, and a second create of it would be refused.
+				err := backend.Snapshots().Create(ctx, &apiv1.Snapshot{
+					Name: "snap-auth", ResourceName: "pvc-x",
 					Nodes:             []string{"node-1", "node-2"},
 					VolumeDefinitions: []apiv1.SnapshotVolumeDef{{VolumeNumber: 0, SizeKib: 1 << 20}},
 					Props:             map[string]string{drbd.SharedSecretProp: sourceSecret},
 				})
+				if err != nil {
+					t.Errorf("seed the snapshot: %v", err)
+				}
 			})
 
 			if got := app.Run(t.Context(), argv); got != 0 {
