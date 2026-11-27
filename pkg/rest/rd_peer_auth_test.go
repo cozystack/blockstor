@@ -233,7 +233,46 @@ func TestRDModifyLeavesAnExistingDefinitionUnauthenticated(t *testing.T) {
 		t.Fatalf("get: %v", err)
 	}
 
-	if drbd.HasPropFold(rd.Props, drbd.SharedSecretProp) || drbd.HasPropFold(rd.Props, drbd.CramHMACAlgProp) {
+	if auth := peerAuthProps(rd.Props); len(auth) != 0 {
 		t.Errorf("an edit switched peer authentication on for an existing definition")
+	}
+}
+
+// A clone's deletes are folded in again once its data is in place. They
+// take a secret the source had; the one the clone was given stays, even
+// under a delete of the whole DrbdOptions/Net namespace.
+func TestClonePropEditsKeepTheClonesOwnPeerAuthentication(t *testing.T) {
+	st := store.NewInMemory()
+
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{
+		Name: "pvc-clone",
+		Props: map[string]string{
+			drbd.SharedSecretProp:         peerAuthSourceSecret,
+			drbd.CramHMACAlgProp:          drbd.DefaultCramHMACAlg,
+			"DrbdOptions/Net/max-buffers": "8000",
+		},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	req := &rdCloneRequest{Name: "pvc-clone"}
+	req.DeleteProps = []string{drbd.SharedSecretProp}
+	req.DeleteNamespaces = []string{"DrbdOptions/Net"}
+
+	if err := (&Server{Store: st}).applyClonePropEdits(t.Context(), req); err != nil {
+		t.Fatalf("applyClonePropEdits: %v", err)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(t.Context(), "pvc-clone")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if rd.Props[drbd.SharedSecretProp] != peerAuthSourceSecret || rd.Props[drbd.CramHMACAlgProp] != drbd.DefaultCramHMACAlg {
+		t.Errorf("the clone lost its peer authentication to its own delete edits")
+	}
+
+	if _, ok := rd.Props["DrbdOptions/Net/max-buffers"]; ok {
+		t.Errorf("the namespace delete did not apply to the rest of DrbdOptions/Net")
 	}
 }

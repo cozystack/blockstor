@@ -28,6 +28,19 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
+// peerAuthProps returns the peer authentication props carries.
+func peerAuthProps(props map[string]string) map[string]string {
+	out := map[string]string{}
+
+	for _, key := range []string{drbd.SharedSecretProp, drbd.CramHMACAlgProp} {
+		if value, ok := props[key]; ok {
+			out[key] = value
+		}
+	}
+
+	return out
+}
+
 // prepareDRBDLayer resolves, for a definition a create door is about to
 // write, the peer slots (store.ResolvePeerSlots) and the peer
 // authentication (store.SeedPeerAuthentication) of its DRBD layer, and

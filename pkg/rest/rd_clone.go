@@ -2145,6 +2145,11 @@ func (s *Server) applyClonePropEdits(ctx context.Context, req *rdCloneRequest) e
 				rd.Props = make(map[string]string, len(req.OverrideProps))
 			}
 
+			// The deletes were folded in before the definition was created,
+			// where they could only take the source's secret; what is on the
+			// definition now is its own, and stays.
+			auth := peerAuthProps(rd.Props)
+
 			maps.Copy(rd.Props, req.OverrideProps)
 
 			for _, k := range req.DeleteProps {
@@ -2152,6 +2157,12 @@ func (s *Server) applyClonePropEdits(ctx context.Context, req *rdCloneRequest) e
 			}
 
 			deletePropNamespaces(rd.Props, req.DeleteNamespaces)
+
+			for key, value := range auth {
+				if _, kept := rd.Props[key]; !kept {
+					rd.Props[key] = value
+				}
+			}
 
 			return nil
 		})
