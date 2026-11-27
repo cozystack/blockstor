@@ -18,6 +18,12 @@ limitations under the License.
 
 package v1
 
+import (
+	"encoding/json"
+	"strconv"
+	"strings"
+)
+
 // Resource is a single replica of a ResourceDefinition placed on a node.
 // linstor-csi reads this heavily via /v1/view/resources during volume
 // reconciliation.
@@ -230,14 +236,105 @@ type Volume struct {
 }
 
 // VolumeLayerData mirrors upstream LINSTOR's per-volume layer
-// descriptor: a `type` (DRBD/STORAGE/LUKS/…) plus the layer's `data`.
-// Only the STORAGE layer of a replica with a disk carries data: the
+// descriptor (VolumeLayer): a `type` (DRBD/STORAGE/LUKS/…) plus the
+// layer's `data`. LINSTOR sends `data` on every entry, and python
+// linstor 1.29 reads it unconditionally (Volume.layer_data indexes
+// entry["data"] for DRBD, STORAGE and LUKS), so `linstor r l` and `v l`
+// crash with KeyError 'data' on an entry without one. Volume's
+// MarshalJSON fills an entry nobody filled from the volume itself; the
+// REST layer stamps the STORAGE entry of a replica with a disk with the
 // sizes linstor-csi adds up to the capacity a thin pool has promised
-// (ReservedCapacity) when a StorageClass sets overProvision. The CLI
-// only reads the type discriminator to gate the disk_state trust path.
+// (ReservedCapacity) when a StorageClass sets overProvision.
 type VolumeLayerData struct {
 	Type string              `json:"type"`
-	Data *StorageVolumeLayer `json:"data,omitempty"`
+	Data *VolumeLayerPayload `json:"data,omitempty"`
+}
+
+// VolumeLayerPayload is the `data` of one VolumeLayerData entry: the
+// fields of LINSTOR's DrbdVolume, LUKSVolume and StorageVolume that
+// blockstor knows, by the entry's type. The ones python linstor reads
+// with a plain index are always present: device_path and both sizes,
+// and drbd_volume_definition on a DRBD entry.
+type VolumeLayerPayload struct {
+	// DrbdVolumeDefinition is set on a DRBD entry only.
+	DrbdVolumeDefinition *DrbdVolumeDefinitionData `json:"drbd_volume_definition,omitempty"`
+
+	// VolumeNumber is set on every entry but a DRBD one, which carries
+	// it inside DrbdVolumeDefinition, as LINSTOR's schema does.
+	VolumeNumber *int32 `json:"volume_number,omitempty"`
+
+	DevicePath       string `json:"device_path"`
+	AllocatedSizeKib int64  `json:"allocated_size_kib"`
+	UsableSizeKib    int64  `json:"usable_size_kib"`
+	DiskState        string `json:"disk_state,omitempty"`
+}
+
+// DrbdVolumeDefinitionData is LINSTOR's DrbdVolumeDefinition, the
+// DRBD side of a volume definition.
+type DrbdVolumeDefinitionData struct {
+	ResourceNameSuffix string `json:"resource_name_suffix"`
+	VolumeNumber       int32  `json:"volume_number"`
+	MinorNumber        int32  `json:"minor_number"`
+}
+
+// drbdDevicePrefix is the device path of a DRBD minor without its
+// number.
+const drbdDevicePrefix = "/dev/drbd"
+
+// MarshalJSON gives every layer entry of the volume a `data` object:
+// one the REST layer stamped is sent as is, any other is built from
+// the volume's own fields. The device path and the disk state belong
+// to the top layer, which is the device the volume exposes; a layer
+// below it gets the sizes only. A DRBD entry's minor is read off its
+// /dev/drbd<minor> device path, 0 while the volume has none.
+func (v Volume) MarshalJSON() ([]byte, error) {
+	type plain Volume
+
+	out := plain(v)
+
+	if len(v.LayerDataList) > 0 {
+		out.LayerDataList = make([]VolumeLayerData, len(v.LayerDataList))
+
+		for i, layer := range v.LayerDataList {
+			if layer.Data == nil {
+				layer.Data = v.layerPayload(layer.Type, i == 0)
+			}
+
+			out.LayerDataList[i] = layer
+		}
+	}
+
+	return json.Marshal(out) //nolint:wrapcheck // a json.Marshaler's error is reported by encoding/json
+}
+
+// layerPayload builds the data of one layer entry from the volume.
+func (v *Volume) layerPayload(kind string, top bool) *VolumeLayerPayload {
+	payload := &VolumeLayerPayload{
+		AllocatedSizeKib: v.AllocatedKib,
+		UsableSizeKib:    v.UsableKib,
+	}
+
+	if top {
+		payload.DevicePath = v.DevicePath
+		payload.DiskState = v.State.DiskState
+	}
+
+	if !strings.EqualFold(kind, LayerKindDRBD) {
+		number := v.VolumeNumber
+		payload.VolumeNumber = &number
+
+		return payload
+	}
+
+	payload.DrbdVolumeDefinition = &DrbdVolumeDefinitionData{VolumeNumber: v.VolumeNumber}
+
+	if digits, ok := strings.CutPrefix(v.DevicePath, drbdDevicePrefix); ok {
+		if minor, err := strconv.ParseInt(digits, 10, 32); err == nil {
+			payload.DrbdVolumeDefinition.MinorNumber = int32(minor)
+		}
+	}
+
+	return payload
 }
 
 // VolumeState is the runtime state surface of a Volume.

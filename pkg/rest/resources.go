@@ -375,8 +375,9 @@ func stampStorageLayerData(vols []apiv1.Volume, rsc *apiv1.Resource, vdSizes map
 			usable = vdSizes[vol.VolumeNumber]
 		}
 
-		vol.LayerDataList[last].Data = &apiv1.StorageVolumeLayer{
-			VolumeNumber:     vol.VolumeNumber,
+		number := vol.VolumeNumber
+		vol.LayerDataList[last].Data = &apiv1.VolumeLayerPayload{
+			VolumeNumber:     &number,
 			DevicePath:       vol.DevicePath,
 			AllocatedSizeKib: vol.AllocatedKib,
 			UsableSizeKib:    usable,
