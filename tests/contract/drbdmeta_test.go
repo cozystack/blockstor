@@ -266,6 +266,70 @@ func TestDrbdadmConfigValidate(t *testing.T) {
 	}
 }
 
+// TestDrbdadmAcceptsPeerAuthentication renders the net section every
+// definition blockstor creates carries, a generated secret next to
+// `cram-hmac-alg sha1`, and has real drbdadm parse it. A generated secret
+// is base64 and routinely holds '+', '/' or '=', which drbdadm refuses
+// unquoted, so this pins the quoting against the parser rather than
+// against our own golden string.
+func TestDrbdadmAcceptsPeerAuthentication(t *testing.T) {
+	contract.SkipIfNotLinux(t)
+	contract.EnsureImage(t)
+
+	secret, err := drbd.GenerateSharedSecret()
+	if err != nil {
+		t.Fatalf("GenerateSharedSecret: %v", err)
+	}
+
+	// A fixed fixture next to the generated one, so every run exercises
+	// the characters a random draw may happen to miss.
+	for _, value := range []string{secret, "+k6fjase/NGwYq1e2Ab="} {
+		r := drbd.Resource{
+			Name: "pvc-auth",
+			Net: drbd.Net{
+				ProtocolC: true,
+				Options: map[string]string{
+					"shared-secret": value,
+					"cram-hmac-alg": drbd.DefaultCramHMACAlg,
+				},
+			},
+			Hosts: []drbd.Host{
+				{NodeName: "worker-a", Address: "10.0.0.1", Port: 7000, NodeID: 0, IsLocal: true},
+				{NodeName: "worker-b", Address: "10.0.0.2", Port: 7000, NodeID: 1},
+			},
+			Volumes: []drbd.Volume{
+				{Number: 0, Device: "/dev/drbd1000", Disk: "/dev/vg0/pvc-auth_00000", Minor: 1000},
+			},
+		}
+
+		body, err := drbd.Build(r)
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+
+		resPath := filepath.Join(t.TempDir(), r.Name+".res")
+		if err := os.WriteFile(resPath, []byte(body), 0o600); err != nil {
+			t.Fatalf("write res: %v", err)
+		}
+
+		res := contract.RunDrbdadm(t, resPath, r.Hosts[0].NodeName,
+			"-c", "/etc/drbd.d/"+filepath.Base(resPath),
+			"dump", r.Name,
+		)
+
+		// The output carries the secret; only the parser's verdict is
+		// printed.
+		if res.ExitCode != 0 {
+			t.Fatalf("drbdadm dump refused the authenticated net section: exit=%d stderr: %s",
+				res.ExitCode, strings.ReplaceAll(res.Stderr, value, "<secret>"))
+		}
+
+		if !strings.Contains(res.Stdout, "cram-hmac-alg") || !strings.Contains(res.Stdout, value) {
+			t.Errorf("drbdadm dump did not keep cram-hmac-alg and the secret")
+		}
+	}
+}
+
 // ----- helpers -----
 
 // createThenSetGI runs create-md + set-gi against the same loopback
