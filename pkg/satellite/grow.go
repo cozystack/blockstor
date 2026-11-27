@@ -446,6 +446,31 @@ func drbdDevicePath(dr *intent.DesiredResource, vol *intent.DesiredVolume) strin
 	return fmt.Sprintf("/dev/drbd%d", volMinorOrBase(vol, minor))
 }
 
+// deviceShortOfDefinition reports whether some DRBD device of dr is
+// smaller than its definition, which a grow then has `drbdadm resize`
+// extend. A device it cannot measure counts as short, so the resize
+// runs as it did before the check.
+//
+// A grow does not always leave the device short. A replica whose
+// backing grew before its disk was attached, as a restore received
+// from another node at the snapshot's size and grown to the definition
+// before its metadata was created, attaches at the new size: there is
+// nothing to resize, and the resize, which DRBD refuses while the
+// replica resyncs, failed the apply of every such restore with "Resize
+// not allowed during resync". LINSTOR resizes a DRBD volume only when
+// the device it reads from sysfs is smaller than the volume
+// (DrbdLayer.needsResize, Size.TOO_SMALL).
+func (r *Reconciler) deviceShortOfDefinition(ctx context.Context, dr *intent.DesiredResource) bool {
+	for _, vol := range dr.GetVolumes() {
+		deviceKib, err := r.deviceSizeKib(ctx, drbdDevicePath(dr, vol))
+		if err != nil || deviceKib < vol.GetSizeKib() {
+			return true
+		}
+	}
+
+	return false
+}
+
 // deviceSizeKib reads the size of a block device.
 func (r *Reconciler) deviceSizeKib(ctx context.Context, device string) (int64, error) {
 	if r.cfg.DeviceSizeKib != nil {

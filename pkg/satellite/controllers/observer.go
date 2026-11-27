@@ -117,6 +117,10 @@ type observation struct {
 	// listMap entry on the apiserver or (worse) emit False frames
 	// the next reconcile would treat as "kernel slot gone".
 	HasKernelLoaded bool
+	// ForceIOFailures mirrors `force-io-failures:` on resource frames.
+	// Not written to Status: only the DRBD workarounds read it, from
+	// the cache (workaround_hints.go).
+	ForceIOFailures bool
 	// Destroyed marks a `destroy resource` frame: the kernel slot is
 	// gone, and with it everything the observer knew about it.
 	Destroyed   bool
@@ -143,7 +147,11 @@ type observation struct {
 type volumeObservation struct {
 	VolumeNumber int32
 	DiskState    string
-	CurrentUUID  string
+	// DiskStateIfUnknown marks a DiskState that is a guess, not a
+	// frame's report: the cache takes it only while it holds no disk
+	// state for the volume.
+	DiskStateIfUnknown bool
+	CurrentUUID        string
 	// BackingDev is the lower-disk path from the events2 `device`
 	// frame's `backing_dev:` field. Used by the observer to read the
 	// on-disk current-UUID via drbdmeta get-gi when events2 doesn't
@@ -161,6 +169,11 @@ type volumeObservation struct {
 	// DeviceSizeKib is the DRBD device size from the `size:` token of
 	// a `device` frame; 0 when the frame did not carry one.
 	DeviceSizeKib int64
+
+	// Open is the `open:yes|no|unknown` of the events2 `device` frame,
+	// empty when the frame did not carry it. Not published to Status:
+	// only the DRBD workarounds' hints read it (workaround_hints.go).
+	Open string
 
 	// SyncPeer is the peer a peer-device frame's out-of-sync count is
 	// about (its `conn-name`).
@@ -352,6 +365,7 @@ func translateResourceEvent(ev drbd.Event) (observation, bool) {
 		HasResource:           true,
 		KernelLoaded:          normalizeKernelLoaded(ev.Action),
 		HasKernelLoaded:       true,
+		ForceIOFailures:       ev.Fields["force-io-failures"] == drbdFlagYes,
 		Destroyed:             ev.Action == eventActionDestroy,
 	}, true
 }
@@ -462,6 +476,7 @@ func translateDeviceEvent(ev drbd.Event) (observation, bool) {
 		DiskState:    disk,
 		CurrentUUID:  ev.Fields["current-uuid"],
 		BackingDev:   ev.Fields["backing_dev"],
+		Open:         ev.Fields["open"],
 	}
 
 	// `quorum:yes|no` is emitted on every `device` frame on
@@ -527,24 +542,22 @@ func parsePeerNodeID(raw string) *int32 {
 // the clear, a reader between the two frames sees stale "(NN%)"
 // on what the kernel already considers a settled replica.
 func peerDeviceVolumeObservation(ev drbd.Event, volNum int32) []volumeObservation {
-	// SyncSource invariant (BUG-045): a node reporting
-	// `replication:SyncSource` toward a peer is feeding that peer's
-	// resync, which the kernel only permits from a LOCAL disk that is
-	// itself UpToDate. The local `device` frame's `disk:UpToDate` may
-	// be missing or stale on a Secondary SyncSource (it is only
-	// re-emitted on an actual local disk-state transition, and a peer-
-	// device frame can create the volume-cache entry first with an
-	// empty DiskState). Stamp DiskState=UpToDate off the reliably-
-	// emitted peer-device frame so the CRD status projection never
-	// leaves a live source's diskState blank — the U130 last-copy
-	// delete guard reads exactly this field. mergeVolumeInto only ever
-	// upgrades a cached DiskState to a non-empty value, and UpToDate is
-	// the terminal disk-state, so this is idempotent and never
-	// downgrades a richer local-frame observation.
+	// BUG-045: a peer-device frame can create the volume-cache entry of
+	// a Secondary SyncSource before any `device` frame gave it a disk
+	// state (the local disk state did not change, so none is emitted),
+	// and the CRD status projection then left the source's diskState
+	// blank, which the U130 last-copy delete guard reads. A resync
+	// source is usually UpToDate, so the frame fills that in, but only
+	// where no disk state is known: DRBD also resyncs from an Outdated
+	// source to an Inconsistent peer (drbd_state.c handles a SyncSource
+	// whose disk is below UpToDate), and overwriting the Outdated the
+	// device frame reported showed a volume with no UpToDate replica
+	// left as UpToDate until the satellite restarted.
 	if ev.Fields["replication"] == drbdReplStateSyncSource {
 		obs := volumeObservation{
-			VolumeNumber: volNum,
-			DiskState:    drbdDiskStateUpToDate,
+			VolumeNumber:       volNum,
+			DiskState:          drbdDiskStateUpToDate,
+			DiskStateIfUnknown: true,
 		}
 
 		if oosStr, ok := ev.Fields["out-of-sync"]; ok {
@@ -767,6 +780,9 @@ const (
 	// volume has lost quorum — the CSI plugin's mount path keys
 	// off this signal.
 	drbdQuorumYes = "yes"
+	// drbdFlagYes is how events2 prints any set flag, such as
+	// `force-io-failures:yes` on resource frames.
+	drbdFlagYes = "yes"
 )
 
 // newObserverRunnableFromConfig builds the observer the manager runs, so the
@@ -1016,6 +1032,12 @@ type resourceObservation struct {
 	Suspended      string
 	PromotionScore *int32
 	MayPromote     *bool
+
+	// ForceIOFailures and Unloaded feed the DRBD workarounds' hints
+	// only (workaround_hints.go); Unloaded marks a resource whose
+	// kernel slot was destroyed.
+	ForceIOFailures bool
+	Unloaded        bool
 }
 
 // NeedLeaderElection reports that this runnable does NOT need
@@ -1706,6 +1728,8 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 		cur.InUse = ev.InUse
 		cur.Role = ev.Role
 		cur.Suspended = normalizeSuspended(ev.Suspended)
+		cur.ForceIOFailures = ev.ForceIOFailures
+		cur.Unloaded = ev.HasKernelLoaded && !ev.KernelLoaded
 
 		mergePromotion(&cur, ev)
 	}
@@ -2126,12 +2150,28 @@ func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm,
 // partitions. Read that way on every resync, a hundred replicas held
 // a satellite at its CPU limit, with the disk rescans the uevents set
 // off. drbdsetup asks the kernel over netlink and opens nothing.
+//
+// Every peer the observer holds is asked, not only the lowest: right
+// after a replica is deleted the observer still holds the peer the
+// kernel just dropped, and asking only that one fell through to
+// drbdmeta --force against the attached, in-use backing device of a
+// Primary. A replica with peers whose reads all failed publishes no GI
+// this time rather than read the disk: the kernel owns the metadata of
+// an attached device, and what drbdmeta finds there can trail it. The
+// backing device is read only for a replica without peers, which no
+// drbdsetup get-gi can name.
 func (o *ObserverRunnable) readCurrentGI(ctx context.Context, adm *drbd.Adm, name string, vol *volumeObservation) string {
-	if peer, ok := o.anyPeerNodeID(name); ok {
+	peers := o.peerNodeIDs(name)
+
+	for _, peer := range peers {
 		current, err := adm.KernelCurrentGI(ctx, name, peer, vol.VolumeNumber)
 		if err == nil && current != "" {
 			return current
 		}
+	}
+
+	if len(peers) > 0 {
+		return ""
 	}
 
 	current, err := adm.CurrentGI(ctx, name, vol.VolumeNumber, vol.BackingDev)
@@ -2142,28 +2182,23 @@ func (o *ObserverRunnable) readCurrentGI(ctx context.Context, adm *drbd.Adm, nam
 	return current
 }
 
-// anyPeerNodeID returns the lowest DRBD node-id of name's peers the
-// observer has seen, for naming a peer device to drbdsetup.
-func (o *ObserverRunnable) anyPeerNodeID(name string) (int32, bool) {
+// peerNodeIDs returns the DRBD node-ids of name's peers the observer
+// has seen, lowest first, for naming a peer device to drbdsetup.
+func (o *ObserverRunnable) peerNodeIDs(name string) []int32 {
 	o.connMu.Lock()
 	defer o.connMu.Unlock()
 
-	var (
-		lowest int32
-		found  bool
-	)
+	ids := make([]int32, 0, len(o.connCache[name]))
 
 	for _, peer := range o.connCache[name] {
-		if peer.PeerDRBDNodeID == nil {
-			continue
-		}
-
-		if !found || *peer.PeerDRBDNodeID < lowest {
-			lowest, found = *peer.PeerDRBDNodeID, true
+		if peer.PeerDRBDNodeID != nil {
+			ids = append(ids, *peer.PeerDRBDNodeID)
 		}
 	}
 
-	return lowest, found
+	slices.Sort(ids)
+
+	return ids
 }
 
 // rememberProbedGI keeps a get-gi result on the cached volume, so the
@@ -2791,6 +2826,23 @@ func mergeOutOfSyncInto(merged, incoming *volumeObservation) bool {
 	return true
 }
 
+// mergeDiskStateInto takes the disk state incoming reports, unless it
+// is only a guess (DiskStateIfUnknown) and a frame already reported
+// one, and reports whether the merged state changed.
+func mergeDiskStateInto(merged, incoming *volumeObservation) bool {
+	if incoming.DiskState == "" || merged.DiskState == incoming.DiskState {
+		return false
+	}
+
+	if incoming.DiskStateIfUnknown && merged.DiskState != "" {
+		return false
+	}
+
+	merged.DiskState = incoming.DiskState
+
+	return true
+}
+
 // mergeVolumeInto folds `incoming` into `cache` for its volume key.
 // Returns true if any field actually changed — the caller uses that
 // to decide whether to emit a fresh Status snapshot.
@@ -2798,12 +2850,7 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 	merged := cache[incoming.VolumeNumber]
 	merged.VolumeNumber = incoming.VolumeNumber
 
-	changed := false
-
-	if incoming.DiskState != "" && merged.DiskState != incoming.DiskState {
-		merged.DiskState = incoming.DiskState
-		changed = true
-	}
+	changed := mergeDiskStateInto(&merged, incoming)
 
 	// The GI read from disk belongs to the data the volume held then.
 	// A volume that stops holding data, or now sits on another backing
@@ -2838,6 +2885,16 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 		changed = true
 	}
 
+	mergeHelperFieldsInto(&merged, incoming)
+
+	cache[incoming.VolumeNumber] = merged
+
+	return changed
+}
+
+// mergeHelperFieldsInto carries the fields the cache keeps for its own
+// readers rather than for Status, so they never mark the volume changed.
+func mergeHelperFieldsInto(merged, incoming *volumeObservation) {
 	// BackingDev is carried in the cache (so the snapshot the backfill
 	// reads has the lower-disk path) but never marks the volume
 	// `changed` on its own — it is an internal helper field, not a
@@ -2847,9 +2904,11 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 		merged.BackingDev = incoming.BackingDev
 	}
 
-	cache[incoming.VolumeNumber] = merged
-
-	return changed
+	// Open, like BackingDev, is cached for the workarounds' hints only
+	// and never marks the volume changed.
+	if incoming.Open != "" {
+		merged.Open = incoming.Open
+	}
 }
 
 // mergeDeviceSizeInto takes the device size a frame carried; a frame

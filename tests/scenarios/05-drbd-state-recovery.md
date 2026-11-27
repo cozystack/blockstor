@@ -282,7 +282,7 @@ Operator runs `drbdadm disconnect test` on a satellite container; reconciler doe
 - **Priority:** P1  **Target:** e2e  **Complexity:** L
 - **Source:** observability #7
 
-Emergency: operator force-promotes when peer is unreachable. Reconciler treats Primary role as observed state, not Spec — doesn't demote. After 30s recheck, role:Primary persists.
+Emergency: operator force-promotes when peer is unreachable. Reconciler treats Primary role as observed state, not Spec, and does not demote a Primary that is in use. The idle-Primary workaround (`--drbd-workaround-idle-primary`, on by default) does demote a Primary with no device open on two passes in a row, whatever promoted it, so a forced Primary nobody opens goes back to Secondary 30 to 60 s after the promote. The test opens the forced side's device within that window and holds it open; after a 30s recheck, role:Primary persists. An operator who needs the forced Primary to stay idle turns the workaround off.
 
 ### 5.31 `--discard-my-data` misuse doesn't amplify damage — S
 
