@@ -440,6 +440,13 @@ type DesiredVolume struct {
 	// volume, where they override the resource-scope disk section.
 	DiskOptions map[string]string
 
+	// FileSystem are the volume's FileSystem/* props (FileSystem/Type,
+	// FileSystem/MkfsParams), resolved over every level LINSTOR reads
+	// them from by effectiveprops.VolumeFileSystemProps. Nil when the
+	// payload carries none per volume; the satellite then reads the
+	// resource's Props.
+	FileSystem map[string]string
+
 	// DeviceSizeKib is the largest DRBD device size, in KiB, any replica
 	// of the definition reports for this volume; 0 when none reports
 	// one. A new lower disk must hold at least this much: the kernel
@@ -465,6 +472,16 @@ func (x *DesiredVolume) GetDiskOptions() map[string]string {
 	}
 
 	return x.DiskOptions
+}
+
+// GetFileSystem returns the volume's own FileSystem/* props, nil when
+// the payload carries none.
+func (x *DesiredVolume) GetFileSystem() map[string]string {
+	if x == nil {
+		return nil
+	}
+
+	return x.FileSystem
 }
 
 // GetDeviceSizeKib returns the largest DRBD device size any replica
