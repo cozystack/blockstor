@@ -161,6 +161,8 @@ linstor resource create myvolume --auto-place 3 --storage-pool data
 linstor resource create worker-1 worker-2 myvolume --storage-pool data
 ```
 
+Every resource definition is created with DRBD peer authentication, as in LINSTOR: a random 20-character `DrbdOptions/Net/shared-secret` of its own and `DrbdOptions/Net/cram-hmac-alg sha1`, which the satellites render into the `net` section. This holds for `rd create`, `rg spawn`, clones and snapshot restores; a clone or restore gets a new secret, not its source's. A `drbd_secret` sent with the create request is used as the secret, and a secret or digest already set on the definition, its resource group or the controller is kept. Definitions that existed before the upgrade that introduced this are left as they are, because switching authentication on under live connections fails every handshake between a satellite that has applied it and one that has not. To turn it on for one of them, set `DrbdOptions/Net/shared-secret` and `DrbdOptions/Net/cram-hmac-alg` on it together, while every satellite of that definition is online and none of its nodes is being rebooted or drained: a satellite that is offline applies the change only when it comes back, and its peers cannot reconnect to it until then.
+
 ### 5. Inspect state
 
 ```sh

@@ -28,6 +28,7 @@ import (
 	"github.com/google/uuid"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/validate"
 
@@ -416,6 +417,15 @@ func newRestoredDefinition(
 
 	if def.Props == nil {
 		def.Props = store.TravellingProps(src.Props)
+	}
+
+	// The restored definition is a DRBD resource of its own, with its own
+	// secret, as LINSTOR gives it.
+	drbd.DropSharedSecret(def.Props)
+
+	err = store.SeedPeerAuthentication(ctx, st, def, "")
+	if err != nil {
+		return nil, fmt.Errorf("peer authentication of %s: %w", rdName, err)
 	}
 
 	// Both halves off the stored objects, never off what the operator typed:

@@ -331,6 +331,11 @@ func spawnDefinition(ctx context.Context, run *runContext, group *apiv1.Resource
 		return err
 	}
 
+	err = store.SeedPeerAuthentication(ctx, run.Store, def, "")
+	if err != nil {
+		return fmt.Errorf("peer authentication of %s: %w", rdName, err)
+	}
+
 	err = run.Store.ResourceDefinitions().Create(ctx, def)
 	if err != nil {
 		return fmt.Errorf("create resource definition %s: %w", rdName, err)
