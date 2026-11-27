@@ -254,6 +254,8 @@ func TravellingProps(props map[string]string) map[string]string {
 	delete(out, CloneSnapshotOwnerProp)
 	delete(out, CloneSnapshotReapingProp)
 	delete(out, SnapshotDeletingProp)
+	// A delete a client asked for of THIS definition.
+	delete(out, DeleteWhenEmptyProp)
 
 	// A copy of a volume caught mid live migration is not migrating: no
 	// VM runs on it, and nobody will unmake-available it to close the
@@ -308,6 +310,7 @@ var serverOwnedDefinitionProps = []string{ //nolint:gochecknoglobals // a fixed 
 	RestoreVolumesProp,
 	CloneSnapshotOwnerProp,
 	CloneSnapshotReapingProp,
+	DeleteWhenEmptyProp,
 }
 
 // The steps a rollback gives up at before it touches anything: it found a

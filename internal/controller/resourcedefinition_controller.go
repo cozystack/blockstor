@@ -143,6 +143,15 @@ func (r *ResourceDefinitionReconciler) ReconcilePass(ctx context.Context, req ct
 		return ctrl.Result{}, nil
 	}
 
+	deleted, err := r.deleteRequestedWhenEmpty(ctx, &rd)
+	if err != nil {
+		return r.stepFailed(ctx, log, &rd, "delete when empty", err)
+	}
+
+	if deleted {
+		return ctrl.Result{}, nil
+	}
+
 	err = r.pinLayerStack(ctx, &rd)
 	if err != nil {
 		return r.stepFailed(ctx, log, &rd, "pin layer stack", err)
@@ -2002,6 +2011,12 @@ func (r *ResourceDefinitionReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		Watches(&blockstoriov1alpha1.ResourceGroup{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueRDsInGroup),
 			builder.WithPredicates(groupLayerStackChanged())).
+		// A definition a client asked to delete once empty, kept by the
+		// snapshot a clone took from it, is deleted when that snapshot
+		// goes (deleteRequestedWhenEmpty).
+		Watches(&blockstoriov1alpha1.Snapshot{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueRDForSnapshot),
+			builder.WithPredicates(snapshotGone())).
 		Named("resourcedefinition").
 		Complete(r)
 }

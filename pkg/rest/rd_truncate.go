@@ -180,74 +180,31 @@ func (s *Server) truncateReplicas(ctx context.Context, rdName string, replicas [
 // deleteDefinitionIfEmpty deletes rdName when it has neither replicas nor
 // snapshots, LINSTOR's deleteResourceDefinitionIfEmpty behind
 // `delete_empty_resource_definition`. A definition that still has either,
-// or is already gone, stays as it is and the answer is empty.
+// or is already gone, stays as it is and the answer is empty; see
+// store.ClaimEmptyDefinition for how a racing create keeps it.
 //
-// LINSTOR checks and deletes under one lock, so a replica or a snapshot
-// created meanwhile keeps the definition. Here the definition is first
-// marked DELETE, which a snapshot create checks after its own write and
-// rolls back on, and then checked again past the cache: a snapshot that
-// lands before the mark is seen by the second check, which takes the mark
-// off and keeps the definition, and one that lands after it rolls itself
-// back.
+// One kept only by the internal snapshots of a clone taken from it is
+// marked store.DeleteWhenEmptyProp instead, and the definition controller
+// deletes it once the clone's snapshot is gone: LINSTOR has no snapshot
+// definition there and deletes it at once, and the client does not ask
+// again.
 func (s *Server) deleteDefinitionIfEmpty(ctx context.Context, rdName string) ([]apiv1.APICallRc, error) {
-	empty, err := s.definitionIsEmpty(ctx, rdName)
-	if err != nil || !empty {
-		return nil, ignoreNotFound(err)
-	}
-
-	err = s.setDefinitionDeleteFlag(ctx, rdName, true)
+	contents, claimed, err := store.ClaimEmptyDefinition(ctx, s.Store, rdName)
 	if err != nil {
 		return nil, ignoreNotFound(err)
 	}
 
-	empty, err = s.definitionIsEmpty(ctx, rdName)
-	if err != nil || !empty {
-		unmarkErr := s.setDefinitionDeleteFlag(ctx, rdName, false)
+	if !claimed {
+		if contents.OnlyCloneSnapshots {
+			return nil, ignoreNotFound(store.SetDeleteWhenEmpty(ctx, s.Store, rdName, true))
+		}
 
-		return nil, errors.Wrapf(errors.CombineErrors(ignoreNotFound(err), ignoreNotFound(unmarkErr)),
-			"keep %s", rdName)
+		return nil, nil
 	}
 
 	answer, err := s.deleteDefinitionData(ctx, rdName)
 
 	return answer, ignoreNotFound(err)
-}
-
-// definitionIsEmpty reports, past the cache, whether rdName has neither a
-// replica that is not being deleted nor a snapshot.
-func (s *Server) definitionIsEmpty(ctx context.Context, rdName string) (bool, error) {
-	snaps, err := s.Store.Snapshots().ListByDefinitionUncached(ctx, rdName)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return false, errors.Wrapf(err, "list snapshots of %s", rdName)
-	}
-
-	if len(snaps) > 0 {
-		return false, nil
-	}
-
-	replicas, err := store.LiveReplicas(ctx, s.Store, rdName)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return false, errors.Wrapf(err, "list replicas of %s", rdName)
-	}
-
-	// A replica being deleted is gone for this question: its satellite
-	// only has the teardown left, which the definition delete waits on
-	// the same way.
-	return !slices.ContainsFunc(replicas, func(res apiv1.Resource) bool {
-		return !slices.Contains(res.Flags, apiv1.ResourceFlagDelete)
-	}), nil
-}
-
-// setDefinitionDeleteFlag puts LINSTOR's DELETE flag on rdName, or takes it
-// off.
-func (s *Server) setDefinitionDeleteFlag(ctx context.Context, rdName string, set bool) error {
-	//nolint:wrapcheck // the callers tell ErrNotFound from the rest
-	return s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName,
-		func(rd *apiv1.ResourceDefinition) error {
-			rd.Flags = applyFlagMutation(rd.Flags, rdFlagDelete, set)
-
-			return nil
-		})
 }
 
 // ignoreNotFound drops an error that only says the object is gone.
