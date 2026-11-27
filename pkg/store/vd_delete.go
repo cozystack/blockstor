@@ -94,9 +94,11 @@ type VolumeDefinitionDeleteProgress struct {
 // FinishVolumeDefinitionDelete removes the flagged volume definition from
 // its resource definition once every replica of the definition confirmed it
 // deleted its volume under the definition's deleteID, and otherwise reports
-// which replicas it is waiting for. A replica whose satellite is down, or
-// that never confirms, holds the definition: LINSTOR removes it anyway and
-// leaves that node's volume on disk with nothing that would ever delete it.
+// which replicas it is waiting for. A replica that has not confirmed holds
+// the definition, and its satellite retries a delete that failed, as
+// LINSTOR does. A replica whose satellite is down holds it too: LINSTOR
+// removes it anyway in that case and leaves that node's volume on disk with
+// nothing that would ever delete it.
 // `node lost` is the way to let a node go for good, and it takes the
 // node's replicas with it.
 //
