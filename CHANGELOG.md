@@ -4,6 +4,101 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0 — 2026-11-27
+
+blockstor serves linstor-csi v1.13 with server-side dual Primary and REST API 1.29, deletes storage only when it is asked to, the way LINSTOR does, and takes over the DRBD workarounds of the LINSTOR plunger. Most of the other changes come from running a cluster adopted from LINSTOR: migration and adoption fixes, DRBD peer slots and block sizes as LINSTOR sets them, and faster bring-up of busy and rebooted nodes.
+
+### Breaking changes
+
+- **Storage is deleted only on request (#271).** The orphan-storage sweeper is gone: a volume that no replica claims is never deleted, and the `blockstor.org/skip-orphan-storage-sweeper` annotation has no effect. A ZFS zvol that still has snapshots is marked `linstor:marked_for_deletion` and renamed to `_deleted_<name>_<suffix>` instead of being destroyed recursively, and it is destroyed once its last snapshot or clone goes. `StorDriver/Zfs/DeleteStrategy` is honoured. A thick LVM volume with snapshots is no longer removed while they exist. `node lost` leaves the node's storage in place, and a pool or node delete is refused while snapshots have copies on it unless `--force` is given. A replica or definition delete that is still in progress answers with a warning and keeps the object flagged `DELETE` until its satellite has deleted the storage.
+- **`vd d` deletes the volume on every replica first (#273).** A volume definition delete used to drop the definition at once and leave every replica's backing volume on disk, so a volume created again under the same number picked up the old data. The definition is now flagged `DELETE` and stays listed until every replica's satellite has deleted its volume, a `vd c` reusing the number succeeds only after that, and the flag cannot be cleared. Removing the last volume of a resource that is Primary or open on a node is refused on that node, even with `--force`. Snapshots, auto-snapshots and clones taken while a volume is flagged leave it out.
+- **`DrbdOptions/*` properties are checked against LINSTOR's whitelist (#313).** A key LINSTOR does not allow on the object, or a value its rule refuses, is refused with `FAIL_INVLD_PROP` on the REST API and in the CLI. Values already stored are kept, but a request that sends one again is refused, so a StorageClass carrying a refused `DrbdOptions` parameter fails every new PVC after the upgrade.
+
+### Upgrade notes
+
+- **Check StorageClass parameters before the upgrade (#313).** Compare the `property.linstor.csi.linbit.com/DrbdOptions/*` parameters of every StorageClass, and the props of groups and definitions that clients write back, against LINSTOR's whitelist.
+- **Roll out the CRDs before the controller (#292, #273, #325).** The Snapshot, ResourceDefinition and Resource CRDs get new optional fields, which an older API schema prunes. In a mixed-version cluster a `vd d` waits for the upgraded satellites instead of skipping a replica.
+- **Group snapshots with a failed member turn FAILED (#292).** After the upgrade every snapshot of a multi-snapshot whose sibling failed is flagged FAILED and can no longer be restored, as in LINSTOR.
+- **Clean up `_deleted_` ZFS datasets left behind by pre-release builds (#330).** On a build that had #271 but not #330, such as the earlier v0.4.0 alpha pre-releases, deleting a source volume, its snapshot and the snapshot's restores together could leave the source zvol and its snapshot renamed to `_deleted_...` and marked for deletion, with no clone left. No later delete reaches them, so they stay until removed by hand. On each storage node:
+  1. List them: `zfs list -t all -o name,used,origin,clones | grep _deleted_`.
+  2. Check that nothing references them. A snapshot must have an empty `clones` column, and no blockstor Snapshot (`blockstor s l`, or `kubectl get snapshots.blockstor.org`) may still list it, since a marked zvol whose snapshot is still in use is kept on purpose for restores. A zvol must not be open: `/dev/zvol/<pool>/<dataset>` must not be named by any `/etc/drbd.d/*.res` file or `drbdsetup show`, and the holders of its device must be empty (`ls /sys/block/$(basename $(readlink -f /dev/zvol/<pool>/<dataset>))/holders/`).
+  3. Destroy the snapshot before its zvol, and run each command with `-nv` first to see what it would destroy: `zfs destroy -nv <pool>/_deleted_<name>_<suffix>@<snapshot>`, then the same without `-nv`; then `zfs destroy -nv <pool>/_deleted_<name>_<suffix>` and the same without `-nv`. Do not add `-r` or `-R`: a dataset that still has children or dependents is one the checks above missed.
+- **New definitions get 7 DRBD peer slots (#325).** A definition created after the upgrade resolves its peer-slot count the way LINSTOR does and defaults to 7 instead of 15. Set `PeerSlotsNewResource` on the controller or the resource group to keep 15.
+- **Block size on pools blockstor creates (#287).** Volumes on pools adopted from LINSTOR get LINSTOR's 4096-byte block size. Pools blockstor creates itself record no minimum I/O size yet, so their volumes still come up with 512-byte sectors.
+
+### Added
+
+- **linstor-csi v1.13 and REST API 1.29 (#315).** blockstor serves every call linstor-csi v1.13 makes, including `make-available` with `auto_manage_dual_primary` and `unmake-available` for a VM live migration, truncate and `delete_empty_resource_definition`, and advertises REST API 1.29.0 and LINSTOR 1.35.0. linstor-csi v1.11 keeps working as before. `docs/linstor-csi-compatibility.md` lists the calls one by one.
+- **DRBD workarounds of the LINSTOR plunger (#314).** The satellite runs the four checks the `linstor-plunger` sidecar ran in LINSTOR mode, each with its own flag: an idle Primary is demoted, a Secondary still failing I/O is taken down and up, stale loop devices are detached, and a stalled resync (LINBIT/drbd#149) is reported as a `DRBDResyncStalled` Warning Event naming the `drbdadm` commands that would recover it. The stalled-resync check only reports by default; `--drbd-workaround-stalled-resync-act` makes it run those commands, which is risky with a Primary writing (see the flag's help). `--drbd-workarounds-interval=0` turns all checks off, and every action is recorded as a Warning Event.
+- **DRBD peer slots with LINSTOR's semantics (#325).** A definition records its peer-slot count, each replica copies it, metadata and the lower disk are sized for it, and a replica the count cannot hold is refused with `FAIL_INSUFFICIENT_PEER_SLOTS`. Replicas adopted from LINSTOR take their count from their superblock.
+- **Prebuilt CLI binaries (#319).** Every release carries `blockstor-<os>-<arch>` binaries for linux, darwin and windows on amd64 and arm64, with `SHA256SUMS`.
+- A diskless attach stays diskless once the volume has as many diskful replicas as its group's place count (#285).
+- The images report the release they were built from (#332).
+
+### Fixed
+
+#### LINSTOR migration and adoption
+
+- `linstor-migrate` keeps LINSTOR's DRBD net options and peer authentication, including the satellite-level `/STLT` options (#270).
+- `linstor-migrate` reads the DELETE flag from each table's own bits, so definitions being restored are no longer dropped and deleted ones are no longer converted as live (#274); a volume definition's DELETE flag is read from bit 0, so an encrypted volume definition is no longer dropped as deleted (#273).
+- The runbook dumps LINSTOR's tables at their storage version, so no field is lost on the way (#293).
+- An adopted replica is never promoted for mkfs (#269), and an adopted LUKS replica keeps the dm-crypt mapper LINSTOR left open (#276).
+- Volume definition disk options such as `block-size` are rendered the way LINSTOR does, so an adopted volume keeps its 4096-byte sectors on the next attach (#275), and new and restored volumes get LINSTOR's block size (#287).
+- A restore from a LINSTOR snapshot uses its own peer slots instead of 15-slot metadata that could overwrite the end of the data (#279), and a restore target takes the snapshot's layer stack (#286).
+- A new replica of an adopted volume gets a lower disk sized for its DRBD metadata (#321).
+- The satellite prunes only kernel peers it knows are stale (#268) and leaves DRBD slots alone unless it provably owns them (#272), so a live resource of another DRBD manager is never taken down.
+
+#### DRBD
+
+- A resource is never taken down over a bitmap refusal (#323).
+- Every `drbdsetup status` call is bounded, so one hung resource no longer stops every pass on its node (#327).
+- A peer DRBD refuses for its disk size is reported as `PeerDiskTooSmall` instead of a silent successful apply (#328).
+- A snapshot never runs `sync` while it holds I/O suspended (#282), and a snapshot abort orders the resume even when a status write fails (#324).
+- A failed `drbdadm adjust` is retried in full instead of with `--skip-net` (#299).
+- Only a replica born as the only copy is force-promoted (#312).
+- A tiebreaker is re-added only after the survivors dropped the old peer (#307).
+- A resize runs only on a DRBD device short of its definition (#333).
+- The GI is read from the kernel through any peer it still has, not from the backing device (#305, #335).
+- A port handover no longer raises `ApplyFailed`, and a clean shutdown is quiet (#329).
+- The satellite's resource queue stops while passes finish, so a satellite no longer hangs on shutdown (#342).
+
+#### Storage and ZFS
+
+- The deletes of one zpool run one at a time, so a namespace teardown no longer leaves `_deleted_` datasets behind (#330).
+- A failed replica delete backs off between retries (#331).
+- A volume is formatted from the `FileSystem/*` props linstor-csi v1.13 writes on the volume definition (#338).
+
+#### REST and linstor-csi
+
+- `/v1/view/resources` answers linstor-csi and the scheduler extender the way LINSTOR does (#278), and `linstor r l` from python-linstor 1.29.1 no longer fails with `KeyError: 'data'` (#339).
+- A resize answers only after every replica has grown (#281), a snapshot create once the snapshot is listed (#284), and a resource create once its replicas are ready (#291).
+- linstor-csi can delete the definition of a volume it deletes (#288), also after a retried snapshot delete (#306), a volume can be deleted during its initial sync (#310), and a clone source is deleted once its clone lets go (#341).
+- A snapshot stays SUCCESSFUL after its source is deleted (#292), a restore from a snapshot whose source volume is gone works (#294), and every member of a multi-snapshot is recorded SUCCESSFUL (#340).
+- The satellite writes a replica's whole status every time, so `r l` no longer flickers to Unknown and resync progress keeps up with the kernel (#297).
+- An Outdated resync source is no longer reported as UpToDate, so `r l --faulty` lists every replica that lost its last UpToDate copy (#334).
+- Sync progress is reported per volume (#296), an offline node's replicas show as Unknown (#302), and non-DRBD replicas show as Created in the CLI (#283).
+- A healthy node stays ONLINE when one API server dies (#304).
+- An ignored per-definition key Secret is flagged with an `EncryptionKeyIgnored` Condition (#192).
+
+#### Controller
+
+- Rebalance no longer re-places a definition whose replicas were deleted (#280).
+- No DRBD port or minor is allocated for a definition without DRBD (#289).
+- Auto-snapshots run on LINSTOR's schedule (#301).
+- Self-healing write conflicts are no longer logged at ERROR (#316).
+- The `MetadataCreated` backfill uses the resource's own name (#290).
+
+### Performance
+
+- A new resource on a busy node is reconciled within seconds (#277), and a rebooted node brings its resources up in parallel, every local replica before any repeat pass (#295, #298).
+- DRBD identities are handed out without stalling a provisioning burst (#300).
+- The controller and the satellites read only a definition's replicas (#303), the controller no longer re-reads every definition every 5 s (#308), and the encryption state is served from name-limited watches (#311).
+
+### Build
+
+- The satellite ships drbd-utils 9.36.0 from LINBIT's repository, the version LINSTOR's satellite runs (#275).
+- Each image architecture is built on a native runner (#309).
+
 ## v0.3.0 — 2026-11-16
 
 Every LUKS volume gets its own password under a cluster master key that several passphrases can open, and the LINSTOR migration keeps each replica's DRBD port.
