@@ -63,7 +63,7 @@ func SeedPeerAuthentication(ctx context.Context, st Store, rd *apiv1.ResourceDef
 
 		drbd.DropSharedSecret(rd.Props)
 		rd.Props[drbd.SharedSecretProp] = requested
-	case !drbd.HasPropFold(rd.Props, drbd.SharedSecretProp) && !drbd.HasPropFold(inherited, drbd.SharedSecretProp):
+	case !hasProp(rd.Props, drbd.SharedSecretProp) && !hasProp(inherited, drbd.SharedSecretProp):
 		secret, genErr := drbd.GenerateSharedSecret()
 		if genErr != nil {
 			return errors.Wrapf(genErr, "generate the DRBD shared secret of %q", rd.Name)
@@ -72,11 +72,20 @@ func SeedPeerAuthentication(ctx context.Context, st Store, rd *apiv1.ResourceDef
 		rd.Props[drbd.SharedSecretProp] = secret
 	}
 
-	if !drbd.HasPropFold(rd.Props, drbd.CramHMACAlgProp) && !drbd.HasPropFold(inherited, drbd.CramHMACAlgProp) {
+	if !hasProp(rd.Props, drbd.CramHMACAlgProp) && !hasProp(inherited, drbd.CramHMACAlgProp) {
 		rd.Props[drbd.CramHMACAlgProp] = drbd.DefaultCramHMACAlg
 	}
 
 	return nil
+}
+
+// hasProp reports whether props names key exactly. The satellite renders a
+// DrbdOptions key only in its canonical spelling, so a value under another
+// spelling never reaches the .res and must not stop the stamp.
+func hasProp(props map[string]string, key string) bool {
+	_, ok := props[key]
+
+	return ok
 }
 
 // inheritedDefinitionProps merges the props rd inherits from its group and

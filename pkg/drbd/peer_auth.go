@@ -64,14 +64,3 @@ func DropSharedSecret(props map[string]string) {
 		}
 	}
 }
-
-// HasPropFold reports whether props names key in any letter case.
-func HasPropFold(props map[string]string, key string) bool {
-	for name := range props {
-		if strings.EqualFold(name, key) {
-			return true
-		}
-	}
-
-	return false
-}

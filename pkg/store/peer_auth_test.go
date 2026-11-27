@@ -148,3 +148,24 @@ func TestSeedPeerAuthenticationKeepsWhatAnOperatorSet(t *testing.T) {
 		})
 	}
 }
+
+// The satellite renders a DrbdOptions key only in its canonical spelling,
+// so a secret or digest under another spelling does not stop the stamp:
+// it would never reach the .res.
+func TestSeedPeerAuthenticationIgnoresAnOffSpelling(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	rd := &apiv1.ResourceDefinition{Name: "pvc-a", Props: map[string]string{
+		"drbdoptions/net/shared-secret": "off-spelling",
+		"drbdoptions/net/cram-hmac-alg": "sha256",
+	}}
+
+	if err := store.SeedPeerAuthentication(t.Context(), st, rd, ""); err != nil {
+		t.Fatalf("SeedPeerAuthentication: %v", err)
+	}
+
+	if len(rd.Props[drbd.SharedSecretProp]) != 20 || rd.Props[drbd.CramHMACAlgProp] != drbd.DefaultCramHMACAlg {
+		t.Errorf("the canonical secret and digest were not stamped next to an off-spelling")
+	}
+}
