@@ -1933,6 +1933,12 @@ func (r *Reconciler) detachIfStillAttached(ctx context.Context, dr *intent.Desir
 	}
 
 	loaded, err := r.cfg.Adm.IsLoaded(ctx, dr.GetName())
+	if errors.Is(err, drbd.ErrStatusTimeout) {
+		// The slot may still hold the disk the caller is about to
+		// reclaim; stop the toggle until the kernel answers.
+		return errors.Wrapf(err, "probe %s before detach", dr.GetName())
+	}
+
 	if err != nil || !loaded {
 		// Slot absent / netlink hiccup → nothing to detach; the LV
 		// reclaim path is safe to proceed without a detach.
@@ -6168,7 +6174,9 @@ func (r *Reconciler) adjustResource(ctx context.Context, dr *intent.DesiredResou
 //
 // Errors from the probe fall through to the prop-only gate (the
 // pre-Bug-280 behaviour) so a transient netlink hiccup doesn't
-// strand the reconciler.
+// strand the reconciler. A status that did not answer stops the
+// adjust instead: the disk state is unknown, and an adjust without
+// --skip-disk could reattach the disk this probe exists to keep off.
 //
 // Bug 287 / scenario 5.32 race: even when the FSM `KernelLoaded`
 // observation reads as true (or when this path runs on first
@@ -6193,6 +6201,10 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 	// suppress exactly the attach we just created the metadata for.
 	if !skipDisk && !diskfulFlip {
 		diskless, probeErr := r.cfg.Adm.HasDisklessVolume(ctx, dr.GetName())
+		if errors.Is(probeErr, drbd.ErrStatusTimeout) {
+			return errors.Wrapf(probeErr, "probe disk state of %s before adjust", dr.GetName())
+		}
+
 		if probeErr == nil && diskless {
 			skipDisk = true
 		}
