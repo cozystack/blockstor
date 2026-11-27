@@ -308,6 +308,85 @@ func VolumeDiskOptions(ctx context.Context, c client.Reader, target *blockstorio
 	return out, nil
 }
 
+// FileSystemPrefix is LINSTOR's FileSystem namespace
+// (ApiConsts.NAMESPC_FILESYSTEM): FileSystem/Type, FileSystem/MkfsParams.
+const FileSystemPrefix = "FileSystem/"
+
+// VolumeFileSystemProps resolves each volume's FileSystem/* props, the
+// ones that decide whether and how the satellite formats the volume.
+// The result maps a volume number to full keys (FileSystem/Type); a
+// volume none of the levels gives one is absent.
+//
+// LINSTOR reads them per volume (MkfsUtils.needsToCreateFs and
+// makeFileSystemOnMarked) over resource, volume definition, volume
+// group, resource definition, resource group, closer scope first, and
+// nothing above the resource group. linstor-csi v1.13.2 stamps them on
+// the volume definition, earlier releases on the resource definition,
+// and a StorageClass parameter puts them on the resource group, so
+// every one of those levels has to count. Per volume, because the
+// volumes of one definition need not agree: a consistency group holds
+// a block member, which must not be formatted, next to a filesystem
+// one.
+func VolumeFileSystemProps(ctx context.Context, c client.Reader, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) (map[int32]map[string]string, error) {
+	if target == nil || rd == nil || len(rd.Spec.VolumeDefinitions) == 0 {
+		return nil, nil //nolint:nilnil // no volumes, nothing to resolve
+	}
+
+	rg, err := resourceGroup(ctx, c, rd)
+	if err != nil {
+		return nil, err
+	}
+
+	var rgLevel map[string]string
+	if rg != nil {
+		rgLevel = fileSystemKeys(rg.Spec.Props, rg.Spec.ExtraProps)
+	}
+
+	rdLevel := fileSystemKeys(rd.Spec.Props, rd.Spec.ExtraProps)
+	resLevel := fileSystemKeys(target.Spec.Props, target.Spec.ExtraProps)
+
+	out := map[int32]map[string]string{}
+
+	for i := range rd.Spec.VolumeDefinitions {
+		vd := &rd.Spec.VolumeDefinitions[i]
+
+		props := map[string]string{}
+
+		// Farthest level first, so a closer one overwrites it.
+		for _, level := range []map[string]string{
+			rgLevel,
+			rdLevel,
+			fileSystemKeys(volumeGroupProps(rg, vd.VolumeNumber)),
+			fileSystemKeys(vd.Props),
+			resLevel,
+		} {
+			maps.Copy(props, level)
+		}
+
+		if len(props) > 0 {
+			out[vd.VolumeNumber] = props
+		}
+	}
+
+	return out, nil
+}
+
+// fileSystemKeys returns the FileSystem/* entries of the given maps,
+// later maps winning on a collision.
+func fileSystemKeys(sources ...map[string]string) map[string]string {
+	out := map[string]string{}
+
+	for _, src := range sources {
+		for key, value := range src {
+			if strings.HasPrefix(key, FileSystemPrefix) {
+				out[key] = value
+			}
+		}
+	}
+
+	return out
+}
+
 const (
 	// rsDiscardGranularity is the disk option LINSTOR's auto rule owns.
 	rsDiscardGranularity = "rs-discard-granularity"

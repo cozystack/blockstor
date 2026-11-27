@@ -176,3 +176,106 @@ func TestRsDiscardGranularityFollowsLinstorsAutoRule(t *testing.T) {
 		t.Errorf("rule off: volume 1 rs-discard-granularity = %q, want the replica's 4096 over the group's", v)
 	}
 }
+
+// TestVolumeFileSystemPropsFollowLinstorPrecedence: FileSystem/* is
+// read per volume over resource, volume definition, volume group,
+// resource definition and resource group, closer first, the order
+// LINSTOR's MkfsUtils builds its PriorityProps in. linstor-csi v1.13.2
+// puts the props on the volume definition, v1.11.2 on the resource
+// definition, a StorageClass parameter on the resource group.
+func TestVolumeFileSystemPropsFollowLinstorPrecedence(t *testing.T) {
+	const fsType = "FileSystem/Type"
+
+	rdWith := func(rdProps, vd0, vd1 map[string]string) *blockstoriov1alpha1.ResourceDefinition {
+		return &blockstoriov1alpha1.ResourceDefinition{
+			ObjectMeta: v1.ObjectMeta{Name: "pvc-1"},
+			Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+				ResourceGroupName: "rg-1",
+				ExtraProps:        rdProps,
+				VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+					{VolumeNumber: 0, SizeKib: 1024, Props: vd0},
+					{VolumeNumber: 1, SizeKib: 1024, Props: vd1},
+				},
+			},
+		}
+	}
+
+	rgWith := func(rgProps, vg0 map[string]string) *blockstoriov1alpha1.ResourceGroup {
+		return &blockstoriov1alpha1.ResourceGroup{
+			ObjectMeta: v1.ObjectMeta{Name: "rg-1"},
+			Spec: blockstoriov1alpha1.ResourceGroupSpec{
+				ExtraProps:   rgProps,
+				VolumeGroups: []blockstoriov1alpha1.ResourceGroupVolumeGroup{{VolumeNumber: 0, Props: vg0}},
+			},
+		}
+	}
+
+	ext4 := map[string]string{fsType: "ext4", "FileSystem/MkfsParams": ""}
+	xfs := map[string]string{fsType: "xfs"}
+
+	cases := map[string]struct {
+		target *blockstoriov1alpha1.Resource
+		rd     *blockstoriov1alpha1.ResourceDefinition
+		rg     *blockstoriov1alpha1.ResourceGroup
+		want   map[int32]map[string]string
+	}{
+		"volume definition (linstor-csi v1.13.2)": {
+			rd:   rdWith(nil, ext4, nil),
+			rg:   rgWith(nil, nil),
+			want: map[int32]map[string]string{0: ext4},
+		},
+		"resource definition (linstor-csi v1.11.2)": {
+			rd:   rdWith(ext4, nil, nil),
+			rg:   rgWith(nil, nil),
+			want: map[int32]map[string]string{0: ext4, 1: ext4},
+		},
+		"resource group (StorageClass parameter)": {
+			rd:   rdWith(nil, nil, nil),
+			rg:   rgWith(xfs, nil),
+			want: map[int32]map[string]string{0: xfs, 1: xfs},
+		},
+		"volume group outranks the resource definition": {
+			rd:   rdWith(ext4, nil, nil),
+			rg:   rgWith(nil, xfs),
+			want: map[int32]map[string]string{0: {fsType: "xfs", "FileSystem/MkfsParams": ""}, 1: ext4},
+		},
+		"volume definition outranks the volume group": {
+			rd:   rdWith(nil, ext4, nil),
+			rg:   rgWith(nil, xfs),
+			want: map[int32]map[string]string{0: ext4, 1: nil},
+		},
+		"resource outranks the volume definition": {
+			target: func() *blockstoriov1alpha1.Resource {
+				res := replica()
+				res.Spec.Props = map[string]string{fsType: "xfs", "StorPoolName": "zfs1"}
+
+				return res
+			}(),
+			rd:   rdWith(nil, ext4, nil),
+			rg:   rgWith(nil, nil),
+			want: map[int32]map[string]string{0: {fsType: "xfs", "FileSystem/MkfsParams": ""}, 1: xfs},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			target := tc.target
+			if target == nil {
+				target = replica()
+			}
+
+			c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(tc.rg).Build()
+
+			got, err := effectiveprops.VolumeFileSystemProps(t.Context(), c, target, tc.rd)
+			if err != nil {
+				t.Fatalf("VolumeFileSystemProps: %v", err)
+			}
+
+			for vol := range int32(2) {
+				if !maps.Equal(got[vol], tc.want[vol]) {
+					t.Errorf("volume %d: got %v, want %v", vol, got[vol], tc.want[vol])
+				}
+			}
+		})
+	}
+}

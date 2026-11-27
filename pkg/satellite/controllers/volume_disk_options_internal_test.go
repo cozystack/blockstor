@@ -70,3 +70,48 @@ func TestTheIntentCarriesAVolumeDefinitionsDiskOptions(t *testing.T) {
 		t.Errorf("volume 0 block-size = %q, want 4096", got)
 	}
 }
+
+// linstor-csi v1.13.2 stamps FileSystem/Type on the volume definition
+// rather than on the resource definition. The intent has to carry it on
+// the volume, or the satellite never formats the volume and every
+// Filesystem PVC fails to mount.
+func TestTheIntentCarriesAVolumeDefinitionsFileSystem(t *testing.T) {
+	t.Parallel()
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-csi"},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			LayerStack: []string{"DRBD", "STORAGE"},
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 4 * 1024, Props: map[string]string{
+					"FileSystem/Type":       "ext4",
+					"FileSystem/MkfsParams": "",
+				}},
+			},
+		},
+	}
+
+	replica := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-csi.node-a"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-csi",
+			NodeName:               "node-a",
+			StoragePool:            "pool-a",
+		},
+	}
+
+	r := newPassphraseTestReconciler(t, rd, replica)
+
+	desired, err := r.buildDesiredFromCRD(t.Context(), replica, rd, nil)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	if len(desired.GetVolumes()) != 1 {
+		t.Fatalf("volumes = %d, want 1", len(desired.GetVolumes()))
+	}
+
+	if got := desired.GetVolumes()[0].GetFileSystem()["FileSystem/Type"]; got != "ext4" {
+		t.Errorf("volume 0 FileSystem/Type = %q, want ext4", got)
+	}
+}

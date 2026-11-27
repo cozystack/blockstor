@@ -1883,8 +1883,14 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 		return nil, errors.Wrap(err, "resolve volume disk options")
 	}
 
+	volumeFS, err := effectiveprops.VolumeFileSystemProps(ctx, r.Client, target, rd)
+	if err != nil {
+		return nil, errors.Wrap(err, "resolve volume filesystem props")
+	}
+
 	for _, vol := range desired.Volumes {
 		vol.DiskOptions = volumeDisk[vol.VolumeNumber]
+		vol.FileSystem = volumeFS[vol.VolumeNumber]
 	}
 
 	// Phase 11.3 Stage 1: carry the `MetadataCreated=True` Status

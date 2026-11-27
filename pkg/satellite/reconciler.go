@@ -4258,7 +4258,7 @@ func (r *Reconciler) recoveryPromoteDue(name string) bool {
 // fs.Stat — cheaper than re-running blkid on every volume just to
 // decide whether we need to do anything at all.
 func (r *Reconciler) needsAutoMkfsRetry(dr *intent.DesiredResource) bool {
-	if strings.TrimSpace(dr.GetProps()["FileSystem/Type"]) == "" {
+	if !needsMkfs(dr) {
 		return false
 	}
 
@@ -5683,15 +5683,43 @@ func (r *Reconciler) shouldForcePromote(ctx context.Context, dr *intent.DesiredR
 	return true
 }
 
-// needsMkfs reports whether the RD requests an on-creation filesystem
-// (the `FileSystem/Type` prop the controller folds from the RG's
-// effective props). It is the sole remaining reason to `drbdadm
-// primary --force` a fresh replica: mkfs must run while Primary, and
-// quorum may not be satisfiable yet because peers haven't connected.
-// When false, the elected winner reaches UpToDate from its set-gi
-// seed alone and is never promoted at create time.
+const (
+	fsTypeProp       = "FileSystem/Type"
+	fsMkfsParamsProp = "FileSystem/MkfsParams"
+)
+
+// volumeFileSystemProp reads one FileSystem/* prop for a volume: from
+// the volume's own resolved props when the payload carries them
+// (effectiveprops.VolumeFileSystemProps, which already folds in every
+// level up to the resource group), from the resource's Props otherwise.
+func volumeFileSystemProp(dr *intent.DesiredResource, vol *intent.DesiredVolume, key string) string {
+	if fs := vol.GetFileSystem(); fs != nil {
+		return strings.TrimSpace(fs[key])
+	}
+
+	return strings.TrimSpace(dr.GetProps()[key])
+}
+
+// needsMkfs reports whether the replica requests an on-creation
+// filesystem: whether any one of its volumes carries FileSystem/Type,
+// as LINSTOR's MkfsUtils.needsToCreateFs reads it. It is the sole
+// remaining reason to `drbdadm primary --force` a fresh replica: mkfs
+// must run while Primary, and quorum may not be satisfiable yet
+// because peers haven't connected. When false, the elected winner
+// reaches UpToDate from its set-gi seed alone and is never promoted at
+// create time.
 func needsMkfs(dr *intent.DesiredResource) bool {
-	return strings.TrimSpace(dr.GetProps()["FileSystem/Type"]) != ""
+	if len(dr.GetVolumes()) == 0 {
+		return strings.TrimSpace(dr.GetProps()[fsTypeProp]) != ""
+	}
+
+	for _, vol := range dr.GetVolumes() {
+		if volumeFileSystemProp(dr, vol, fsTypeProp) != "" {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (r *Reconciler) runAutoPromote(ctx context.Context, dr *intent.DesiredResource) error {
@@ -5781,7 +5809,7 @@ func (r *Reconciler) runStorageOnlyMkfs(ctx context.Context, dr *intent.DesiredR
 		return nil
 	}
 
-	if strings.TrimSpace(dr.GetProps()["FileSystem/Type"]) == "" {
+	if !needsMkfs(dr) {
 		return nil
 	}
 
@@ -5789,9 +5817,9 @@ func (r *Reconciler) runStorageOnlyMkfs(ctx context.Context, dr *intent.DesiredR
 }
 
 // runAutoMkfs handles the RG-driven auto-mkfs path of scenario
-// 9.W14. The controller folds `FileSystem/Type` (and the optional
-// `FileSystem/MkfsParams`) from the RG's effective props into the
-// per-RD wire Props map; the satellite consumes them here on the
+// 9.W14. `FileSystem/Type` (and the optional `FileSystem/MkfsParams`)
+// arrive resolved per volume (DesiredVolume.FileSystem, falling back to
+// the resource's Props); the satellite consumes them here on the
 // primary replica.
 //
 // Idempotency has two layers:
@@ -5831,8 +5859,7 @@ func (r *Reconciler) runStorageOnlyMkfs(ctx context.Context, dr *intent.DesiredR
 // only legitimate "missing" case is a diskless replica caller,
 // which has already been early-returned by runStorageOnlyMkfs.
 func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
-	fsType := strings.TrimSpace(dr.GetProps()["FileSystem/Type"])
-	if fsType == "" {
+	if !needsMkfs(dr) {
 		return nil
 	}
 
@@ -5880,7 +5907,7 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 		return nil
 	}
 
-	err := r.mkfsVolumes(ctx, dr, devices, fsType)
+	err := r.mkfsVolumes(ctx, dr, devices)
 	if err != nil {
 		return err
 	}
@@ -5930,14 +5957,16 @@ var errMkfsTargetUnknown = errors.New("blkid cannot tell whether the device carr
 // volume of dr whose device the probe reads as empty, adopts every one
 // that already carries a filesystem, and stops at the first one it
 // cannot read.
-func (r *Reconciler) mkfsVolumes(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, fsType string) error {
-	args := []string{}
-
-	if extra := strings.TrimSpace(dr.GetProps()["FileSystem/MkfsParams"]); extra != "" {
-		args = append(args, strings.Fields(extra)...)
-	}
-
+func (r *Reconciler) mkfsVolumes(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
 	for _, vol := range dr.GetVolumes() {
+		// Each volume carries its own type and parameters, as LINSTOR's
+		// makeFileSystemOnMarked reads them; one without a type is a
+		// block volume and is left alone.
+		fsType := volumeFileSystemProp(dr, vol, fsTypeProp)
+		if fsType == "" {
+			continue
+		}
+
 		device := devices[vol.GetVolumeNumber()]
 		if device == "" {
 			// No device path for this volume → caller is a path that
@@ -5965,7 +5994,7 @@ func (r *Reconciler) mkfsVolumes(ctx context.Context, dr *intent.DesiredResource
 		case filesystemAbsent:
 		}
 
-		cmdArgs := append(slices.Clone(args), device)
+		cmdArgs := append(strings.Fields(volumeFileSystemProp(dr, vol, fsMkfsParamsProp)), device)
 
 		_, err := r.cfg.Exec.Run(ctx, "mkfs."+fsType, cmdArgs...)
 		if err != nil {
