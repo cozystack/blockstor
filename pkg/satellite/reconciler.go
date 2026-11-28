@@ -375,6 +375,17 @@ type Reconciler struct {
 	// Process memory only: after a restart the published count serves.
 	metadataSlots map[string]int32
 
+	// luksHeaders records, per "<resource>/<volNumber>", what the LUKS
+	// header on the volume's backing takes from its front, as this
+	// process read it (luksHeaderKib), so it is read once and not on
+	// every pass. Process memory only.
+	luksHeaders map[string]luksHeader
+
+	// luksUnfitted lists, per "<resource>/<volNumber>", the backings this
+	// process formatted and has not yet grown to hold their header
+	// (fitBackingToLUKSHeader). Process memory only.
+	luksUnfitted map[string]struct{}
+
 	// restoreClonedHere records, per "<resource>/<volNumber>", whether
 	// this process itself cloned or received the snapshot into a volume
 	// that was not on disk before (true), or first found the volume
@@ -530,6 +541,8 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		growSteps:                   map[string]growStep{},
 		resizeRetries:               map[string]resizeRetry{},
 		metadataSlots:               map[string]int32{},
+		luksHeaders:                 map[string]luksHeader{},
+		luksUnfitted:                map[string]struct{}{},
 		restoreClonedHere:           map[string]bool{},
 		lastRecoveryPromoteAt:       map[string]time.Time{},
 		firstLateAddStallAt:         map[string]time.Time{},
@@ -1516,7 +1529,18 @@ func (r *Reconciler) applyLUKS(ctx context.Context, dr *intent.DesiredResource, 
 			return nil, false, errors.Wrapf(err, "luks volume %d", vol)
 		}
 
-		mapperPath, grew, err := r.openLUKS(ctx, dmName, dev, key, resized || toAttach)
+		if !active {
+			err = r.fitBackingToLUKSHeader(ctx, dr, volumes[vol], dev)
+			if err != nil {
+				clear(key)
+
+				return nil, false, errors.Wrapf(err, "luks volume %d", vol)
+			}
+		}
+
+		header := func() int64 { return r.luksHeaderKib(ctx, dr, vol, dev) }
+
+		mapperPath, grew, err := r.openLUKS(ctx, dmName, dev, key, resized || toAttach, header)
 
 		clear(key)
 
@@ -1583,7 +1607,10 @@ func (r *Reconciler) luksMapperState(
 		return false, true
 	}
 
-	return !luksMapperBehind(devBytes, mapperBytes), false
+	lags := luksMapperBehind(devBytes, mapperBytes) &&
+		luksMapperLagsHeader(devBytes, mapperBytes, r.luksHeaderKib(ctx, dr, vol.GetVolumeNumber(), dev))
+
+	return !lags, false
 }
 
 // luksPassword returns the password dev opens with, formatting dev first
@@ -1608,7 +1635,7 @@ func (r *Reconciler) luksPassword(ctx context.Context, vol LUKSVolume, dev strin
 			return key, nil
 		}
 
-		return key, r.formatLUKS(ctx, dev, key)
+		return key, r.formatLUKS(ctx, vol, dev, key)
 	}
 
 	if !errors.Is(err, luks.ErrNoLUKSKey) {
@@ -1629,16 +1656,20 @@ func (r *Reconciler) luksPassword(ctx context.Context, vol LUKSVolume, dev strin
 		return nil, err //nolint:wrapcheck // the provider names the replica and the reason
 	}
 
-	return key, r.formatLUKS(ctx, dev, key)
+	return key, r.formatLUKS(ctx, vol, dev, key)
 }
 
-func (r *Reconciler) formatLUKS(ctx context.Context, dev string, key []byte) error {
+// formatLUKS writes a LUKS header on dev, which holds nothing else, and
+// records it for fitBackingToLUKSHeader.
+func (r *Reconciler) formatLUKS(ctx context.Context, vol LUKSVolume, dev string, key []byte) error {
 	err := r.cfg.Cryptsetup.Format(ctx, dev, key)
 	if err != nil {
 		clear(key)
 
 		return errors.Wrapf(err, "luks format %s", dev)
 	}
+
+	r.noteLUKSFormatted(vol.Resource, vol.Volume)
 
 	return nil
 }
@@ -1693,8 +1724,11 @@ func (r *Reconciler) tryLUKSCandidate(ctx context.Context, dev string, candidate
 }
 
 // openLUKS opens dev under dmName and grows the mapper on the two resize
-// triggers applyLUKS describes.
-func (r *Reconciler) openLUKS(ctx context.Context, dmName, dev string, key []byte, resized bool) (string, bool, error) {
+// triggers applyLUKS describes. header reports what the LUKS header on
+// dev takes from its front (luksHeaderKib).
+func (r *Reconciler) openLUKS(
+	ctx context.Context, dmName, dev string, key []byte, resized bool, header func() int64,
+) (string, bool, error) {
 	openErr := r.cfg.Cryptsetup.Open(ctx, dev, dmName, key)
 	alreadyOpen := errors.Is(openErr, luks.ErrAlreadyOpen)
 
@@ -1708,7 +1742,7 @@ func (r *Reconciler) openLUKS(ctx context.Context, dmName, dev string, key []byt
 	mapperPath := luks.DevicePath(dmName)
 
 	needResize := resized
-	if !needResize && alreadyOpen && r.luksMapperBehindUnderlying(ctx, dev, mapperPath) {
+	if !needResize && alreadyOpen && r.luksMapperBehindUnderlying(ctx, dev, mapperPath, header) {
 		needResize = true
 	}
 
@@ -1729,11 +1763,13 @@ func (r *Reconciler) openLUKS(ctx context.Context, dmName, dev string, key []byt
 // at devicePath, accounting for the LUKS header carve-out.
 //
 // LUKS2 reserves a 16 MiB header by default (cryptsetup 2.x — older
-// LUKS1 reserves ~2 MiB; older LUKS2 builds 4 MiB). The mapper is
+// LUKS1 reserves ~2 MiB; older LUKS2 builds 4 MiB), and more on a
+// device whose I/O size it aligns the data to. The mapper is
 // ALWAYS smaller than the underlying by at least that header amount,
 // so a naive `underlying > mapper` comparison fires on every healthy
-// LUKS device. We use a 32 MiB tolerance: anything beyond that gap
-// is a real grow that the mapper hasn't picked up.
+// LUKS device. We use a 32 MiB tolerance, and 16 MiB over a larger
+// header read off the device (luksMapperLagsHeader): anything beyond
+// that gap is a real grow that the mapper hasn't picked up.
 //
 // Both probes shell out to `blockdev --getsize64`. Probe failures
 // (Exec nil in unit tests, blockdev missing on a minimal image,
@@ -1742,10 +1778,10 @@ func (r *Reconciler) openLUKS(ctx context.Context, dmName, dev string, key []byt
 // for fresh resize-pending events. This mirrors the "best-effort
 // drift detection" pattern used by readDeviceSizeMiB elsewhere in
 // this file.
-func (r *Reconciler) luksMapperBehindUnderlying(ctx context.Context, devicePath, mapperPath string) bool {
+func (r *Reconciler) luksMapperBehindUnderlying(ctx context.Context, devicePath, mapperPath string, header func() int64) bool {
 	devSize, mapperSize, ok := r.luksSizes(ctx, devicePath, mapperPath)
 
-	return ok && luksMapperBehind(devSize, mapperSize)
+	return ok && luksMapperBehind(devSize, mapperSize) && luksMapperLagsHeader(devSize, mapperSize, header())
 }
 
 // luksSizes reads the sizes, in bytes, of the device under a LUKS mapper
@@ -2236,7 +2272,9 @@ func (r *Reconciler) growBacking(
 ) (bool, error) {
 	withDRBD := r.cfg.Adm != nil && needsDRBD(dr.GetLayerStack())
 
-	step := r.planGrow(dr, vol, status.UsableKib, withDRBD)
+	header := func() int64 { return r.luksHeaderKib(ctx, dr, vol.GetVolumeNumber(), status.DevicePath) }
+
+	step := r.planGrow(dr, vol, status.UsableKib, withDRBD, header)
 	if !step.pending && withDRBD {
 		step = r.planAttachGrow(ctx, dr, vol, status, kernel)
 	}
@@ -2284,8 +2322,16 @@ func (r *Reconciler) growBacking(
 // from the front of the storage volume, so the storage volume holds the
 // header on top of whatever the layer above needs, as LINSTOR sizes it.
 // A volume adopted from LINSTOR was sized that way, and a replica
-// joining it without the header could not attach.
+// joining it without the header could not attach. The header is not
+// written yet when the volume is created, so it is sized for the 16 MiB
+// cryptsetup takes by default, as LINSTOR assumes; a header that takes
+// more grows the volume right after the format (fitBackingToLUKSHeader).
 func lowerDiskKib(dr *intent.DesiredResource, vol *intent.DesiredVolume) int64 {
+	return lowerDiskKibUnder(dr, vol, luks.HeaderKiB)
+}
+
+// lowerDiskKibUnder is lowerDiskKib for a LUKS header of headerKib.
+func lowerDiskKibUnder(dr *intent.DesiredResource, vol *intent.DesiredVolume, headerKib int64) int64 {
 	size := vol.GetSizeKib()
 
 	if needsDRBD(dr.GetLayerStack()) && vol.GetMetaPool() == "" {
@@ -2294,7 +2340,7 @@ func lowerDiskKib(dr *intent.DesiredResource, vol *intent.DesiredVolume) int64 {
 	}
 
 	if needsLUKS(dr.GetLayerStack()) {
-		size += luks.HeaderKiB
+		size += headerKib
 	}
 
 	return size
@@ -2544,6 +2590,8 @@ func (r *Reconciler) forgetRestoreRecord(rdName string, volNum int32) {
 	delete(r.restoreClonedHere, key)
 	delete(r.restoreSnapshotMissingTries, key)
 	delete(r.metadataSlots, growKey(rdName, volNum))
+	delete(r.luksHeaders, growKey(rdName, volNum))
+	delete(r.luksUnfitted, growKey(rdName, volNum))
 }
 
 // bumpRestoreSnapshotMissing increments and returns the consecutive
