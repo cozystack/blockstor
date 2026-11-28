@@ -71,10 +71,12 @@ func statBlockDevice(path string) (bool, error) {
 	return mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0, nil
 }
 
-// HeaderKiB is what a LUKS2 header Format writes takes from the front of
-// the device: cryptsetup's default LUKS2 data offset, 16 MiB. The opened
-// device is the lower one less this. LINSTOR assumes the same size for
-// LUKS2 when it sizes the volume under a LUKS layer.
+// HeaderKiB is cryptsetup's default LUKS2 data offset, 16 MiB, which
+// LINSTOR assumes for LUKS2 when it sizes the volume under a LUKS layer
+// (LuksLayerSizeCalculator). It is what a header Format writes takes on
+// a device that reports no I/O size: cryptsetup rounds the offset up to
+// the alignment a device asks for, which on some zvols gives 32 MiB. A
+// written header's own offset is read with DataOffsetKiB.
 const HeaderKiB = 16 * 1024
 
 // Format runs `cryptsetup luksFormat` against device with the given
@@ -126,9 +128,10 @@ func (c *Cryptsetup) IsLUKS(ctx context.Context, device string) bool {
 // DataOffsetKiB reads from device's LUKS header where the encrypted data
 // starts, which is what the header takes from the front of the device:
 // the data segment's offset for LUKS2, the payload offset for LUKS1.
-// That is HeaderKiB for a LUKS2 header Format writes, 2 MiB for a LUKS1
-// one and 4 MiB for one some LUKS2 builds wrote. It reports false when
-// the header cannot be read.
+// That is HeaderKiB for a LUKS2 header Format writes on a device with no
+// alignment of its own and more on one with it, 2 MiB for a LUKS1 one
+// and 4 MiB for one some LUKS2 builds wrote. It reports false when the
+// header cannot be read.
 func (c *Cryptsetup) DataOffsetKiB(ctx context.Context, device string) (int64, bool) {
 	out, err := c.exec.Run(ctx, "cryptsetup", "luksDump", device)
 	if err != nil {

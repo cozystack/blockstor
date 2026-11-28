@@ -36,15 +36,14 @@ import (
 
 // Sizes a grow reserves under the definition size, in KiB, as LINSTOR's
 // layer size calculators do (DrbdLayerSizeCalculator with
-// MetaData.getGrossSize, LuksLayerSizeCalculator).
+// MetaData.getGrossSize). The LUKS header is read off the backing
+// (Reconciler.luksHeaderKib).
 const (
 	// drbdMetaSuperblockKib is DRBD's 4 KiB metadata superblock.
 	drbdMetaSuperblockKib = 4
 	// drbdMetaActivityLogKib is the default activity log: one stripe of
 	// 32 KiB.
 	drbdMetaActivityLogKib = 32
-	// luks2HeaderKib is the LUKS2 header cryptsetup reserves by default.
-	luks2HeaderKib = 16 * 1024
 	// drbdMetaAlignKib is the alignment of DRBD's on-disk bitmap.
 	drbdMetaAlignKib = 4
 	// kibPerBitmapBit is the data one bit of DRBD's bitmap tracks.
@@ -151,17 +150,23 @@ func drbdGrossKib(netKib int64, peerSlots int) int64 {
 
 // growBackingKib is the backing size a grow of vol has to reach for the
 // device the consumer sees to have the definition size: the size plus
-// DRBD's internal metadata when DRBD keeps it on this device, plus the
-// LUKS header when LUKS sits under it. The metadata is sized for
-// peerSlots, the slots its superblock holds (Reconciler.grownPeerSlots).
-// LINSTOR sizes the backing the
-// same way, so an adopted volume's backing already carries both. Under
+// DRBD's internal metadata when DRBD keeps it on this device, plus
+// headerKib, what the LUKS header on the backing takes from its front
+// when LUKS sits under it (Reconciler.luksHeaderKib). The metadata is
+// sized for peerSlots, the slots its superblock holds
+// (Reconciler.grownPeerSlots). LINSTOR sizes the backing the same way,
+// so an adopted volume's backing already carries both. Under
 // DRBD the data area is the definition or the largest device any
 // replica reports, whichever is larger, as for a new lower disk
 // (lowerDiskKib): a volume adopted from LINSTOR exposes a few KiB more
 // than its definition, and a backing grown short of that could not be
 // attached.
-func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withDRBD bool, peerSlots int) int64 {
+//
+// The header is the one on the backing, not the size cryptsetup takes
+// by default: it aligns the data to the I/O size the device reports, so
+// on some zvols a LUKS2 header takes 32 MiB, and a grow sized for 16
+// MiB left the device that much short of the definition for good.
+func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withDRBD bool, peerSlots int, headerKib int64) int64 {
 	size := vol.GetSizeKib()
 
 	if withDRBD && vol.GetMetaPool() == "" {
@@ -169,7 +174,7 @@ func growBackingKib(dr *intent.DesiredResource, vol *intent.DesiredVolume, withD
 	}
 
 	if needsLUKS(dr.GetLayerStack()) {
-		size += luks2HeaderKib
+		size += headerKib
 	}
 
 	// The provider rounds it up to its allocation unit, as LINSTOR does.
@@ -268,37 +273,28 @@ type growStep struct {
 // is left alone. An attached backing is never grown here, so volumes
 // whose backings are exactly the definition keep them. The kernel is
 // asked only once the sizes call for it, so a backing that holds the
-// device costs no exec. Under LUKS the mapper grows after it
+// device costs no exec beyond reading its LUKS header once
+// (luksHeaderKib). Under LUKS the mapper grows after it
 // (luksMapperTooSmallForDevice).
 func (r *Reconciler) planAttachGrow(
 	ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume, status storage.VolumeStatus, kernel *disklessProbe,
 ) growStep {
 	usableKib := status.UsableKib
 
-	header := int64(0)
-	if needsLUKS(dr.GetLayerStack()) {
-		header = luks2HeaderKib
-	}
+	// The header is read off the backing: a LUKS1 one, or one some LUKS2
+	// builds wrote, is smaller than the 16 MiB cryptsetup takes by
+	// default, and one aligned to the device's I/O size is larger.
+	header := r.luksHeaderKib(ctx, dr, vol.GetVolumeNumber(), status.DevicePath)
 
 	if !backingTooSmallForDevice(vol, usableKib, header) {
 		return growStep{}
-	}
-
-	// A LUKS1 header, or one some LUKS2 builds wrote, is smaller than
-	// the 16 MiB a new one takes; read the one on the backing rather
-	// than grow a backing that holds the device.
-	if header > 0 && r.cfg.Cryptsetup != nil {
-		actual, ok := r.cfg.Cryptsetup.DataOffsetKiB(ctx, status.DevicePath)
-		if ok && !backingTooSmallForDevice(vol, usableKib, actual) {
-			return growStep{}
-		}
 	}
 
 	if !kernel.holds(ctx, vol.GetVolumeNumber()) {
 		return growStep{}
 	}
 
-	target := growBackingKib(dr, vol, true, r.grownPeerSlots(dr, vol))
+	target := growBackingKib(dr, vol, true, r.grownPeerSlots(dr, vol), header)
 	if target <= usableKib {
 		return growStep{}
 	}
@@ -360,7 +356,12 @@ func (r *Reconciler) luksMapperTooSmallForDevice(
 // volume created at the definition's size, which must not resize; only
 // a resize signal from the controller, as LINSTOR's RESIZE flags are,
 // would tell the two apart.
-func (r *Reconciler) planGrow(dr *intent.DesiredResource, vol *intent.DesiredVolume, usableKib int64, withDRBD bool) growStep {
+//
+// header reports what the LUKS header on the backing takes from its
+// front; it is asked only once a grow is pending.
+func (r *Reconciler) planGrow(
+	dr *intent.DesiredResource, vol *intent.DesiredVolume, usableKib int64, withDRBD bool, header func() int64,
+) growStep {
 	applied := vol.GetAppliedSizeKib()
 	lagging := applied > 0 && vol.GetSizeKib() > applied
 
@@ -381,7 +382,7 @@ func (r *Reconciler) planGrow(dr *intent.DesiredResource, vol *intent.DesiredVol
 		return step
 	}
 
-	if target := growBackingKib(dr, vol, withDRBD, r.grownPeerSlots(dr, vol)); target > usableKib {
+	if target := growBackingKib(dr, vol, withDRBD, r.grownPeerSlots(dr, vol), header()); target > usableKib {
 		step.backingKib = target
 
 		return step

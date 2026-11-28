@@ -73,7 +73,7 @@ func TestGrowBackingKibNeverSizesBelowFifteenPeerSlots(t *testing.T) {
 
 	r := NewReconciler(ReconcilerConfig{})
 	grown := func(dr *intent.DesiredResource) int64 {
-		return growBackingKib(dr, vol, true, r.grownPeerSlots(dr, vol))
+		return growBackingKib(dr, vol, true, r.grownPeerSlots(dr, vol), 0)
 	}
 
 	seven := int32(7)
@@ -118,7 +118,7 @@ func TestGrowBackingKibFollowsTheSuperblock(t *testing.T) {
 		dr := &intent.DesiredResource{PeerSlots: tc.recorded, MetadataPeerSlots: tc.metadata}
 		geometry := drbd.GeometryForPeerSlots(int(*tc.metadata))
 
-		got := growBackingKib(dr, vol, true, NewReconciler(ReconcilerConfig{}).grownPeerSlots(dr, vol))
+		got := growBackingKib(dr, vol, true, NewReconciler(ReconcilerConfig{}).grownPeerSlots(dr, vol), 0)
 		if want := drbdGrossKib(definition, int(*tc.metadata)); got != want {
 			t.Errorf("%s: got %d KiB, want %d", tc.name, got, want)
 		}
