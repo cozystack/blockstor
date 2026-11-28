@@ -4,6 +4,17 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.1-alpha.1 — 2026-11-28
+
+Pre-release for testing the LUKS sizing fix on a cluster adopted from LINSTOR. It is built from main and the open pull requests #350 and #348.
+
+### Changes since v0.4.0
+
+- **LUKS volumes are sized by the header cryptsetup actually wrote (#350).** The satellite reads the data offset from the LUKS header instead of assuming 16 MiB, so a new LUKS volume is no longer 16 MiB short of the definition when cryptsetup writes a 32 MiB header, and a LUKS resize completes. A volume left short by v0.4.0 keeps its size until the next resize, which ends at the requested size.
+- **`linstor encryption status` works with the stock client (#348).** `GET /v1/encryption/passphrase` answers one object, as LINSTOR does, instead of an array the client could not read.
+- **Every new resource definition gets DRBD peer authentication (#346).** Definitions created over REST or the CLI, including clones and restores, get their own `shared-secret` and `cram-hmac-alg sha1`, as in LINSTOR. Definitions that already carry a secret keep it.
+- The snapshot orphan cleanup integration test retries its finalizer update on a conflict (#344).
+
 ## v0.4.0 — 2026-11-27
 
 blockstor serves linstor-csi v1.13 with server-side dual Primary and REST API 1.29, deletes storage only when it is asked to, the way LINSTOR does, and takes over the DRBD workarounds of the LINSTOR plunger. Most of the other changes come from running a cluster adopted from LINSTOR: migration and adoption fixes, DRBD peer slots and block sizes as LINSTOR sets them, and faster bring-up of busy and rebooted nodes.
