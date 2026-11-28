@@ -6,6 +6,7 @@ description: |
     1. clear the legacy DrbdOptions/EncryptPassphrase controller prop
        (empty value = delete, still allowed) and assert it is ABSENT
     2. encryption create-passphrase (master passphrase → Secret)
+    2b. encryption status parses the reply (exit 0)
     2a. controller set-property DrbdOptions/EncryptPassphrase <pp> is
        REFUSED (exit 10): REST never stores the passphrase in a
        plaintext property; the prop stays absent
@@ -62,6 +63,13 @@ steps:
     # satisfies the post-fix LUKS gate.
     cmd: ["encryption", "create-passphrase", "-p", "replay-pp023-do-not-rely-on"]
     expect_exit: [0, 10]
+  - name: encryption-status
+    # The CLI reads the reply as one {"status": ...} object, the shape
+    # LINSTOR sends; an array of them, which the upstream OpenAPI
+    # declares, makes it exit 1 with "'list' object has no attribute
+    # 'get'".
+    cmd: ["encryption", "status"]
+    expect_exit: 0
   - name: set-legacy-prop-refused
     # The passphrase never goes into a property: the controller answers
     # 400 ("refusing to store the LUKS master passphrase in property

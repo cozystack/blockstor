@@ -71,6 +71,22 @@ var ErrLinstorBinaryMissing = errors.New("linstor binary not on PATH; install `l
 func (c *CLI) Run(t *testing.T, args ...string) []byte {
 	t.Helper()
 
+	return c.run(t, append([]string{"--machine-readable"}, args...)...)
+}
+
+// Human runs the CLI like Run but without `--machine-readable`, so the
+// client renders the reply itself. Some verbs only read the fields of
+// the parsed reply on this path: `encryption status` prints the
+// machine-readable form of any body, the wrong shape included.
+func (c *CLI) Human(t *testing.T, args ...string) []byte {
+	t.Helper()
+
+	return c.run(t, args...)
+}
+
+func (c *CLI) run(t *testing.T, args ...string) []byte {
+	t.Helper()
+
 	binary := c.binary()
 
 	_, err := exec.LookPath(binary)
@@ -78,7 +94,7 @@ func (c *CLI) Run(t *testing.T, args ...string) []byte {
 		t.Fatalf("%v (looked for %q): %v", ErrLinstorBinaryMissing, binary, err)
 	}
 
-	full := append([]string{"--controllers", c.URL, "--machine-readable"}, args...)
+	full := append([]string{"--controllers", c.URL}, args...)
 
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout())
 	defer cancel()
