@@ -20,6 +20,7 @@ package rest
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -105,6 +106,9 @@ func TestIdleConnectionsAreClosed(t *testing.T) {
 			t.Fatalf("request: %v", err)
 		}
 
+		// Read the body to the end: a transport that closes an unread
+		// body drops the connection instead of keeping it.
+		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}
 
