@@ -130,7 +130,10 @@ func (s *Server) registerEncryption(mux *http.ServeMux) {
 }
 
 // passphraseStatus is the upstream `PassphraseStatus` schema: a single
-// tri-state status field, array-wrapped like every other reply.
+// tri-state status field. It goes out as a bare object, as LINSTOR's
+// Encryption.passphraseStatus writes it, even though rest_v1_openapi.yaml
+// declares an array: python-linstor reads the reply as one object and
+// fails on a list.
 type passphraseStatus struct {
 	Status string `json:"status"`
 }
@@ -271,7 +274,7 @@ func (s *Server) handlePassphraseStatus(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	writeJSON(w, http.StatusOK, []passphraseStatus{{Status: string(status.State)}})
+	writeJSON(w, http.StatusOK, passphraseStatus{Status: string(status.State)})
 }
 
 func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) {
