@@ -15,6 +15,7 @@
 #   1. exit 0 from the CLI (= envelope decoded without traceback)
 #   2. GET /v1/encryption surfaces a non-empty status afterwards
 #      (passphrase is considered "set" by the controller)
+#   3. `linstor encryption status` parses the reply and says unlocked
 #
 # Cleanup: linstor encryption delete-passphrase. Idempotent — runs
 # from the EXIT trap so a half-finished cell doesn't leave the
@@ -92,6 +93,20 @@ fi
 # `status: SET`.
 if ! grep -qiE 'true|set|unlocked' <<<"$status_body"; then
     echo "FAIL (Bug 333): status body has no positive flag after create-passphrase: $status_body" >&2
+    exit 1
+fi
+
+echo ">> linstor encryption status renders the unlocked state"
+# The CLI reads the reply as one {"status": ...} object, the shape
+# LINSTOR sends; an array of them, which the upstream OpenAPI declares,
+# fails here with "'list' object has no attribute 'get'".
+if ! status_out=$("${LCTL[@]}" encryption status 2>&1); then
+    echo "FAIL: linstor encryption status exited non-zero" >&2
+    echo "$status_out" >&2
+    exit 1
+fi
+if ! grep -q 'The controller is unlocked.' <<<"$status_out"; then
+    echo "FAIL: linstor encryption status after create-passphrase: $status_out" >&2
     exit 1
 fi
 

@@ -20,6 +20,7 @@ package rest
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"testing"
 
@@ -35,10 +36,12 @@ import (
 // Wire shape (upstream-faithful — `PassphraseStatus` schema in
 // docs/rest_v1_openapi.yaml lines 8357-8367):
 //
-//   - response body is an ARRAY of `{"status": "<enum>"}` (upstream's
-//     OpenAPI wraps the singleton object in a slice, matching the
-//     `[]ApiCallRc` convention used by every other LINSTOR REST
-//     reply);
+//   - response body is a single `{"status": "<enum>"}` object. The
+//     OpenAPI declares an array of them, but LINSTOR's
+//     Encryption.passphraseStatus serialises one object, and
+//     python-linstor builds its PassphraseStatus from the decoded
+//     body as is, so an array fails `linstor encryption status` with
+//     `'list' object has no attribute 'get'`;
 //   - the enum has three values: "unset" (no passphrase has ever
 //     been POSTed), "locked" (passphrase set but the controller's
 //     in-memory unlock flag is false — typical after restart), or
@@ -132,17 +135,21 @@ func requirePassphraseStatus(t *testing.T, base string) string {
 		t.Fatalf("status code: got %d, want 200", resp.StatusCode)
 	}
 
-	var arr []struct {
-		Status string `json:"status"`
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&arr); err != nil {
-		t.Fatalf("decode body: %v", err)
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("body is not a single JSON object, as LINSTOR answers: %v\nbody: %s", err, body)
 	}
 
-	if len(arr) != 1 {
-		t.Fatalf("response array length: got %d, want 1", len(arr))
+	if len(got) != 1 {
+		t.Errorf("body: got fields %v, want only status", got)
 	}
 
-	return arr[0].Status
+	status, _ := got["status"].(string)
+
+	return status
 }
