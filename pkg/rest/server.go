@@ -181,6 +181,14 @@ type Server struct {
 	// binaries set DefaultResourceDeployWait.
 	ResourceDeployWait time.Duration
 
+	// idleTimeout overrides restIdleTimeout so a test can watch idle
+	// connections being closed without waiting two minutes. Zero is
+	// restIdleTimeout.
+	idleTimeout time.Duration
+	// connState is passed to http.Server.ConnState so a test can count
+	// the connections the server holds.
+	connState func(net.Conn, http.ConnState)
+
 	// eventBrokersInit gates the lazy initialisation of the SSE
 	// brokers below. The two brokers back `/v1/events/drbd/promotion`
 	// and `/v1/events/nodes` respectively — see pkg/rest/events.go.
@@ -276,13 +284,31 @@ func (s *Server) Start(ctx context.Context) error {
 	return waitAndShutdown(ctx, servers, errCh)
 }
 
+// restIdleTimeout is how long a keep-alive connection may sit between
+// requests before the server closes it. Without it a connection stays
+// open for as long as the client keeps it, and a client that builds a
+// new transport for every call never closes the old one: each of those
+// connections pins a goroutine, a file descriptor and its TLS and bufio
+// buffers until the pod is OOM-killed. It is longer than the 90 s idle
+// timeout of Go's default transport, so a client that does pool its
+// connections closes them before the server does. It does not apply
+// while a request is in flight, so the SSE streams are not cut.
+const restIdleTimeout = 120 * time.Second
+
 // newHTTPServer constructs an *http.Server with the project's shared
 // timeouts and base context. tlsCfg may be nil for the plain listener.
 func (s *Server) newHTTPServer(ctx context.Context, addr string, handler http.Handler) *http.Server {
+	idle := s.idleTimeout
+	if idle == 0 {
+		idle = restIdleTimeout
+	}
+
 	return &http.Server{
 		Addr:              addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       idle,
+		ConnState:         s.connState,
 		BaseContext:       func(_ net.Listener) context.Context { return ctx },
 	}
 }
