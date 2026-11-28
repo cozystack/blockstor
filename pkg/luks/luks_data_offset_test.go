@@ -48,6 +48,48 @@ Keyslots:
 	Area length:258048 [bytes]
 `
 
+// luks2AlignedDump is `cryptsetup luksDump`, from cryptsetup 2.7.5, of a
+// LUKS2 header Format wrote on a device asking for 32 MiB alignment: the
+// keyslots area is the default one, and the data starts 32 MiB in, not
+// right after it.
+const luks2AlignedDump = `LUKS header information
+Version:       	2
+Epoch:         	3
+Metadata area: 	16384 [bytes]
+Keyslots area: 	16744448 [bytes]
+UUID:          	b3b0218c-674a-4c99-a84d-c20c10c27a49
+Label:         	(no label)
+Subsystem:     	(no subsystem)
+Flags:       	(no flags)
+
+Data segments:
+  0: crypt
+	offset: 33554432 [bytes]
+	length: (whole device)
+	cipher: aes-xts-plain64
+	sector: 4096 [bytes]
+
+Keyslots:
+  0: luks2
+	Key:        512 bits
+	Priority:   normal
+	Cipher:     aes-xts-plain64
+	Cipher key: 512 bits
+	PBKDF:      pbkdf2
+	Hash:       sha256
+	Iterations: 1000
+	AF stripes: 4000
+	AF hash:    sha256
+	Area offset:32768 [bytes]
+	Area length:258048 [bytes]
+	Digest ID:  0
+Tokens:
+Digests:
+  0: pbkdf2
+	Hash:       sha256
+	Iterations: 1000
+`
+
 // luks1Dump is `cryptsetup luksDump` of a LUKS1 header.
 const luks1Dump = `LUKS header information for /dev/vg/lv
 
@@ -59,8 +101,9 @@ Payload offset:	4096
 MK bits:       	512
 `
 
-// The data offset is read from the header, so a LUKS1 header's 2 MiB is
-// not taken for the 16 MiB a LUKS2 header Format writes.
+// The data offset is read from the header, so neither a LUKS1 header's 2
+// MiB nor an aligned LUKS2 header's 32 MiB is taken for the 16 MiB a
+// LUKS2 header takes by default.
 func TestDataOffsetKiBReadsTheHeader(t *testing.T) {
 	t.Parallel()
 
@@ -71,6 +114,7 @@ func TestDataOffsetKiBReadsTheHeader(t *testing.T) {
 		wantOK bool
 	}{
 		{"LUKS2", storage.FakeResponse{Stdout: []byte(luks2Dump)}, 16384, true},
+		{"LUKS2 aligned to 32 MiB", storage.FakeResponse{Stdout: []byte(luks2AlignedDump)}, 32768, true},
 		{"LUKS1", storage.FakeResponse{Stdout: []byte(luks1Dump)}, 2048, true},
 		{"LUKS2 with a 4 MiB offset", storage.FakeResponse{Stdout: []byte(
 			"Version: 2\nData segments:\n  0: crypt\n\toffset: 4194304 [bytes]\n")}, 4096, true},
