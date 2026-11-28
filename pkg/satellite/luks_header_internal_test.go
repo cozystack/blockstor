@@ -330,8 +330,10 @@ func TestFitBackingToLUKSHeader(t *testing.T) {
 	}
 }
 
-// TestFitBackingToLUKSHeaderRetriesAFailedGrow: a grow that fails fails
-// the open, and the next open grows the backing.
+// TestFitBackingToLUKSHeaderRetriesAFailedGrow: when the grow fails, the
+// open fails too, and the next open grows the backing.
+var errPoolBusy = errors.New("pool is busy")
+
 func TestFitBackingToLUKSHeaderRetriesAFailedGrow(t *testing.T) {
 	t.Parallel()
 
@@ -347,7 +349,7 @@ func TestFitBackingToLUKSHeaderRetriesAFailedGrow(t *testing.T) {
 	})
 
 	setVolsize := "zfs set volsize=" + strconv.FormatInt(want, 10) + "K " + headerZvol
-	fx.ExpectSequence(setVolsize, storage.FakeResponse{Err: errors.New("pool is busy")}, storage.FakeResponse{})
+	fx.ExpectSequence(setVolsize, storage.FakeResponse{Err: errPoolBusy}, storage.FakeResponse{})
 
 	r := NewReconciler(ReconcilerConfig{
 		Cryptsetup: luks.NewCryptsetup(fx),
