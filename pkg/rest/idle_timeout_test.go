@@ -20,8 +20,9 @@ package rest
 
 import (
 	"context"
+	"net"
 	"net/http"
-	"runtime"
+	"sync"
 	"testing"
 	"time"
 )
@@ -31,7 +32,7 @@ import (
 // call leaves a keep-alive connection open, and without an idle
 // timeout the server holds it, with its goroutine and buffers, for as
 // long as the client process lives. The test makes the calls, checks
-// that they are being held, and then that the server lets them go once
+// that the server is holding them, and then that it lets them go once
 // they have been idle for longer than its idle timeout.
 func TestIdleConnectionsAreClosed(t *testing.T) {
 	const calls = 40
@@ -39,6 +40,18 @@ func TestIdleConnectionsAreClosed(t *testing.T) {
 	ca := newTestCA(t)
 	paths := writeServerCerts(t, ca, t.TempDir(), "blockstor-apiserver")
 	clientCert, clientKey := ca.issue(t, "blockstor-csi", false)
+
+	var (
+		mu   sync.Mutex
+		open = map[net.Conn]struct{}{}
+	)
+
+	openConns := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return len(open)
+	}
 
 	tlsAddr := pickFreeAddr(t)
 	srv := &Server{
@@ -50,6 +63,18 @@ func TestIdleConnectionsAreClosed(t *testing.T) {
 			ClientCAFile: paths.caFile,
 		},
 		idleTimeout: 300 * time.Millisecond,
+		connState: func(c net.Conn, st http.ConnState) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			switch st {
+			case http.StateNew:
+				open[c] = struct{}{}
+			case http.StateClosed, http.StateHijacked:
+				delete(open, c)
+			case http.StateActive, http.StateIdle:
+			}
+		},
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -64,11 +89,11 @@ func TestIdleConnectionsAreClosed(t *testing.T) {
 
 	waitReachable(t, ctx, srv.Addr)
 	waitReachable(t, ctx, tlsAddr)
-
-	baseline := settledGoroutines()
+	waitOpenConns(t, openConns, 0, "the reachability probes")
 
 	for range calls {
 		client := clientFor(t, ca.certPEM, clientCert, clientKey)
+		t.Cleanup(client.CloseIdleConnections)
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+tlsAddr+"/v1/controller/version", nil)
 		if err != nil {
@@ -83,45 +108,32 @@ func TestIdleConnectionsAreClosed(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 
-	// Every connection costs one goroutine on the server and two on
-	// the client transport, so the calls must show up here; otherwise
-	// the test would pass without exercising anything.
-	held := runtime.NumGoroutine() - baseline
-	if held < calls {
-		t.Fatalf("only %d goroutines above baseline after %d calls, the connections are not being held", held, calls)
+	// The calls finish well within the idle timeout, so every one of
+	// them must still be open here; otherwise the test would pass
+	// without exercising anything.
+	if n := openConns(); n != calls {
+		t.Fatalf("server holds %d connections after %d calls, want %d", n, calls, calls)
 	}
+
+	waitOpenConns(t, openConns, 0, "idle timeout")
+}
+
+// waitOpenConns waits up to 5 s for the server to hold want connections.
+func waitOpenConns(t *testing.T, openConns func() int, want int, after string) {
+	t.Helper()
 
 	deadline := time.Now().Add(5 * time.Second)
 
 	for {
-		left := runtime.NumGoroutine() - baseline
-		if left <= 5 {
+		n := openConns()
+		if n == want {
 			return
 		}
 
 		if time.Now().After(deadline) {
-			t.Fatalf("%d goroutines above baseline 5 s after %d idle connections, the server does not close them", left, calls)
+			t.Fatalf("server still holds %d connections after %s, want %d", n, after, want)
 		}
 
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
-}
-
-// settledGoroutines waits for the goroutine count to stop changing, so
-// the probe dials of waitReachable are not counted as held connections.
-func settledGoroutines() int {
-	n := runtime.NumGoroutine()
-
-	for range 20 {
-		time.Sleep(50 * time.Millisecond)
-
-		m := runtime.NumGoroutine()
-		if m == n {
-			return n
-		}
-
-		n = m
-	}
-
-	return n
 }

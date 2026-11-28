@@ -185,6 +185,9 @@ type Server struct {
 	// connections being closed without waiting two minutes. Zero is
 	// restIdleTimeout.
 	idleTimeout time.Duration
+	// connState is passed to http.Server.ConnState so a test can count
+	// the connections the server holds.
+	connState func(net.Conn, http.ConnState)
 
 	// eventBrokersInit gates the lazy initialisation of the SSE
 	// brokers below. The two brokers back `/v1/events/drbd/promotion`
@@ -305,6 +308,7 @@ func (s *Server) newHTTPServer(ctx context.Context, addr string, handler http.Ha
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       idle,
+		ConnState:         s.connState,
 		BaseContext:       func(_ net.Listener) context.Context { return ctx },
 	}
 }
