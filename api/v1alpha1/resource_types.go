@@ -780,7 +780,9 @@ type ResourceVolumeStatus struct {
 
 	// deviceSizeKib is the size of this replica's DRBD device in KiB,
 	// the `size:` token of `drbdsetup events2 --statistics --full`
-	// device frames. A diskless replica reports the size its peers
+	// device frames, read again from sysfs every few seconds because
+	// an online resize does not reliably bring a frame. A diskless
+	// replica reports the size its peers
 	// agreed on. The controller hands the largest size any replica
 	// reports to a replica that is getting a new lower disk, which
 	// must hold at least that much: the kernel refuses to attach a

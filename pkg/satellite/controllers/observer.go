@@ -170,6 +170,11 @@ type volumeObservation struct {
 	// a `device` frame; 0 when the frame did not carry one.
 	DeviceSizeKib int64
 
+	// Minor is the `minor:` of the events2 `device` frame, empty when
+	// the frame did not carry it. Not published to Status: the resync
+	// reads the device size from sysfs by it (refreshDeviceSizes).
+	Minor string
+
 	// Open is the `open:yes|no|unknown` of the events2 `device` frame,
 	// empty when the frame did not carry it. Not published to Status:
 	// only the DRBD workarounds' hints read it (workaround_hints.go).
@@ -477,6 +482,7 @@ func translateDeviceEvent(ev drbd.Event) (observation, bool) {
 		CurrentUUID:  ev.Fields["current-uuid"],
 		BackingDev:   ev.Fields["backing_dev"],
 		Open:         ev.Fields["open"],
+		Minor:        ev.Fields["minor"],
 	}
 
 	// `quorum:yes|no` is emitted on every `device` frame on
@@ -917,6 +923,9 @@ type ObserverRunnable struct {
 	// again; zero means events2RestartDelay. Both are for tests.
 	startEvents2 func(context.Context) (*drbd.Watcher, func(), error)
 	restartDelay time.Duration
+	// readDeviceSize reads the size of a DRBD minor in KiB; nil reads
+	// sysfs. For tests.
+	readDeviceSize func(minor string) (int64, error)
 	// initialStateQuiet is how long a stream's dump may go without a
 	// line before it is taken as ended; zero means
 	// observerInitialStateQuiet. For tests.
@@ -1505,9 +1514,11 @@ func (o *ObserverRunnable) resyncLoop(ctx context.Context) {
 
 // resyncOnce marks every known resource pending and writes them,
 // reading afresh the GI of those whose GI may have moved with no frame
-// (giMayMove). The pass waits for one the writer has in flight, and
+// (giMayMove) and every device size (refreshDeviceSizes). The pass waits for one the writer has in flight, and
 // writes nothing while a stream's dump is being read.
 func (o *ObserverRunnable) resyncOnce(ctx context.Context) {
+	o.refreshDeviceSizes()
+
 	for _, name := range o.cachedResourceNames() {
 		probe := o.giMayMove(name)
 		o.markPending(name, func(entry *pendingWrite) { entry.probeGI = entry.probeGI || probe })
@@ -2908,6 +2919,10 @@ func mergeHelperFieldsInto(merged, incoming *volumeObservation) {
 	// and never marks the volume changed.
 	if incoming.Open != "" {
 		merged.Open = incoming.Open
+	}
+
+	if incoming.Minor != "" {
+		merged.Minor = incoming.Minor
 	}
 }
 
